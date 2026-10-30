@@ -1412,6 +1412,23 @@ def test_a_memory_limit_below_configured_ram_flags_memory_limited() -> None:
     assert checks.MEMORY_LIMITED not in uncapped.flags  # a limit at or above RAM caps nothing
 
 
+def test_a_vm_that_is_up_but_capped_names_its_limits_and_says_it_is_up() -> None:
+    machine = vm(
+        tools_running="guestToolsRunning",
+        heartbeat="green",
+        cpu_mhz=400.0,
+        cpu_limit_mhz=600,
+        memory_mb=8192,
+        memory_limit_mb=2048,
+    )
+
+    result = _conclude_on(machine)
+
+    causes = [cause["cause"] for cause in result["causes"]]
+    assert causes[:2] == [diagnose.CPU_LIMIT_CAUSE, diagnose.MEMORY_LIMIT_CAUSE]
+    assert "VM up (Tools running)" in result["headline"]
+
+
 def test_a_cpu_limit_on_a_stuck_vm_is_weighed_as_throttled_not_host_starvation() -> None:
     machine = vm(cpu_mhz=3600.0, cpu_limit_mhz=600)
     result = diagnose.conclude(

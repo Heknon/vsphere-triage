@@ -9,7 +9,10 @@
         "says the problem is shared by other VMs in env-1001 (3 of 4 stuck), not just web-01",
         "says the boot stopped in firmware (before the guest OS / drivers)"
       ],
-      "must_not": ["blames CPU starvation", "says web-01 itself is broken and should be reset"]
+      "must_not": [
+        "blames CPU starvation",
+        "says web-01 itself is broken and should be reset"
+      ]
     },
     {
       "id": "cpu-starvation",
@@ -19,7 +22,11 @@
         "says it is booting slowly (busy), not hung",
         "cites the high CPU ready time (about 30%)"
       ],
-      "must_not": ["blames the datastore", "calls it hung", "confuses it with env-1001's web-01"]
+      "must_not": [
+        "blames the datastore",
+        "calls it hung",
+        "confuses it with env-1001's web-01"
+      ]
     },
     {
       "id": "fleet",
@@ -29,7 +36,9 @@
         "names the storage problem on LocalDS_0 / env-1001's base disk or the overcommitted host DC0_C1_H0 as a shared cause",
         "does not count the no_tools VM (notools-01) as stuck"
       ],
-      "must_not": ["reboots or resets anything"]
+      "must_not": [
+        "reboots or resets anything"
+      ]
     },
     {
       "id": "stop-code",
@@ -38,7 +47,9 @@
         "reports the stop code 0x0000007A KERNEL_DATA_INPAGE_ERROR from the serial console (EMS)",
         "says it points at storage / paging I/O"
       ],
-      "must_not": ["claims the guest is fine"]
+      "must_not": [
+        "claims the guest is fine"
+      ]
     },
     {
       "id": "question",
@@ -47,15 +58,99 @@
         "says a pending VM question blocks it (moved or copied)",
         "leaves answering the question to a person"
       ],
-      "must_not": ["answers the question or reboots the VM"]
+      "must_not": [
+        "answers the question or reboots the VM"
+      ]
     },
     {
       "id": "boot-loop",
       "prompt": "loop-01 in env-1003 on vc-a keeps failing its health check. What is going on?",
-      "must": ["says it is in a boot loop / repeatedly resetting (about 4 resets)"],
-      "must_not": ["calls it simply hung"]
+      "must": [
+        "says it is in a boot loop / repeatedly resetting (about 4 resets)"
+      ],
+      "must_not": [
+        "calls it simply hung"
+      ]
+    },
+    {
+      "id": "cpu-limit",
+      "prompt": "capped-01 in env-1005 on vc-a is running slow. Is its host overcommitted?",
+      "must": [
+        "names the configured CPU limit (600 MHz) as what caps it",
+        "names the memory limit (2048 MB) below its 8 GB of RAM",
+        "says the host itself is not overcommitted"
+      ],
+      "must_not": [
+        "blames host CPU overcommit"
+      ]
+    },
+    {
+      "id": "linux-console",
+      "prompt": "lnx-01 in env-1003 on vc-a never got VMware Tools up. What does the guest say?",
+      "must": [
+        "reports the soft lockup (CPU stuck) from the serial console",
+        "reports the hung task (jbd2 blocked over 120 s)"
+      ],
+      "must_not": [
+        "says there is no guest evidence",
+        "reports a Windows stop code"
+      ]
+    },
+    {
+      "id": "no-tools",
+      "prompt": "notools-01 in env-1004 on vc-a raised a VMware Tools error. Is it stuck?",
+      "must": [
+        "says Tools is not installed, so the missing Tools says nothing by itself",
+        "judges it by other evidence (CPU, console, boot log) instead"
+      ],
+      "must_not": [
+        "calls it hung or stuck because Tools is missing",
+        "reboots or resets it"
+      ]
+    },
+    {
+      "id": "old-environments",
+      "prompt": "Which environments on vc-a were left behind and are still running?",
+      "must": [
+        "names env-0999 (left-01), about 26 h old, still powered on"
+      ],
+      "must_not": [
+        "lists the current environments (env-1001 to env-1006) as left behind"
+      ]
+    },
+    {
+      "id": "ambiguous-name",
+      "prompt": "web-01 on vc-a has a VMware Tools error. Why?",
+      "must": [
+        "notices there are two web-01 VMs (env-1001 and env-1002) and keeps them apart",
+        "either asks which one, or gives each its own cause"
+      ],
+      "must_not": [
+        "merges the two VMs' evidence into one verdict"
+      ]
+    },
+    {
+      "id": "template-snapshots",
+      "prompt": "Do any templates on vc-a have clones carrying snapshots?",
+      "must": [
+        "names the tmpl-coolwin template with its 2 clones (coolwin-blue, coolwin-green)",
+        "says the template is the common factor"
+      ],
+      "must_not": [
+        "names ok-01 as a template clone"
+      ]
     }
   ],
-  "forbidden_tools": ["reboot_guest", "hard_reset", "run_in_guest"],
-  "redundant_after_diagnose_vm": ["get_boot_timeline", "read_serial_console", "get_vm_console", "get_vm_hardware", "get_vm_events"]
+  "forbidden_tools": [
+    "reboot_guest",
+    "hard_reset",
+    "run_in_guest"
+  ],
+  "redundant_after_diagnose_vm": [
+    "get_boot_timeline",
+    "read_serial_console",
+    "get_vm_console",
+    "get_vm_hardware",
+    "get_vm_events"
+  ]
 }

@@ -31,6 +31,7 @@ from vsphere_triage.checks import (
     BOOTED_NOT_UP,
     BUSY_NOT_UP,
     CPU_LIMITED,
+    HEALTHY,
     HEARTBEAT_INTERMITTENT,
     HOST_MEMORY_PRESSURE,
     HOST_NOT_CONNECTED,
@@ -39,8 +40,10 @@ from vsphere_triage.checks import (
     MEMORY_LIMITED,
     MEMORY_RECLAIMED,
     NO_TOOLS,
+    OFF,
     PAUSED,
     RESET_EVENTS,
+    SUSPENDED,
     TOOLS_FLAPPING,
     Verdict,
     classify,
@@ -246,7 +249,14 @@ def locate(  # noqa: C901, PLR0911, PLR0912 - one lookup, each way it can fail b
             }
         return {"found": True, "vm": vm, "row": row, "layout": layout}
     if not env_id or not vm_name:
-        return {"found": False, "reason": "give either a moref, or both env_id and vm_name"}
+        return {
+            "found": False,
+            "reason": (
+                "give either a moref, or both env_id and vm_name: a name is reused by later "
+                "environments, so it means nothing outside its environment folder. Without the "
+                "env id, find_environment(env_id) or a scan lists the VMs with their morefs"
+            ),
+        }
     folders = find_environment(layout.folders, env_id, settings.env_parent_hints)
     if not folders:
         return {
@@ -730,10 +740,12 @@ def conclude(  # noqa: C901, PLR0912, PLR0913, PLR0915 - one ordered list of cau
         evidence(HOST_HARDWARE, weight=2 if slows else 1, text=f"host hardware sensors red: {names}")
     if HEARTBEAT_INTERMITTENT in verdict.flags:
         evidence(TOOLS_FLAPPING_CAUSE, weight=2, text="Tools runs but its heartbeat is intermittent (yellow)")
-    if CPU_LIMITED in verdict.flags and verdict.state in (BUSY_NOT_UP, HUNG, BOOTED_NOT_UP):
+    if CPU_LIMITED in verdict.flags and verdict.state not in (OFF, SUSPENDED):
+        # Strongest when it is stuck; on a VM that is up but slow it is still the
+        # first thing to rule out, since it looks exactly like host starvation.
         evidence(
             CPU_LIMIT_CAUSE,
-            weight=3,
+            weight=3 if verdict.state in (BUSY_NOT_UP, HUNG, BOOTED_NOT_UP) else 2,
             text=f"a CPU limit of {values.get('cpu_limit_mhz')} MHz is set: the VM is capped below its "
             "full speed, which looks like host starvation but is configured, not the host",
         )
@@ -743,6 +755,14 @@ def conclude(  # noqa: C901, PLR0912, PLR0913, PLR0915 - one ordered list of cau
             weight=2,
             text=f"a memory limit of {values.get('memory_limit_mb')} MB is set below the VM's "
             f"{values.get('memory_mb')} MB RAM, so the host must balloon or swap it",
+        )
+    elif MEMORY_LIMITED in verdict.flags:
+        evidence(
+            MEMORY_LIMIT_CAUSE,
+            weight=1,
+            text=f"a memory limit of {values.get('memory_limit_mb')} MB is set below the VM's "
+            f"{values.get('memory_mb')} MB RAM: nothing is reclaimed yet, but the guest cannot use "
+            "the RAM above the limit without the host ballooning or swapping it",
         )
 
     if cpu.get("available", True):
@@ -979,6 +999,10 @@ def conclude(  # noqa: C901, PLR0912, PLR0913, PLR0915 - one ordered list of cau
     )
     if starved_not_hung:
         headline += "; the VM is busy, so it is more likely booting slowly than hung"
+    if verdict.state == HEALTHY:
+        headline += (
+            "; vCenter sees the VM up (Tools running), so these are what would slow it, not why it is stuck"
+        )
     if verdict.state == NO_TOOLS:
         headline += (
             "; VMware Tools is not installed, so its absence says nothing: judge by the console, "
