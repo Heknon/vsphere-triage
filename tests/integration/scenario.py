@@ -22,6 +22,7 @@ fake `perf`), and it has no console `/screen` endpoint and no host logs.
 
 from __future__ import annotations
 
+import os
 import shutil
 import ssl
 import subprocess
@@ -92,11 +93,17 @@ def save_model(builder: str, directory: Path) -> None:
     """`govc object.save` the builder's inventory into `directory`."""
     directory.parent.mkdir(parents=True, exist_ok=True)
     directory.parent.chmod(0o777)
+    # Run govc as this process's own uid/gid (where the OS has them, i.e. not on
+    # Windows). Otherwise the container writes the inventory XML as root, and an
+    # unprivileged CI runner cannot then edit it (build() rewrites each VM's
+    # XML) — nor chmod it, since you cannot chmod a file you do not own.
+    as_user = [f"{os.getuid()}:{os.getgid()}"] if hasattr(os, "getuid") else []
     subprocess.run(
         [
             "docker",
             "run",
             "--rm",
+            *(["--user", *as_user] if as_user else []),
             "--network",
             f"container:{builder}",
             "-e",
