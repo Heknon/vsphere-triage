@@ -642,15 +642,19 @@ def _register_fleet_tools(  # noqa: C901, PLR0915 - one closure per tool
         # The VM rows are the bulk of a scan: list fewer of them before the
         # generic cut would trim the groups and findings along with them.
         summary = scanning.summary(result, states=wanted, limit=max(1, min(limit, MAX_LIMIT)))
-        rows = summary["abnormal_vms"]
+        rows, more = summary["abnormal_vms"], summary["more_abnormal_vms"]
+        summary["more_abnormal_vms"] = []
         while len(summary["abnormal_vms"]) > 1 and size(jsonable(summary)) > MAX_RESPONSE_CHARACTERS:
             summary["abnormal_vms"] = summary["abnormal_vms"][: len(summary["abnormal_vms"]) // 2]
         summary["abnormal_vms_truncated"] += len(rows) - len(summary["abnormal_vms"])
-        dropped = [
-            f"{row['vcenter']}/{row['moref']} {row['name']} in {row['folder']}: {row['verdict']['state']}"
-            for row in rows[len(summary["abnormal_vms"]) :]
-        ]
-        summary["more_abnormal_vms"] = dropped + summary["more_abnormal_vms"]
+        # The rows cut for size are still named, one line each, as far as the budget allows.
+        summary["more_abnormal_vms"] = [
+            scanning.brief(row) for row in rows[len(summary["abnormal_vms"]) :]
+        ] + more
+        while summary["more_abnormal_vms"] and size(jsonable(summary)) > MAX_RESPONSE_CHARACTERS:
+            summary["more_abnormal_vms"] = summary["more_abnormal_vms"][
+                : len(summary["more_abnormal_vms"]) // 2
+            ]
         return summary
 
     @tool()

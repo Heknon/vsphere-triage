@@ -151,6 +151,57 @@ def test_storage_storm_on_a_shared_base_disk(server: MCPServer, worlds: tuple[sc
     assert "console screen" in result["conclusion"]["not_checked"]
 
 
+# The fields the skill's ladder (core/ladder.md, core/causes.md) tells a model to read.
+DIAGNOSE_PATHS_THE_SKILL_READS = (
+    "finding",
+    "conclusion.causes",
+    "conclusion.not_checked",
+    "machine.state",
+    "machine.question",
+    "environment.signals",
+    "cpu.host",
+    "cpu.vm_ready_percent_per_vcpu",
+    "storage.where",
+    "boot.timeline.last_stage",
+    "serial_console",
+    "console",
+    "snapshots",
+    "events",
+    "evidence_gaps",
+    "host_hardware",
+)
+SCAN_FIELDS_THE_SKILL_READS = (
+    "strongest_groups",
+    "counts_by_state",
+    "counts_by_flag",
+    "hosts_over_cpu_threshold",
+    "hosts_near_memory_capacity",
+    "hosts_not_connected",
+    "hosts_with_hardware_problems",
+    "more_abnormal_vms",
+)
+
+
+def test_the_fields_the_skill_reads_are_in_the_results(server: MCPServer) -> None:
+    diagnosis = call(
+        server,
+        "diagnose_vm",
+        {"vcenter": "vc-a", "env_id": "env-1001", "vm_name": "web-01", "console_captures": 0},
+    )
+    fleet = call(server, "scan", {"vcenters": ["vc-a"]})
+
+    def missing(result: dict[str, Any], path: str) -> bool:
+        value: Any = result
+        for key in path.split("."):
+            if not isinstance(value, dict) or key not in value:
+                return True
+            value = value[key]
+        return False
+
+    assert [path for path in DIAGNOSE_PATHS_THE_SKILL_READS if missing(diagnosis, path)] == []
+    assert [field for field in SCAN_FIELDS_THE_SKILL_READS if field not in fleet] == []
+
+
 def test_cpu_starvation_on_an_overcommitted_host(
     server: MCPServer, worlds: tuple[scenario.World, ...]
 ) -> None:

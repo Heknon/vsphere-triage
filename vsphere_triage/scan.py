@@ -484,7 +484,7 @@ def summary(scan: Scan, *, states: Sequence[str] = FLAGGED, limit: int) -> dict[
     flagged_off = sum(1 for _, verdict in abnormal if verdict.state == OFF)
     # Asked for other states (healthy, no_tools), the groups hold those VMs: say so,
     # or "3 of 3 on a base disk are abnormal" would send a reader after healthy VMs.
-    word = "abnormal" if tuple(states) == FLAGGED else " or ".join(stuck)
+    word = "abnormal" if set(stuck) <= set(FLAGGED) else " or ".join(stuck)
     findings.append(
         f"{abnormal_on} {word} of {considered} powered-on VMs across {len(scan.vcenters)} vCenter(s)"
         + (f"; {flagged_off} powered-off VM(s) also flagged" if flagged_off else "")
@@ -594,8 +594,7 @@ def summary(scan: Scan, *, states: Sequence[str] = FLAGGED, limit: int) -> dict[
         "abnormal_vms_truncated": max(0, len(rows) - limit),
         # The rest in one line each, so a reader can name them all without a second scan.
         "more_abnormal_vms": [
-            f"{vm.vcenter}/{vm.moref} {vm.name} in {vm.folder}: {verdict.state}"
-            + (f" ({', '.join(verdict.flags)})" if verdict.flags else "")
+            brief(vm.identity() | {"verdict": verdict.as_dict()})
             for vm, verdict in rows[limit : limit + MORE_LISTED]
         ],
         "next": (
@@ -603,6 +602,13 @@ def summary(scan: Scan, *, states: Sequence[str] = FLAGGED, limit: int) -> dict[
             "diagnose_vm on its representatives"
         ),
     }
+
+
+def brief(row: dict[str, Any]) -> str:
+    """One abnormal VM in a line: where it is, its state, and the flags that make it abnormal."""
+    verdict = row["verdict"]
+    flags = f" ({', '.join(verdict['flags'])})" if verdict.get("flags") else ""
+    return f"{row['vcenter']}/{row['moref']} {row['name']} in {row['folder']}: {verdict['state']}{flags}"
 
 
 def _row_verdict(verdict: Verdict) -> dict[str, Any]:

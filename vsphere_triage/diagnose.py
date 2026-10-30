@@ -582,7 +582,11 @@ def environment_pattern(
         "abnormal_base_disks": dict(Counter(peer.base_disk for peer, _ in abnormal if peer.base_disk)),
         "healthy_base_disks": dict(Counter(peer.base_disk for peer, _ in healthy if peer.base_disk)),
         # What a device check flags on the healthy VMs too cannot be what stops this one.
-        "healthy_device_blocks": sorted({text for peer, _ in healthy for text in peer.device_blocks}),
+        # The VM itself is left out: a booting VM counts as healthy, and must not be
+        # compared with itself.
+        "healthy_device_blocks": sorted(
+            {text for peer, _ in healthy if peer.moref != vm.moref for text in peer.device_blocks}
+        ),
         "vm_list": [
             {
                 "name": peer.name,
@@ -671,14 +675,16 @@ def conclude(  # noqa: C901, PLR0912, PLR0913, PLR0915 - one ordered list of cau
         # A hint: a disconnected NIC or a device error can matter (PXE, a stuck
         # device), but rarely stops a boot from completing, so it is weighed
         # below a CPU or storage cause rather than above it.
-        evidence(HARDWARE, weight=1, text=finding)
         if finding in shared_devices:
+            # Not counted for: a healthy VM has it too. Said, so a reader need not check.
             evidence(
                 HARDWARE,
-                weight=2,
+                weight=0,
                 against=True,
                 text=f"a healthy VM in its environment has the same: {finding}",
             )
+        else:
+            evidence(HARDWARE, weight=1, text=finding)
     if snapshots and snapshots["count"]:
         gb = snapshots["total_bytes"] / (1024**3)
         if gb >= 1:
@@ -928,6 +934,13 @@ def conclude(  # noqa: C901, PLR0912, PLR0913, PLR0915 - one ordered list of cau
     if verdict.state == BUSY_NOT_UP:
         evidence(STILL_WORKING, weight=1, text=verdict.reasons[-1])
 
+    if BOOT_LOOP_CAUSE in causes and EARLY_HANG in causes:
+        # Each boot of a loop stops early, then resets: what reads as an early hang
+        # (a black console, a log that stops at firmware) is one turn of the loop.
+        hang = causes.pop(EARLY_HANG)
+        loop = causes[BOOT_LOOP_CAUSE]
+        loop["for"].extend(f"each boot stops early: {text}" for text in hang["for"])
+        loop["score"] += max(hang["score"], 0)
     ranked = sorted(causes.values(), key=lambda entry: entry["score"], reverse=True)
     for entry in ranked:
         support, opposed = len(entry["for"]), len(entry["against"])

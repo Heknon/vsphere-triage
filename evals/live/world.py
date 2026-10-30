@@ -93,7 +93,9 @@ def main() -> None:
                 else:
                     text = "\n".join(getattr(part, "text", "") for part in result.content)
                 error = bool(result.is_error)
-                vm = (result.structured_content or {}).get("vm") or {}
+                content = result.structured_content or {}
+                # Some results name the VM under "vm", others at the top level.
+                vm = content.get("vm") if isinstance(content.get("vm"), dict) else content
             except Exception as failure:  # noqa: BLE001 - the model sees the error, as a client would
                 text, error, vm = f"Error: {failure}", True, {}
             with lock, (RUNS / f"{body.get('run', 'adhoc')}.jsonl").open("a") as log:
@@ -103,7 +105,10 @@ def main() -> None:
                             "tool": body["tool"],
                             "arguments": body.get("arguments"),
                             "error": error,
-                            "moref": vm.get("moref") if isinstance(vm, dict) else None,
+                            "vm": [
+                                vm.get("vcenter") or (body.get("arguments") or {}).get("vcenter"),
+                                vm.get("moref") or (body.get("arguments") or {}).get("moref"),
+                            ],
                             "characters": len(text),
                             "seconds": round(time.monotonic() - started, 1),
                         }

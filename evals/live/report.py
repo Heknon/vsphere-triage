@@ -14,12 +14,14 @@ redundant = set(spec["redundant_after_diagnose_vm"])
 names = sys.argv[1:] or sorted(path.stem for path in (HERE / "runs").glob("*.jsonl"))
 for name in names:
     calls = [json.loads(line) for line in (HERE / "runs" / f"{name}.jsonl").read_text().splitlines()]
-    diagnosed: set[str] = set()
+    diagnosed: set[tuple[str, str]] = set()
     repeats = []
     for row in calls:
+        # (vCenter, moref): the two simulated vCenters hand out the same morefs.
+        key = tuple(row.get("vm") or ())
         if row["tool"] == "diagnose_vm" and not row["error"]:
-            diagnosed.add(row.get("moref"))
-        elif row["tool"] in redundant and row.get("moref") in diagnosed:
+            diagnosed.add(key)
+        elif row["tool"] in redundant and key in diagnosed:
             repeats.append(row["tool"])
     read = sum(row["characters"] for row in calls)
     print(
