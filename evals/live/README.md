@@ -76,4 +76,38 @@ One run per scenario per round, on a simulator: evidence of direction, not a
 benchmark. vcsim gives every VM 32 MB of RAM and a disconnected NIC, which a
 careful model sometimes notes; both are simulator defaults.
 
+### Rounds 6 to 8: twelve scenarios
+
+Six more scenarios cover a configured CPU limit, a Linux kernel console, a VM
+without Tools, leftover environments, an ambiguous VM name and snapshots across
+a template's clones. Each surfaced something:
+
+- A healthy VM's CPU and memory limits were no cause at all unless it was
+  stuck; then the CPU limit was "capped below full speed" even at 400 of 600
+  MHz, which Haiku rightly called not binding. The cause now says the usage
+  against the limit and weighs it by whether the VM is at the limit.
+- Snapshot sizes vCenter did not report read as 0.0 GB; they are null now.
+- A busy Linux guest was offered "Windows still working through boot".
+- `diagnose_vm` with a bare name said only which arguments it wanted; it now
+  says why a name is not enough and how to find the env id.
+
+Round 7 ran all twelve on the code after an independent review of the skill
+(nine contradictions with the server, fixed): **12 of 12 pass**. Round 8 re-ran
+the four scenarios the last change touched: **4 of 4 pass**.
+
+| scenario | round 7 | round 8 (final code) |
+|---|---|---|
+| storage-storm | pass, 9 calls | pass, 4 calls |
+| cpu-starvation | pass, 3 calls | |
+| fleet | pass, 11 calls | pass, 4 calls |
+| boot-loop | pass, 1 call | |
+| stop-code | pass, 1 call | |
+| question | pass, 1 call | |
+| cpu-limit | pass, 4 calls | pass, 3 calls |
+| linux-console | pass, 2 calls | pass, 1 call |
+| no-tools | pass, 1 call | |
+| old-environments | pass, 2 calls | |
+| ambiguous-name | pass, 5 calls | |
+| template-snapshots | pass, 1 call | |
+
 No run, in any round, called a tool that acts on a VM.
