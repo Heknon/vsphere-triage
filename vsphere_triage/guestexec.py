@@ -44,14 +44,16 @@ def guest_program_spec(command: str, out_path: str, *, windows: bool) -> tuple[s
     The whole command is captured, not only its last part: on Linux the shell's
     own output is redirected first (`exec >`), so `a; b`, `a || b` and `a && b`
     all land in the file; on Windows the command is grouped in parentheses.
-    The command is handed to the guest's shell as-is; a command containing the
-    shell's own quote character (or, on Windows, an unbalanced parenthesis) can
-    break the wrapping, which is a known limit of running an arbitrary string
-    rather than an argv.
+    On Linux, VMware Tools starts the program line itself through `/bin/sh -c`,
+    so the arguments pass through a second shell first, which would expand `$2`,
+    backticks and backslashes in the command; the command therefore travels
+    base64-encoded (`encode_shell`) and reaches its shell byte for byte. On
+    Windows it is handed to cmd.exe as-is; an unbalanced parenthesis or a quote
+    can break the wrapping there, a known limit of running a string, not an argv.
     """
     if windows:
         return WINDOWS_SHELL, f'/c ({command}) > "{out_path}" 2>&1'
-    return LINUX_SHELL, f"-c \"exec > '{out_path}' 2>&1; {command}\""
+    return LINUX_SHELL, f"-c \"exec > '{out_path}' 2>&1; {encode_shell(command)}\""
 
 
 # PowerShell writes what it prints in the guest's OEM codepage (437, 850, 932,

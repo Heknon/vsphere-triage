@@ -122,6 +122,9 @@ HOST_TIME_PATHS = (
 )
 TIME_SERVICE_KEYS = ("ntpd", "chronyd", "ptpd")
 FOLDER_PATHS = ("name", "parent", "childType")
+# A vApp holds VMs as a folder does (vCloud Director builds every environment
+# from them) but is a resource pool: a VM in one has no parent folder.
+VAPP_PATHS = ("name", "parentFolder", "parentVApp")
 DATACENTER_PATHS = ("name", "parent", "vmFolder")
 CLUSTER_PATHS = ("name",)
 
@@ -571,8 +574,15 @@ def describe_devices(
     return described, findings, blocking
 
 
-DEVICE_QUERY_PATHS = ("name", "parent", "config.template", "config.hardware.device")
-SNAPSHOT_LIST_PATHS = ("name", "parent", "config.template", "runtime.consolidationNeeded", "snapshot")
+DEVICE_QUERY_PATHS = ("name", "parent", "parentVApp", "config.template", "config.hardware.device")
+SNAPSHOT_LIST_PATHS = (
+    "name",
+    "parent",
+    "parentVApp",
+    "config.template",
+    "runtime.consolidationNeeded",
+    "snapshot",
+)
 SNAPSHOT_STATE_TYPES = ("snapshotData", "snapshotMemory")
 
 
@@ -681,8 +691,7 @@ def read_vm_snapshots(session: VCenterSession, folders: dict[str, FolderFacts]) 
         usage = snapshot_usage(row.get("snapshot"), layouts.get(row["moref"]), read_at)
         if usage is None:
             continue
-        parent = row.get("parent")
-        folder = folders.get(parent._moId) if parent is not None else None  # noqa: SLF001
+        folder = folder_of(row, folders)
         result.append(
             {
                 "vcenter": session.vcenter.name,
@@ -724,8 +733,7 @@ def read_vm_devices(session: VCenterSession, folders: dict[str, FolderFacts]) ->
         for device in devices:
             kind = device_kind(device)
             by_category.setdefault(_device_category(device), []).append(kind)
-        parent = row.get("parent")
-        folder = folders.get(parent._moId) if parent is not None else None  # noqa: SLF001
+        folder = folder_of(row, folders)
         result.append(
             {
                 "vcenter": session.vcenter.name,
@@ -746,6 +754,7 @@ def read_vm_devices(session: VCenterSession, folders: dict[str, FolderFacts]) ->
 RESOURCE_POLICY_PATHS = (
     "name",
     "parent",
+    "parentVApp",
     "config.template",
     "summary.config.numCpu",
     "summary.config.memorySizeMB",
@@ -783,8 +792,7 @@ def read_vm_resource_policy(session: VCenterSession, folders: dict[str, FolderFa
     bases = base_disks_for(session, [row["_ref"] for row in constrained])
     result = []
     for row in rows:
-        parent = row.get("parent")
-        folder = folders.get(parent._moId) if parent is not None else None  # noqa: SLF001
+        folder = folder_of(row, folders)
         result.append(
             {
                 "vcenter": session.vcenter.name,
@@ -878,11 +886,23 @@ def read_host_time(session: VCenterSession) -> list[dict[str, Any]]:
     return result
 
 
-def read_folders(session: VCenterSession) -> dict[str, FolderFacts]:
-    """Every folder with its path from its datacenter, read in two calls."""
+def folder_of(row: dict[str, Any], folders: dict[str, FolderFacts]) -> FolderFacts | None:
+    """A VM row's folder: its parent folder, or the vApp it is in (read_folders lists both)."""
+    parent = row.get("parent") or row.get("parentVApp")
+    return folders.get(parent._moId) if parent is not None else None  # noqa: SLF001
+
+
+def read_folders(session: VCenterSession) -> dict[str, FolderFacts]:  # noqa: C901 - one walk, folders and vApps
+    """Every folder, and every vApp as one, with its path from its datacenter."""
     datacenters = session.retrieve(vim.Datacenter, DATACENTER_PATHS)
     rows = session.retrieve(vim.Folder, FOLDER_PATHS)
     raw = {row["moref"]: row for row in rows}
+    # A vApp sits in a folder or in another vApp; as a folder it has that parent.
+    for row in session.retrieve(vim.VirtualApp, VAPP_PATHS):
+        parent = row.get("parentVApp") or row.get("parentFolder")
+        raw.setdefault(
+            row["moref"], {"moref": row["moref"], "name": row.get("name", row["moref"]), "parent": parent}
+        )
 
     def datacenter_inventory_path(dc_row: dict[str, Any]) -> str:
         """The path the /folder endpoint's dcPath needs: the datacenter and any folders above it.
@@ -1060,7 +1080,7 @@ def read_inventory(
     )
 
 
-def vm_facts(  # noqa: C901, PLR0913, PLR0915 - one flattening of one row
+def vm_facts(  # noqa: C901, PLR0912, PLR0913, PLR0915 - one flattening of one row
     vcenter: str,
     row: dict[str, Any],
     read_at: datetime,
@@ -1079,7 +1099,10 @@ def vm_facts(  # noqa: C901, PLR0913, PLR0915 - one flattening of one row
     if vapp is not None:
         facts.vapp_moref = vapp._moId  # noqa: SLF001
     parent = row.get("parent")
-    if parent is not None and isinstance(parent, vim.Folder):
+    if parent is None and vapp is not None and vapp._moId in folders:  # noqa: SLF001
+        # A VM in a vApp: the vApp is its folder, as read_folders lists it.
+        parent = vapp
+    if parent is not None and (isinstance(parent, vim.Folder) or parent is vapp):
         folder = folders.get(parent._moId)  # noqa: SLF001
         facts.folder_moref = parent._moId  # noqa: SLF001
         if folder is not None:
@@ -1089,7 +1112,7 @@ def vm_facts(  # noqa: C901, PLR0913, PLR0915 - one flattening of one row
             facts.datacenter = folder.datacenter
             facts.datacenter_path = folder.datacenter_path
     elif parent is None:
-        facts.notes.append("vCenter reports no parent folder for this VM (it may belong to a vApp)")
+        facts.notes.append("vCenter reports no parent folder or vApp for this VM")
     facts.instance_uuid = row.get("config.instanceUuid")
     created = row.get("config.createDate")
     facts.created = as_utc(created) if isinstance(created, datetime) else None

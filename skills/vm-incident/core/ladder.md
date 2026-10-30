@@ -69,7 +69,7 @@ Read it in this order:
 
 `scan(vcenters=[…])`. Read `strongest_groups` and `counts_by_state` before the
 per-VM list. The strongest group is usually the finding, e.g. "29 of 210 on
-datastore vc-04:ds-17, 1.9x the fleet rate". Also read
+datastore vc-04:DC1/ds-17, 1.9x the fleet rate". Also read
 `hosts_over_cpu_threshold`, `hosts_near_memory_capacity`, `hosts_not_connected`
 and `counts_by_flag`; a host or flag common to the stuck VMs is often the
 answer.

@@ -93,6 +93,11 @@ ATTENTION_FLAGS = (
     LONG_RUNNING,
     CONSOLIDATION_NEEDED,
 )
+# Attention flags that are context, not a VM in trouble: common on a healthy
+# fleet (every VM older than a day, swapped pages that stay counted long after
+# the pressure ended), so they are reported but never make a VM count as
+# abnormal in a scan's rates and groups.
+CONTEXT_FLAGS = (MEMORY_RECLAIMED, HOST_MEMORY_PRESSURE, VCENTER_ALARM, LONG_RUNNING, CONSOLIDATION_NEEDED)
 DETAIL_FLAGS = (HOST_IN_MAINTENANCE, TOOLS_OUTDATED, CPU_LIMITED, MEMORY_LIMITED)
 FLAGS = (*ATTENTION_FLAGS, *DETAIL_FLAGS)
 FLAG_MEANING = {

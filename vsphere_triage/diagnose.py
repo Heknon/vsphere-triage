@@ -760,36 +760,41 @@ def conclude(  # noqa: C901, PLR0912, PLR0913, PLR0915 - one ordered list of cau
             elif name in ("windows_logon", "linux_login"):
                 evidence(TOOLS_DID_NOT_START, weight=4, text=f"console: {state['meaning']}")
         read_words = bool(console.get("screen_states") or console.get("stop_codes"))
-        if console.get("frozen") and console.get("blue_screen_colour") and not read_words:
-            # Without the words, a still blue screen is most likely a stop error: the
-            # update and recovery screens on the same blue carry a moving spinner.
-            evidence(
-                WINDOWS_CRASH,
-                weight=2,
-                text="console mostly Windows blue and unchanged across captures (no OCR to confirm)",
-            )
-        if (
+        # Without the words, a still screen's colour is a hint only for a Windows VM
+        # that did not come up: an idle VM at a blue sign-in screen, or a Server Core
+        # console, is still too, and VGA-blue Linux installer screens score as blue.
+        guess_from_colour = (
             console.get("frozen")
-            and console.get("text_on_black")
-            and vm.os_family == "windows"
             and not read_words
-        ):
-            # Windows has no text console to log in at: still text on black is a boot
-            # error or the black stop-error screen of 24H2+.
+            and vm.os_family == "windows"
+            and vm.tools_running != "guestToolsRunning"
+        )
+        if guess_from_colour and console.get("blue_screen_colour"):
             evidence(
                 WINDOWS_CRASH,
                 weight=2,
-                text="console shows still text on a black screen on a Windows guest: a stop error "
-                "(the 24H2+ black screen) or a boot error (no OCR to confirm)",
+                text="console mostly Windows blue and unchanged, Tools not running (no OCR to confirm; "
+                "the recovery screens use the same blue)",
             )
-        elif console.get("frozen") and console.get("text_on_black"):
-            # A text console or login prompt, which is mostly black but not blank:
-            # the guest got far enough to print, so this is no early hang.
-            evidence(
-                TOOLS_DID_NOT_START,
-                weight=1,
-                text="console shows text on a dark screen (a text console or login prompt), unchanged",
-            )
+        if guess_from_colour and console.get("text_on_black"):
+            # Windows has no text console to log in at: still text on black is the
+            # black stop-error screen of 24H2+, or a firmware/boot-manager error.
+            for cause in (WINDOWS_CRASH, CANNOT_BOOT):
+                evidence(
+                    cause,
+                    weight=1,
+                    text="console shows still text on black on a Windows guest, Tools not running: a "
+                    "stop error (the 24H2+ black screen) or a boot error (no OCR to tell which)",
+                )
+        if console.get("frozen") and console.get("text_on_black"):
+            # Mostly black but not blank: something printed, so this is no early hang.
+            # On Linux it is a text console or login prompt; Windows has none.
+            if vm.os_family != "windows":
+                evidence(
+                    TOOLS_DID_NOT_START,
+                    weight=1,
+                    text="console shows text on a dark screen (a text console or login prompt), unchanged",
+                )
         elif console.get("frozen") and console.get("black"):
             evidence(EARLY_HANG, weight=2, text="console black and unchanged across captures")
         elif console.get("frozen"):

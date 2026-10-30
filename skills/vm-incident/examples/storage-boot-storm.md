@@ -17,7 +17,7 @@ linked-clone base disk.
 
 2. **vCenter — scan.** `scan(vcenters=["vc-04"])`:
    - `counts_by_state`: 33 `hung`, the rest healthy or booting.
-   - `strongest_groups[0]`: datastore `vc-04:ds-17`, 29 of 210 abnormal, 1.9×
+   - `strongest_groups[0]`: datastore `vc-04:DC1/ds-17` (vCenter, datacenter, datastore), 29 of 210 abnormal, 1.9×
      the fleet rate. `strongest_groups[1]`: base_disk
      `vc-04:[ds-17] base-win10/base-win10.vmdk`, 3× the fleet rate.
    - `storage_findings`: "datastore ds-17 write latency peaked at 180 ms".
@@ -25,9 +25,11 @@ linked-clone base disk.
    The finding is the group, not any VM.
 
 3. **vCenter — explain_group.** `explain_group(scan_id, "datastore",
-   "vc-04:ds-17")`:
-   - the 29 abnormal VMs rebooted between 02:10 and 02:16; the healthy VMs on
-     ds-17 rebooted before 02:09.
+   "vc-04:DC1/ds-17")`, the value exactly as the group gave it:
+   - `comparison`: what the 29 abnormal VMs share that the healthy VMs on ds-17
+     do not.
+   - `infrastructure["vc-04"].window`: 02:10 to 02:16, the span of the abnormal
+     VMs' boots that the host and storage counters below were read over.
    - `infrastructure`: device latency on ds-17 over 150 ms on four hosts
      02:09–02:17; host CPU normal. So it is the array, not the hosts, and not
      per-host queue.
@@ -35,7 +37,7 @@ linked-clone base disk.
 
 4. **vCenter — diagnose_vm on a representative.** `diagnose_vm(... moref of
    web-01)`: `machine.state` hung; `boot.timeline.last_stage` = firmware, then
-   nothing; `storage.datastores[ds-17].write_latency_ms.max` = 180 at 02:13.
+   nothing; the ds-17 entry in `storage.datastores`: `write_latency_ms.max` = 180 at 02:13.
    The boot stalled at the minute the latency peaked — the mechanism.
 
 5. **vROps.** `vrops_compare_window` on ds-17 latency, 02:00–02:30 vs 7 days:

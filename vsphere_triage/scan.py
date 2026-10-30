@@ -21,6 +21,7 @@ from typing import TYPE_CHECKING, Any
 from vsphere_triage.checks import (
     ABNORMAL,
     ATTENTION_FLAGS,
+    CONTEXT_FLAGS,
     FLAG_MEANING,
     FLAGS,
     MEANING,
@@ -79,6 +80,10 @@ GROUPS_PER_DIMENSION = 5
 REPRESENTATIVES = 3
 # What a scan reports by default: every abnormal state, and the flags.
 FLAGGED = (*ABNORMAL, *ATTENTION_FLAGS)
+# What counts as abnormal in rates and groups: the states, and the flags that
+# mean a VM in trouble. Context flags (long_running, memory_reclaimed, ...) are
+# listed but would otherwise make a fleet of old VMs read as all abnormal.
+STUCK = tuple(item for item in FLAGGED if item not in CONTEXT_FLAGS)
 # Anything a caller may ask a scan for: every state, every flag.
 SELECTABLE = (*STATES, *FLAGS)
 
@@ -213,8 +218,18 @@ async def run_scan(pool: VCenterPool, settings: Settings, names: Sequence[str]) 
     )
 
 
+def grouping_states(states: Sequence[str]) -> tuple[str, ...]:
+    """What makes a VM abnormal for rates and groups: `states` less the context flags.
+
+    A caller who asked for context flags alone (scan for long_running) gets them.
+    """
+    stuck = tuple(item for item in states if item not in CONTEXT_FLAGS)
+    return stuck or tuple(states)
+
+
 def groups(scan: Scan, *, states: Sequence[str] = FLAGGED) -> dict[str, list[dict[str, Any]]]:
     """The groups abnormal VMs fall into, per dimension, strongest first."""
+    states = grouping_states(states)
     considered = [(vm, verdict) for vm, verdict in scan.all_vms() if verdict.state != OFF]
     flagged = [(vm, verdict) for vm, verdict in considered if _counts(verdict, states)]
     if not considered or not flagged:
@@ -277,6 +292,8 @@ def summary(scan: Scan, *, states: Sequence[str] = FLAGGED, limit: int) -> dict[
     """A scan as a tool result: findings, counts, groups, infrastructure, then VMs."""
     everything = scan.all_vms()
     flagged = [(vm, verdict) for vm, verdict in everything if _counts(verdict, states)]
+    stuck = grouping_states(states)
+    abnormal = [(vm, verdict) for vm, verdict in flagged if _counts(verdict, stuck)]
     by_state = count_states({f"{vm.vcenter}/{vm.moref}": verdict for vm, verdict in everything})
     grouped = groups(scan, states=states)
     strongest = sorted(
@@ -323,13 +340,16 @@ def summary(scan: Scan, *, states: Sequence[str] = FLAGGED, limit: int) -> dict[
     # A powered-off leftover can carry an attention flag (long_running), so it is
     # flagged but not among the powered-on: count the two separately rather than
     # reporting "N abnormal of M powered-on" with N larger than M.
-    abnormal_on = sum(1 for _, verdict in flagged if verdict.state != OFF)
-    flagged_off = len(flagged) - abnormal_on
+    abnormal_on = sum(1 for _, verdict in abnormal if verdict.state != OFF)
+    context_only = len(flagged) - len(abnormal)
+    flagged_off = sum(1 for _, verdict in abnormal if verdict.state == OFF)
     findings.append(
         f"{abnormal_on} abnormal of {considered} powered-on VMs across {len(scan.vcenters)} vCenter(s)"
+        + (f"; {flagged_off} powered-off VM(s) also flagged" if flagged_off else "")
         + (
-            f"; {flagged_off} powered-off VM(s) also flagged (e.g. long-running leftovers)"
-            if flagged_off
+            f"; {context_only} more carry only context flags (long_running, memory_reclaimed, ...), "
+            "listed but not counted as abnormal"
+            if context_only
             else ""
         )
     )
@@ -375,6 +395,7 @@ def summary(scan: Scan, *, states: Sequence[str] = FLAGGED, limit: int) -> dict[
     rows = sorted(
         flagged,
         key=lambda pair: (
+            not _counts(pair[1], stuck),
             ABNORMAL.index(pair[1].state) if pair[1].state in ABNORMAL else len(ABNORMAL),
             -(pair[0].uptime_minutes or 0),
         ),
@@ -403,7 +424,8 @@ def summary(scan: Scan, *, states: Sequence[str] = FLAGGED, limit: int) -> dict[
             for name, vscan in scan.vcenters.items()
         },
         "errors": scan.errors,
-        "abnormal_vms_total": len(flagged),
+        "abnormal_vms_total": len(abnormal),
+        "context_flagged_vms_total": context_only,
         "abnormal_vms": [
             vm.identity() | {"verdict": verdict.as_dict(), "notes": vm.notes} for vm, verdict in rows[:limit]
         ],
@@ -467,8 +489,8 @@ async def explain_group(  # noqa: C901 - one comparison, then one check per vCen
     inside = [
         (vm, verdict) for vm, verdict in scan.all_vms() if value in values_of(vm) and verdict.state != OFF
     ]
-    members = [vm for vm, verdict in inside if _counts(verdict, FLAGGED)]
-    healthy = [vm for vm, verdict in inside if not _counts(verdict, FLAGGED)]
+    members = [vm for vm, verdict in inside if _counts(verdict, STUCK)]
+    healthy = [vm for vm, verdict in inside if not _counts(verdict, STUCK)]
     if not members:
         return {"found": False, "reason": f"no abnormal VMs on {dimension} {value!r} in scan {scan.id}"}
     comparison = {}

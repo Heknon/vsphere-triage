@@ -9,6 +9,7 @@ import re
 import ssl
 from datetime import UTC, datetime, timedelta
 from types import SimpleNamespace
+from typing import TYPE_CHECKING
 
 import httpx
 import pytest
@@ -57,6 +58,9 @@ from vsphere_triage.inventory import (
 from vsphere_triage.readonly import ALLOWED_METHODS, ReadOnlyStub, ReadOnlyViolationError, ensure_read_request
 from vsphere_triage.vcenter import PerfSeries, VCenterSession, ssl_context
 from vsphere_triage.vrops import Vrops
+
+if TYPE_CHECKING:
+    import pathlib
 
 NOW = datetime(2026, 10, 29, 2, 30, tzinfo=UTC)
 LIMITS = Thresholds()
@@ -1434,7 +1438,24 @@ def test_the_linux_shell_wraps_the_command_and_captures_output() -> None:
     program, arguments = guestexec.guest_program_spec("systemctl status", "/tmp/o.txt", windows=False)  # noqa: S108
 
     assert program == "/bin/sh"
-    assert arguments == "-c \"exec > '/tmp/o.txt' 2>&1; systemctl status\""
+    assert arguments.startswith("-c \"exec > '/tmp/o.txt' 2>&1; echo ")
+    assert "systemctl" not in arguments
+
+
+def test_a_linux_command_survives_the_shell_tools_starts_it_through(tmp_path: pathlib.Path) -> None:
+    import shutil  # noqa: PLC0415
+    import subprocess  # noqa: PLC0415
+
+    if shutil.which("sh") is None or shutil.which("base64") is None:
+        pytest.skip("needs sh and base64")
+    out = tmp_path / "o.txt"
+    command = "echo 'a b c' | awk '{print $2}'; echo \"`echo tick`\" \\done"
+    program, arguments = guestexec.guest_program_spec(command, str(out), windows=False)
+
+    # open-vm-tools runs `"<program>" <arguments>` through /bin/sh -c.
+    subprocess.run(["/bin/sh", "-c", f'"{program}" {arguments}'], check=True)
+
+    assert out.read_text().splitlines() == ["b", "tick done"]
 
 
 def test_the_guest_temp_path_is_os_specific() -> None:
@@ -3479,17 +3500,8 @@ def test_a_blinking_cursor_alone_does_not_unfreeze_a_screen() -> None:
     assert result["frozen"] is True
 
 
-def test_a_still_blue_screen_without_ocr_is_crash_evidence() -> None:
-    result = conclude(
-        console={"available": True, "frozen": True, "blue_screen_colour": True, "screen_states": []}
-    )
-
-    assert any(cause["cause"] == diagnose.WINDOWS_CRASH for cause in result["causes"])
-
-
-def test_still_text_on_black_on_windows_is_a_crash_not_a_login_prompt() -> None:
-    machine = vm(cpu_mhz=3600.0, os_family="windows")
-    result = diagnose.conclude(
+def _conclude_screen(machine: VmFacts, console_reading: dict) -> dict:
+    return diagnose.conclude(
         checks.classify(machine, LIMITS),
         vm=machine,
         cpu={"findings": [], "starved": False},
@@ -3497,13 +3509,42 @@ def test_still_text_on_black_on_windows_is_a_crash_not_a_login_prompt() -> None:
         environment={"signals": []},
         logs={"available": False},
         serial={"available": False},
-        console={"available": True, "frozen": True, "black": True, "text_on_black": True},
+        console={"available": True, **console_reading},
         host_log={"available": False},
+    )
+
+
+def test_a_still_blue_screen_without_ocr_is_crash_evidence_only_for_a_windows_vm_that_is_down() -> None:
+    blue = {"frozen": True, "blue_screen_colour": True, "screen_states": []}
+
+    down = _conclude_screen(vm(cpu_mhz=3600.0, os_family="windows"), blue)
+    idle = _conclude_screen(
+        vm(
+            cpu_mhz=30.0,
+            os_family="windows",
+            tools_running="guestToolsRunning",
+            heartbeat="green",
+            uptime_minutes=4000.0,
+        ),
+        blue,
+    )
+    installer = _conclude_screen(vm(cpu_mhz=3600.0, os_family="linux"), blue)
+
+    assert any(cause["cause"] == diagnose.WINDOWS_CRASH for cause in down["causes"])
+    assert not any(cause["cause"] == diagnose.WINDOWS_CRASH for cause in idle["causes"])
+    assert not any(cause["cause"] == diagnose.WINDOWS_CRASH for cause in installer["causes"])
+
+
+def test_still_text_on_black_on_a_down_windows_vm_is_a_crash_or_boot_error_not_a_login() -> None:
+    result = _conclude_screen(
+        vm(cpu_mhz=3600.0, os_family="windows"), {"frozen": True, "black": True, "text_on_black": True}
     )
 
     causes = [cause["cause"] for cause in result["causes"]]
     assert diagnose.WINDOWS_CRASH in causes
+    assert diagnose.CANNOT_BOOT in causes
     assert diagnose.TOOLS_DID_NOT_START not in causes
+    assert diagnose.EARLY_HANG not in causes
 
 
 def test_a_guest_reboot_in_the_same_log_starts_a_new_boot() -> None:
@@ -3577,3 +3618,63 @@ def test_a_vcenter_that_is_not_a_vim_server_is_reported_unreachable(monkeypatch:
 
     with pytest.raises(VSphereError, match="unreachable"):
         session.connect()
+
+
+def test_context_flags_on_an_old_fleet_do_not_drown_the_stuck_group() -> None:
+    fleet = [
+        vm(
+            moref=f"vm-{index}",
+            host=f"esx-{index % 10}",
+            datastores=["ds-17" if index < 40 else f"ds-{index % 5}"],
+            created=NOW - timedelta(days=30),
+            read_at=NOW,
+            uptime_minutes=600.0,
+            swapped_mb=64 if index % 2 else 0,
+            tools_running="guestToolsNotRunning" if index < 30 else "guestToolsRunning",
+            heartbeat="gray" if index < 30 else "green",
+        )
+        for index in range(300)
+    ]
+
+    result = scan.summary(scan_of(fleet), limit=10)
+
+    assert result["findings"][0].startswith("30 abnormal of 300 powered-on VMs")
+    assert result["abnormal_vms_total"] == 30
+    assert result["context_flagged_vms_total"] == 270
+    assert result["strongest_groups"][0]["dimension"] == "datastore"
+    assert result["strongest_groups"][0]["value"].endswith("ds-17")
+    assert all(item["verdict"]["state"] != "ok" for item in result["abnormal_vms"][:10])
+
+
+def test_a_vm_in_a_vapp_gets_the_vapp_as_its_environment_folder() -> None:
+    from vsphere_triage import inventory  # noqa: PLC0415
+
+    root, vm_folder, vdc = vim.Folder("group-d1"), vim.Folder("group-v3"), vim.Folder("group-v9")
+    vapp = vim.VirtualApp("resgroup-v42")
+    rows = {
+        vim.Datacenter: [{"moref": "datacenter-2", "name": "DC0", "parent": root, "vmFolder": vm_folder}],
+        vim.Folder: [
+            {"moref": "group-d1", "name": "Datacenters", "parent": None},
+            {"moref": "group-v3", "name": "vm", "parent": vim.Datacenter("datacenter-2")},
+            {"moref": "group-v9", "name": "vdc-prod", "parent": vm_folder},
+        ],
+        vim.VirtualApp: [{"moref": "resgroup-v42", "name": "env-1003", "parentFolder": vdc}],
+    }
+    session = SimpleNamespace(retrieve=lambda kind, _paths: rows.get(kind, []))
+
+    folders = inventory.read_folders(session)
+    facts = inventory.vm_facts(
+        "vc-a",
+        {"moref": "vm-7", "name": "web-01", "parent": None, "parentVApp": vapp},
+        NOW,
+        folders,
+        {},
+        {},
+        with_devices=False,
+    )
+
+    assert facts.folder == "env-1003"
+    assert facts.folder_path == "/DC0/vm/vdc-prod/env-1003"
+    assert facts.folder_parent == "vdc-prod"
+    assert facts.datacenter == "DC0"
+    assert [folder.moref for folder in find_environment(folders, "env-1003")] == ["resgroup-v42"]

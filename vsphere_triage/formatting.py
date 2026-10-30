@@ -9,8 +9,9 @@ from typing import Any
 
 # Measured as the client receives it (the MCP SDK sends the JSON indented), and
 # kept under the default tool-output limit of common clients (Claude Code: 25,000
-# tokens), so a large result arrives cut down rather than refused by the client.
-MAX_RESPONSE_CHARACTERS = 80_000
+# tokens; this JSON runs about 2.5 to 3 characters a token), so a large result
+# arrives cut down rather than refused by the client.
+MAX_RESPONSE_CHARACTERS = 60_000
 # How far a list is cut, in turn, when a response is too large.
 LIST_CUTS = (200, 80, 30, 10, 3)
 

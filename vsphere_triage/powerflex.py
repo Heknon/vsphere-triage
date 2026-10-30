@@ -340,10 +340,16 @@ def summarize_health(
         findings.append(f"{len(sds_down)} SDS node(s) not healthy — the backend is degraded")
     if devices_bad:
         findings.append(f"{len(devices_bad)} device(s) in an error/abnormal state")
-    if degraded and not rebuild_active:
+    if degraded:
         findings.append(
-            "data is down to one copy (semi-protected/degraded capacity) and no rebuild is running — "
-            "no spare capacity, or a rebuild that has not started or has stalled; one more failure loses data"
+            "data is down to one copy (semi-protected/degraded capacity)"
+            + (
+                " and a rebuild is reported"
+                if rebuild_active
+                else " and no rebuild is running — no spare capacity, or a rebuild that has not started or "
+                "has stalled"
+            )
+            + "; one more failure loses data"
         )
     if rebuild_active:
         findings.append(

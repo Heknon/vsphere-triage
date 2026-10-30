@@ -29,7 +29,7 @@
     {
       "id": "storage-boot-storm",
       "prompt": "We're getting VMware Tools errors across lots of environments on vc-04 since about 02:10. Find what's stuck and why.",
-      "provides": "scan (33 hung; strongest group datastore vc-04:ds-17 1.9x, base_disk 3x; ds-17 latency 180 ms); explain_group on ds-17 (29 rebooted 02:10-02:16, healthy ones rebooted before; device latency >150 ms on 4 hosts, host CPU normal); diagnose_vm on a representative (boot stops after firmware, ds-17 latency 180 ms at 02:13); vrops_compare_window (nightly spike at 02:10).",
+      "provides": "scan (33 hung; strongest group datastore vc-04:DC1/ds-17 1.9x, base_disk 3x; ds-17 latency 180 ms); explain_group on ds-17 (window 02:10-02:16, the abnormal VMs' boots; device latency >150 ms on 4 hosts, host CPU normal); diagnose_vm on a representative (boot stops after firmware, ds-17 latency 180 ms at 02:13); vrops_compare_window (nightly spike at 02:10).",
       "must": [
         "leads with the group (29 of 33 on ds-17), not one VM",
         "names storage-array saturation on the ds-17 pool as the cause",
