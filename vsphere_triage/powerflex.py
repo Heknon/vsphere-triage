@@ -166,8 +166,14 @@ _REBUILD_KEYS = (
     "activeMovingInBckRebuildJobs",
     "pendingMovingInFwdRebuildJobs",
     "pendingMovingInBckRebuildJobs",
+    "pendingNormRebuildCapacityInKb",
+    "activeNormRebuildCapacityInKb",
+    "activeMovingInNormRebuildJobs",
+    "pendingMovingInNormRebuildJobs",
     "rebuildPendingCapacityInKb",
 )
+# The subset that means redundancy is lost, which holds with or without a rebuild.
+_DEGRADED_KEYS = _REBUILD_KEYS[:6]
 _REBALANCE_KEYS = (
     "rebalanceCapacityInKb",
     "pendingRebalanceCapacityInKb",
@@ -319,19 +325,26 @@ def summarize_health(
         or str(device.get("errorState", "None")).lower() not in ("none", "")
     ]
     pending = {key: system_stats.get(key) for key in _PD_DEGRADED_KEYS if _positive(system_stats.get(key))}
-    rebuild_active = any(key in _REBUILD_KEYS for key in pending)
+    degraded = any(key in _DEGRADED_KEYS for key in pending)
+    rebuild_active = any(key in _REBUILD_KEYS and key not in _DEGRADED_KEYS for key in pending)
     rebalance_active = any(key in _REBALANCE_KEYS for key in pending)
     data_unavailable = any(key in _FAILED_KEYS for key in pending)
     findings = []
     if data_unavailable:
         findings.append(
-            "capacity has failed with no copy left (failedCapacityInKb) — data on it is unavailable, "
-            "so VMs on those volumes are blocked on I/O"
+            "capacity is failed or inaccessible ("
+            + ", ".join(key for key in _FAILED_KEYS if key in pending)
+            + ") — data with no reachable copy is unavailable, so VMs on those volumes can block on I/O"
         )
     if sds_down:
         findings.append(f"{len(sds_down)} SDS node(s) not healthy — the backend is degraded")
     if devices_bad:
         findings.append(f"{len(devices_bad)} device(s) in an error/abnormal state")
+    if degraded and not rebuild_active:
+        findings.append(
+            "data is down to one copy (semi-protected/degraded capacity) and no rebuild is running — "
+            "no spare capacity, or a rebuild that has not started or has stalled; one more failure loses data"
+        )
     if rebuild_active:
         findings.append(
             "a rebuild is in progress (degraded/rebuild capacity pending) — the usual cause of backend "
@@ -346,7 +359,7 @@ def summarize_health(
         for label, value in (("SDS list", sds), ("devices", devices), ("system statistics", system_stats))
         if not value
     ]
-    trouble = bool(sds_down or devices_bad or rebuild_active or data_unavailable)
+    trouble = bool(sds_down or devices_bad or degraded or rebuild_active or data_unavailable)
     healthy: bool | None = False if trouble else (None if unread else True)
     if not trouble and unread:
         findings.append(
@@ -361,6 +374,7 @@ def summarize_health(
         "sds_total": len(sds),
         "sds_down": [node.get("name") or node.get("id") for node in sds_down],
         "devices_bad_total": len(devices_bad),
+        "degraded": degraded,
         "rebuild_active": rebuild_active,
         "rebalance_active": rebalance_active,
         "pending_capacity": pending,

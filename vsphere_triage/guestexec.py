@@ -99,6 +99,8 @@ def probe_failed(result: dict[str, Any]) -> str | None:
     """
     if result.get("timed_out"):
         return f"the guest probe did not finish within its timeout (exit code {result.get('exit_code')})"
+    if result.get("output_error"):
+        return f"the guest probe's output could not be read back: {result['output_error']}"
     if not str(result.get("output") or "").strip():
         return f"the guest probe produced no output (exit code {result.get('exit_code')})"
     return None

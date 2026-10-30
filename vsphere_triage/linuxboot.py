@@ -42,9 +42,9 @@ def boot_probe_shell() -> str:
     """A /bin/sh script that prints the Linux boot evidence in marked sections."""
     # Specific phrases only: a bare "panic" also matches the kernel command line's
     # "panic=1", and noise like that pushes real faults out of the last 40 lines kept.
-    patterns = "kernel panic|oops|call trace|hung_task|blocked for more than|soft lockup|rcu.*stall|"
+    patterns = "kernel panic|oops([^=]|$)|call trace|hung_task|blocked for more than|soft lockup|rcu.*stall|"
     patterns += "i/o error|blk_update_request|ext4-fs error|xfs.*(error|corrupt)|timed out|"
-    patterns += "dracut-initqueue.*timeout|emergency mode"
+    patterns += "dracut.*(timeout|emergency|could not boot)|emergency mode"
     return (
         "echo ===LAST_BOOT===; (uptime -s 2>/dev/null || who -b 2>/dev/null);"
         "echo ===BLAME===; systemd-analyze blame 2>/dev/null | head -n 15;"

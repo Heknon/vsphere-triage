@@ -623,8 +623,8 @@ async def diagnose_window(
         per_vcenter[name] = result
         if result["events_capped"]:
             findings.append(
-                f"{name}: vCenter returned its maximum of {QUERY_EVENTS_CAP} events; "
-                "narrow the window for complete counts"
+                f"{name}: some part of the window still held over {QUERY_EVENTS_CAP} events after "
+                "splitting it; counts are incomplete, narrow the window"
             )
         resets = sum(result["events_by_type"].get(kind, 0) for kind in RESET_EVENTS)
         failures = result["events_by_type"].get("VmFailedToPowerOnEvent", 0)

@@ -25,7 +25,7 @@ from dataclasses import dataclass, field
 from datetime import UTC, datetime, timedelta
 from http.client import HTTPException
 from typing import TYPE_CHECKING, Any, TypeVar
-from urllib.parse import quote, unquote
+from urllib.parse import quote
 
 import httpx
 from pyVim.connect import Disconnect, SmartConnect
@@ -922,9 +922,9 @@ class VCenterSession:
         # with the whole file, which the stream below caps and tails itself.
         request = self._get_request(
             "/folder/" + quote(inside),
-            # vSphere returns names with %, / and \\ already escaped (%25, %2f, %5c);
-            # undo that, or the request's own encoding would escape them twice.
-            {"dcPath": unquote(datacenter), "dsName": unquote(datastore)},
+            # Names go as vSphere returns them (%, / and \\ escaped as %25, %2f,
+            # %5c) and are URL-encoded on top, as govmomi's Datastore.NewURL does.
+            {"dcPath": datacenter, "dsName": datastore},
             headers={"Range": f"bytes=-{max_bytes}"},
         )
         assert self._http is not None  # noqa: S101 - set by _get_request

@@ -200,7 +200,7 @@ LINUX_MARKS: tuple[tuple[str, str | None, re.Pattern[str]], ...] = (
         "storage: the filesystem reported errors",
         re.compile(r"(?i)(ext4-fs error|xfs.*(error|corrupt))"),
     ),
-    ("oops", None, re.compile(r"(?i)(\boops\b|call trace)")),
+    ("oops", None, re.compile(r"(?i)(\boops\b(?!=)|call trace)")),
 )
 
 

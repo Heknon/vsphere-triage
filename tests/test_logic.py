@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import io
 import json
+import re
 import ssl
 from datetime import UTC, datetime, timedelta
 from types import SimpleNamespace
@@ -3318,8 +3319,33 @@ def test_a_degraded_pool_with_no_rebuild_running_is_not_healthy() -> None:
     unreachable = powerflex.summarize_health(sds, devices, {"inaccessibleCapacityInKb": 10})
 
     assert degraded["healthy"] is False
-    assert degraded["rebuild_active"] is True
+    assert degraded["degraded"] is True
+    assert degraded["rebuild_active"] is False
+    assert any("no rebuild is running" in finding for finding in degraded["findings"])
     assert unreachable["data_unavailable"] is True
+    assert any("inaccessibleCapacityInKb" in finding for finding in unreachable["findings"])
+
+
+def test_the_dmesg_filter_keeps_dracut_failures_and_drops_oops_on_the_command_line() -> None:
+    script = linuxboot.boot_probe_shell()
+    pattern = re.search(r"grep -iE '([^']+)'", script)
+    assert pattern
+    keep = re.compile(pattern.group(1), re.IGNORECASE)
+
+    assert keep.search("dracut-initqueue[285]: Warning: Could not boot.")
+    assert keep.search("Kernel panic - not syncing: VFS: Unable to mount root fs")
+    assert keep.search("Oops: 0000 [#1] SMP PTI")
+    assert not keep.search("Kernel command line: BOOT_IMAGE=/vmlinuz root=/dev/sda1 oops=panic")
+    oops = next(mark for name, _, mark in vmlog.LINUX_MARKS if name == "oops")
+    assert not oops.search("Kernel command line: root=/dev/sda1 oops=panic")
+    assert oops.search("Oops: 0000 [#1] SMP PTI")
+
+
+def test_a_probe_whose_output_could_not_be_read_back_says_why() -> None:
+    reason = guestexec.probe_failed({"output": "", "exit_code": 0, "output_error": "ConnectError: refused"})
+
+    assert reason
+    assert "ConnectError" in reason
 
 
 def test_an_sds_state_field_that_is_null_is_not_a_down_sds() -> None:
