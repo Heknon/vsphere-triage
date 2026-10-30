@@ -420,6 +420,9 @@ def test_datastore_health(server: MCPServer) -> None:
     assert result["storage"]["slow"] is True
     assert result["vms"] >= 3
     assert {vm["name"] for vm in result["abnormal_vms"]} >= {"web-01", "db-01", "app-01"}
+    # Pooled over every mounting host, the series alone would not say whose path is slow.
+    assert result["storage"]["datastores"][0]["slow_from_hosts"] == ["DC0_C0_H0", "DC0_C0_H1"]
+    assert any("from 2 of" in finding for finding in result["storage"]["findings"])
 
 
 def test_a_host_log_the_simulator_lacks_is_reported(server: MCPServer) -> None:

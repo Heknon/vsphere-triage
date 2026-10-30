@@ -295,8 +295,16 @@ def storage(  # noqa: C901, PLR0912, PLR0915 - one report over many counters
         worst_read: list[tuple[datetime, float]] = []
         worst_write: list[tuple[datetime, float]] = []
         iops: list[tuple[datetime, float]] = []
+        slow_from: list[str] = []
         for moref in host_morefs:
             per_host = series.get(moref, {})
+            for name in ("datastore.totalReadLatency.average", "datastore.totalWriteLatency.average"):
+                found = per_host.get(name)
+                instance = next((item for item in instances if found and item in found.samples), None)
+                if found is not None and instance is not None:
+                    worst = max((value for _, value in found.samples[instance]), default=0.0)
+                    if worst >= thresholds.datastore_latency_ms and hosts.get(moref, moref) not in slow_from:
+                        slow_from.append(hosts.get(moref, moref))
             for name, sink in (
                 ("datastore.totalReadLatency.average", worst_read),
                 ("datastore.totalWriteLatency.average", worst_write),
@@ -312,6 +320,9 @@ def storage(  # noqa: C901, PLR0912, PLR0915 - one report over many counters
         entry["read_latency_ms"] = summarize(sorted(worst_read))
         entry["write_latency_ms"] = summarize(sorted(worst_write))
         entry["iops"] = summarize(_sum_by_time(iops))
+        # The series above pool every mounting host; which ones saw it slow is the
+        # path-or-array question, so say it rather than leave it in the mean.
+        entry["slow_from_hosts"] = sorted(slow_from)
         free, capacity = store.get("free_bytes"), store.get("capacity_bytes")
         if free is not None and capacity:
             free_percent = free / capacity * 100
@@ -336,9 +347,14 @@ def storage(  # noqa: C901, PLR0912, PLR0915 - one report over many counters
                     if summary.get("steady")
                     else f"peaked at {summary['max']:.0f} ms at {summary['peak_at']:%H:%M:%S}Z"
                 )
+                where = (
+                    f", from {len(slow_from)} of {len(host_morefs)} hosts ({', '.join(sorted(slow_from))})"
+                    if 0 < len(slow_from) < len(host_morefs)
+                    else ""
+                )
                 findings.append(
                     f"datastore {store.get('name')} {label.split('_')[0]} latency {when} "
-                    f"(threshold {thresholds.datastore_latency_ms:g} ms)"
+                    f"(threshold {thresholds.datastore_latency_ms:g} ms){where}"
                 )
         result["datastores"].append(entry)
 
