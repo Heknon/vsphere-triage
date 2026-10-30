@@ -85,8 +85,11 @@ the environment, events, boot timeline from `vmware.log`, serial console,
 console screen, snapshots, hardware) and returns a `finding`, the ranked
 causes with the evidence for and against each, what it could not read
 (`not_checked`), and the next checks to run. If your orchestrator knows when it
-rebooted the VM, pass `rebooted_at`; vCenter does not move `runtime.bootTime`
-on an in-guest reboot.
+rebooted the VM, pass `rebooted_at`. vCenter does not move `runtime.bootTime`
+on an in-guest reboot and logs no event for it, so `diagnose_vm` also reads the
+last power-on or reset from the VM's `vmware.log`, and `scan` does the same for
+up to 40 VMs per vCenter that look stuck only because their uptime is counted
+from power-on.
 
 **From a question about the fleet.** `scan` judges every VM on some or all
 vCenters and groups the abnormal ones. Each group is compared with its
@@ -207,12 +210,12 @@ server always matches the skill. Invoke the skill as
 | `explain_group` | for one group from a scan: what its abnormal VMs share that the healthy ones do not, and host CPU and storage over their boot window |
 | `diagnose_window` | resets, failed power-ons, host CPU and storage over a past window |
 | `cluster_events` | vSphere HA restarts and VM-monitoring resets, host failures, isolations and lost connections, failed failovers, maintenance mode and migration waves over a window; names the failed host and the hosts VMs restarted onto |
-| `recent_tasks` | tasks over a window grouped by kind (migration, reconfigure, snapshot, clone, power, destroy), flagging 10 or more migrations, reconfigures or snapshot operations as a wave. Task states are as recorded when each task started, so later failures may not show |
+| `recent_tasks` | tasks over a window grouped by kind (migration, reconfigure, snapshot, clone, power, destroy), flagging 10 or more migrations, reconfigures or snapshot operations as a wave, and the tasks that failed, with their error. Read through a task history collector created and destroyed for the call |
 | `find_old_environments` | environment folders older than N hours (age of their oldest VM), optionally under given path segments, oldest first |
 | `hardware_profile` | device counts per category and kind across the fleet, NIC types, and VMs whose devices differ from the rest of their environment |
 | `find_vms_by_device` | VMs that have, or lack, a device category (`sound`, `usb`, `ethernet`, ...) or kind (`Vmxnet3`, `HdAudioCard`) |
 | `find_vms_by_snapshot` | VMs with snapshots, largest first: delta and memory-state size, oldest age, redo-chain depth, consolidation needed; rolled up per template |
-| `find_resource_limits` | VMs with a CPU or memory limit or reservation, tightest limit first, templates marked (linked clones inherit a template's limit) |
+| `find_resource_limits` | VMs with a CPU or memory limit or reservation, tightest limit first, templates marked (linked clones inherit a template's limit), and VMs in a resource pool or vApp that carries a limit, with the pool named |
 | `check_datastores` | each datastore's free space, thin over-provisioning ratio and per-host reachability (APD/PDL); datastores holding a template's base disk are marked |
 | `check_host_time` | each host's NTP configuration and clock skew from vCenter |
 
@@ -442,8 +445,9 @@ The simulator's limits, and how the tests handle them:
 - Snapshot sizes from `layoutEx` (the simulator reports 0).
 - Guest exec: the guest-operation privileges, and that output capture works on
   your Windows and Linux guests.
-- That an in-guest reboot logs a reset or guest-reboot event. If yours are
-  silent, pass `rebooted_at` to `diagnose_vm`.
+- That an in-guest reboot shows in `vmware.log` as a reset (`CPU reset` on
+  vcpu-0, or the chipset's reset request). If your orchestrator knows the
+  reboot time, `rebooted_at` is still the surest input.
 - The HA event ids and messages your vCenter version writes, which
   `cluster_events` matches by pattern.
 - A datacenter inside a folder, and one datastore name in two datacenters (the

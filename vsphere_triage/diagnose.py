@@ -353,6 +353,30 @@ def vm_folder(row: dict[str, Any], vm: VmFacts) -> str | None:
     return None
 
 
+# Enough of the end of vmware.log to hold the last boot's start on a VM that has
+# been stuck a while; a scan reads this much for each suspect VM.
+LOG_REBOOT_BYTES = 512 * 1024
+
+
+def boot_from_vmware_log(
+    session: VCenterSession, vm: VmFacts, row: dict[str, Any], max_bytes: int = LOG_REBOOT_BYTES
+) -> datetime | None:
+    """When the last boot in the VM's `vmware.log` began, or None if it cannot be read.
+
+    A reboot started inside the guest logs no vCenter event and leaves
+    runtime.bootTime at the power-on; the VMX's own log still records the reset.
+    """
+    folder = vm_folder(row, vm)
+    datacenter = vm.datacenter_path or vm.datacenter
+    if folder is None or datacenter is None:
+        return None
+    found = session.read_datastore_file(datacenter, f"{folder}/vmware.log", max_bytes)
+    if found.status != 200:  # noqa: PLR2004
+        return None
+    timeline = boot_timeline(parse_lines(found.text))
+    return timeline.get("boot_started") if timeline.get("boot_found") else None
+
+
 def _read_reason(name: str, status: int, folder: str) -> str:
     """Why a datastore file read did not return a body, worded for a reader."""
     where = f" at {folder}/{name}" if folder else ""
@@ -1023,7 +1047,11 @@ def diagnose_vm(
     )
     raw_events = events.get("events", [])
     reboots = latest_reboot_by_vm(raw_events)
-    set_effective_boot(vm, now, reboots=reboots, rebooted_at=rebooted_at)
+    # The log first: a reboot started in the guest is only in vmware.log, and the
+    # verdict (booting or stuck) rests on when this boot began.
+    logs = piece("vmware.log", lambda: read_logs(session, settings, vm, row))
+    log_boot = (logs.get("timeline") or {}).get("boot_started") if logs.get("available") else None
+    set_effective_boot(vm, now, reboots=reboots, rebooted_at=rebooted_at, log_boot=log_boot)
     begin, end = window(now, vm.boot_time)
     resets = resets_by_vm(raw_events, thresholds.boot_loop_window_minutes, now).get(vm.moref, 0)
     verdict = classify(vm, thresholds, resets_in_window=resets)
@@ -1074,7 +1102,6 @@ def diagnose_vm(
         if host
         else {"available": False, "reason": "the VM's host is not known"}
     )
-    logs = piece("vmware.log", lambda: read_logs(session, settings, vm, row))
     serial = piece("serial console", lambda: read_serial_files(session, vm))
     console = (
         piece(

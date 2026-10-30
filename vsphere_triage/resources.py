@@ -49,6 +49,17 @@ def _findings_for(row: dict[str, Any]) -> list[str]:
     if _memory_capped(row):
         below = f"below its {row['memory_mb']} MB RAM" if row["memory_mb"] is not None else "(RAM not read)"
         reasons.append(f"memory limit {row['memory_limit_mb']} MB set {below} — forces balloon/swap")
+    if row.get("pool_cpu_limit_mhz") is not None:
+        reasons.append(
+            f"in resource pool {row['pool_cpu_limit_set_on']!r}, CPU-limited to "
+            f"{row['pool_cpu_limit_mhz']} MHz shared by every VM in it — throttles them together, "
+            "like host starvation"
+        )
+    if row.get("pool_memory_limit_mb") is not None:
+        reasons.append(
+            f"in resource pool {row['pool_memory_limit_set_on']!r}, memory-limited to "
+            f"{row['pool_memory_limit_mb']} MB shared by every VM in it — forces balloon/swap past it"
+        )
     if row["cpu_reservation_mhz"] is not None:
         reasons.append(f"CPU reservation {row['cpu_reservation_mhz']} MHz locked")
     if row["memory_reservation_mb"] is not None:
@@ -87,7 +98,12 @@ def _by_template(rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
 
 def _matches(row: dict[str, Any], kind: str) -> bool:
     # A memory limit at or above the VM's RAM caps nothing, so it is not a limit here.
-    has_limit = row["cpu_limit_mhz"] is not None or _memory_capped(row)
+    has_limit = (
+        row["cpu_limit_mhz"] is not None
+        or _memory_capped(row)
+        or row.get("pool_cpu_limit_mhz") is not None
+        or row.get("pool_memory_limit_mb") is not None
+    )
     has_reservation = row["cpu_reservation_mhz"] is not None or row["memory_reservation_mb"] is not None
     if kind == "limits":
         return has_limit
@@ -177,6 +193,9 @@ async def find_resource_limits(
                 "cpu_reservation_mhz": row["cpu_reservation_mhz"],
                 "memory_limit_mb": row["memory_limit_mb"],
                 "memory_reservation_mb": row["memory_reservation_mb"],
+                "pool_cpu_limit_mhz": row.get("pool_cpu_limit_mhz"),
+                "pool_memory_limit_mb": row.get("pool_memory_limit_mb"),
+                "pool_limit_set_on": row.get("pool_cpu_limit_set_on") or row.get("pool_memory_limit_set_on"),
                 "problems": reasons[id(row)],
             }
             for row in matched[:limit]

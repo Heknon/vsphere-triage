@@ -87,7 +87,7 @@ from vsphere_triage.inventory import find_environment as environment_folders
 from vsphere_triage.inventory import read_datastore_mounts, read_inventory
 from vsphere_triage.powerflex import PowerFlexError
 from vsphere_triage.readonly import ReadOnlyViolationError
-from vsphere_triage.vcenter import VCenterPool, VSphereError
+from vsphere_triage.vcenter import TASKS_CAP, VCenterPool, VSphereError
 from vsphere_triage.vmlog import caller_pattern, grep, parse_lines
 from vsphere_triage.vrops import KINDS, SUGGESTED_STAT_KEYS, Vrops, VropsError
 
@@ -554,27 +554,27 @@ def _register_fleet_tools(  # noqa: C901, PLR0915 - one closure per tool
 
         def run(session: VCenterSession) -> dict[str, Any]:
             now = session.now()
-            events, cut = session.events_covering(
-                begin=now - timedelta(minutes=minutes), end=now, types=("TaskEvent",)
-            )
+            tasks, cut = session.tasks(begin=now - timedelta(minutes=minutes), end=now)
             rows = []
-            for event in events:
-                info = getattr(event, "info", None)
-                if info is None:
-                    continue
+            for info in tasks:
                 reason = getattr(info, "reason", None)
+                error = getattr(info, "error", None)
                 rows.append(
                     {
                         "operation": getattr(info, "descriptionId", None) or getattr(info, "name", "") or "",
                         "target": getattr(info, "entityName", None),
                         "state": str(getattr(info, "state", "")),
-                        "time": getattr(event, "createdTime", None),
-                        "user": getattr(reason, "userName", None) or getattr(event, "userName", None),
+                        "time": getattr(info, "queueTime", None),
+                        "user": getattr(reason, "userName", None),
+                        "error": (getattr(error, "msg", None) or type(error).__name__) if error else None,
                     }
                 )
             summary = taskhistory.summarize_tasks(rows, now=now, window_minutes=minutes)
             if cut:
-                summary["findings"] = [*summary["findings"], CAP_NOTE.format(n=16)]
+                summary["findings"] = [
+                    *summary["findings"],
+                    f"over {TASKS_CAP} tasks in the window; only the oldest {TASKS_CAP} were read, narrow it",
+                ]
             return {"vcenter": session.vcenter.name} | summary
 
         return await fleet.sweep(name, run)

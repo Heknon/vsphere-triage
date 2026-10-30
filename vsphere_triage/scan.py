@@ -18,12 +18,17 @@ from dataclasses import dataclass, field
 from datetime import datetime, timedelta
 from typing import TYPE_CHECKING, Any
 
+from pyVmomi import vim
+
 from vsphere_triage.checks import (
     ABNORMAL,
     ATTENTION_FLAGS,
+    BOOTED_NOT_UP,
+    BUSY_NOT_UP,
     CONTEXT_FLAGS,
     FLAG_MEANING,
     FLAGS,
+    HUNG,
     MEANING,
     OFF,
     RESET_EVENTS,
@@ -36,6 +41,7 @@ from vsphere_triage.checks import (
 )
 from vsphere_triage.config import NotFoundError
 from vsphere_triage.contention import hosts_cpu, storage
+from vsphere_triage.diagnose import boot_from_vmware_log
 from vsphere_triage.inventory import (
     HostFacts,
     Inventory,
@@ -43,6 +49,7 @@ from vsphere_triage.inventory import (
     read_datastores,
     read_hosts,
     read_inventory,
+    set_effective_boot,
 )
 from vsphere_triage.vcenter import QUERY_EVENTS_CAP, VSphereError
 
@@ -159,6 +166,8 @@ def scan_vcenter(session: VCenterSession, settings: Settings) -> VCenterScan:
                 f"{len(events)} reset events in the window: vCenter returns at most "
                 f"{QUERY_EVENTS_CAP}, so boot-loop counts are low and some reboots may be missed"
             )
+    except vim.fault.NotAuthenticated:
+        raise  # the session expired: let the pool re-login and run the scan again
     except Exception as error:  # noqa: BLE001 - a scan without events is still a scan
         resets, reboots = {}, {}
         notes.append(
@@ -169,6 +178,7 @@ def scan_vcenter(session: VCenterSession, settings: Settings) -> VCenterScan:
     verdicts = {
         vm.moref: classify(vm, thresholds, resets_in_window=resets.get(vm.moref, 0)) for vm in inventory.vms
     }
+    notes.extend(_recheck_in_guest_reboots(session, inventory, verdicts, reboots, resets, settings))
     live_hosts = [host for host in inventory.hosts.values() if host.connection_state in (None, "connected")]
     try:
         hosts, unknown = hosts_cpu(
@@ -176,6 +186,8 @@ def scan_vcenter(session: VCenterSession, settings: Settings) -> VCenterScan:
         )
         if unknown:
             notes.append("host CPU counters unavailable: " + ", ".join(unknown))
+    except vim.fault.NotAuthenticated:
+        raise  # the session expired: let the pool re-login and run the scan again
     except Exception as error:  # noqa: BLE001
         hosts = {}
         notes.append(f"host CPU not read ({type(error).__name__})")
@@ -190,9 +202,80 @@ def scan_vcenter(session: VCenterSession, settings: Settings) -> VCenterScan:
             thresholds=thresholds,
             with_devices=False,  # datastore-level only across the fleet; devices in explain_group
         )
+    except vim.fault.NotAuthenticated:
+        raise  # the session expired: let the pool re-login and run the scan again
     except Exception as error:  # noqa: BLE001
         notes.append(f"storage counters not read ({type(error).__name__})")
     return VCenterScan(inventory, verdicts, hosts, store_report, notes)
+
+
+# States that rest on uptime: a VM rebooted inside the guest looks long-stuck in
+# them, because vCenter logs no event for that reboot.
+UPTIME_STATES = (HUNG, BUSY_NOT_UP, BOOTED_NOT_UP)
+# How many such VMs a scan re-checks against their vmware.log, per vCenter.
+LOG_RECHECKS = 40
+
+
+def _recheck_in_guest_reboots(
+    session: VCenterSession,
+    inventory: Inventory,
+    verdicts: dict[str, Verdict],
+    reboots: dict[str, datetime],
+    resets: dict[str, int],
+    settings: Settings,
+) -> list[str]:
+    """Re-judge VMs stuck by uptime from power-on against the last boot in their vmware.log.
+
+    The same check diagnose_vm makes, made here for the suspects only: a mass
+    in-guest reboot otherwise reads as a fleet of hung VMs. Returns notes.
+    """
+    suspects = [
+        vm
+        for vm in inventory.vms
+        if verdicts[vm.moref].state in UPTIME_STATES and vm.boot_source == "power_on"
+    ]
+    if not suspects:
+        return []
+    checked = suspects[:LOG_RECHECKS]
+    try:
+        rows = {
+            row["moref"]: row
+            for row in session.retrieve(
+                vim.VirtualMachine,
+                ("config.files.vmPathName", "config.files.logDirectory"),
+                objects=[session.reference("VirtualMachine", vm.moref) for vm in checked],
+            )
+        }
+    except vim.fault.NotAuthenticated:
+        raise
+    except Exception as error:  # noqa: BLE001 - the scan stands without the re-check
+        return [f"in-guest reboots not re-checked in vmware.log ({type(error).__name__})"]
+    rebooted = 0
+    for vm in checked:
+        try:
+            log_boot = boot_from_vmware_log(session, vm, rows.get(vm.moref, {}))
+        except vim.fault.NotAuthenticated:
+            raise
+        except Exception:  # noqa: BLE001, S112 - one unreadable log leaves that VM as judged
+            continue
+        if log_boot is None:
+            continue
+        set_effective_boot(vm, inventory.read_at, reboots=reboots, log_boot=log_boot)
+        if vm.boot_source == "vmware_log":
+            rebooted += 1
+            verdicts[vm.moref] = classify(vm, settings.thresholds, resets_in_window=resets.get(vm.moref, 0))
+    notes = [
+        (
+            f"{len(checked)} VM(s) stuck by uptime from power-on re-checked against vmware.log for an "
+            f"in-guest reboot: {rebooted} had rebooted since and were re-judged from that reboot"
+        )
+    ]
+    if len(suspects) > len(checked):
+        notes.append(
+            f"{len(suspects) - len(checked)} more were not re-checked (limit {LOG_RECHECKS}); diagnose_vm "
+            "re-checks any one of them"
+        )
+    return notes
 
 
 async def run_scan(pool: VCenterPool, settings: Settings, names: Sequence[str]) -> Scan:

@@ -27,18 +27,31 @@ if TYPE_CHECKING:
     from vsphere_triage.config import Settings
     from vsphere_triage.vcenter import VCenterPool, VCenterSession
 
-WINDOWS_SHELL = r"C:\Windows\System32\cmd.exe"
+# Where Windows lives when the guest does not say (%SystemRoot% is read first).
+DEFAULT_SYSTEM_ROOT = r"C:\Windows"
+WINDOWS_SHELL = DEFAULT_SYSTEM_ROOT + r"\System32\cmd.exe"
 LINUX_SHELL = "/bin/sh"
 
 
-def guest_temp_path(token: str, *, windows: bool) -> str:
+def system_root_from(variables: list[str] | None) -> str:
+    """%SystemRoot% from ReadEnvironmentVariableInGuest's `NAME=value` strings, or the default."""
+    for item in variables or []:
+        name, _, value = str(item).partition("=")
+        if name.strip().lower() == "systemroot" and value.strip():
+            return value.strip().rstrip("\\")
+    return DEFAULT_SYSTEM_ROOT
+
+
+def guest_temp_path(token: str, *, windows: bool, system_root: str = DEFAULT_SYSTEM_ROOT) -> str:
     """Where the command's output is redirected in the guest, by OS."""
     if windows:
-        return rf"C:\Windows\Temp\vsphere-triage-{token}.txt"
+        return rf"{system_root}\Temp\vsphere-triage-{token}.txt"
     return f"/tmp/vsphere-triage-{token}.txt"  # noqa: S108 - a path inside the guest, not a host temp file
 
 
-def guest_program_spec(command: str, out_path: str, *, windows: bool) -> tuple[str, str]:
+def guest_program_spec(
+    command: str, out_path: str, *, windows: bool, system_root: str = DEFAULT_SYSTEM_ROOT
+) -> tuple[str, str]:
     """The interpreter and arguments to run `command` and capture stdout+stderr to `out_path`.
 
     The whole command is captured, not only its last part: on Linux the shell's
@@ -52,7 +65,7 @@ def guest_program_spec(command: str, out_path: str, *, windows: bool) -> tuple[s
     can break the wrapping there, a known limit of running a string, not an argv.
     """
     if windows:
-        return WINDOWS_SHELL, f'/c ({command}) > "{out_path}" 2>&1'
+        return rf"{system_root}\System32\cmd.exe", f'/c ({command}) > "{out_path}" 2>&1'
     # Escaped for the double quotes the outer shell reads it in.
     inner = encode_shell(command)
     for char in ("\\", '"', "$", "`"):

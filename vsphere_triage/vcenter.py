@@ -45,6 +45,9 @@ T = TypeVar("T")
 PAGE_SIZE = 500
 # QueryEvents answers with at most this many events, the newest; a busier
 # window is cut, and results that use it say so.
+# Tasks read through one task history collector, in pages.
+TASKS_CAP = 5000
+TASK_PAGE = 500
 QUERY_EVENTS_CAP = 1000
 TASK_POLL_SECONDS = 0.1
 REALTIME_INTERVAL_SECONDS = 20
@@ -610,9 +613,11 @@ class VCenterSession:
         """
         # Local import: guestexec imports diagnose, which imports this module.
         from vsphere_triage.guestexec import (  # noqa: PLC0415 - deferred to avoid a circular import
+            DEFAULT_SYSTEM_ROOT,
             guest_program_spec,
             guest_temp_path,
             rewrite_transfer_url,
+            system_root_from,
         )
 
         _ = self.content
@@ -628,8 +633,18 @@ class VCenterSession:
             username=username, password=password, interactiveSession=False
         )
         token = uuid.uuid4().hex
-        out_path = guest_temp_path(token, windows=windows)
-        program_path, arguments = guest_program_spec(command, out_path, windows=windows)
+        system_root = DEFAULT_SYSTEM_ROOT
+        if windows:
+            # Windows is not always on C:. Reading the variable changes nothing; if it
+            # cannot be read, the default is tried.
+            with contextlib.suppress(Exception):
+                system_root = system_root_from(
+                    process_manager.ReadEnvironmentVariableInGuest(vm, auth, ["SystemRoot"])
+                )
+        out_path = guest_temp_path(token, windows=windows, system_root=system_root)
+        program_path, arguments = guest_program_spec(
+            command, out_path, windows=windows, system_root=system_root
+        )
         spec = vim.vm.guest.ProcessManager.ProgramSpec(programPath=program_path, arguments=arguments)
         pid = process_manager.StartProgramInGuest(vm, auth, spec)
         deadline = time.monotonic() + timeout_seconds
@@ -702,6 +717,34 @@ class VCenterSession:
         finally:
             response.close()
         return body.decode("utf-8", errors="replace"), truncated
+
+    # -- tasks ---------------------------------------------------------------
+
+    def tasks(self, *, begin: datetime, end: datetime, max_tasks: int = TASKS_CAP) -> tuple[list[Any], bool]:
+        """The tasks queued in a window, as TaskInfo with their final state, oldest first.
+
+        A task history collector, not the TaskEvents: a TaskEvent carries the
+        task as it was when it was queued, so it never says the task failed.
+        The collector lives only in this session and is destroyed after the read,
+        like a container view. Returns the tasks and whether `max_tasks` cut them.
+        """
+        spec = vim.TaskFilterSpec(
+            time=vim.TaskFilterSpec.ByTime(timeType="queuedTime", beginTime=begin, endTime=end)
+        )
+        collector = self.content.taskManager.CreateCollectorForTasks(spec)
+        found: list[Any] = []
+        try:
+            collector.RewindCollector()
+            while len(found) < max_tasks:
+                page = collector.ReadNextTasks(min(TASK_PAGE, max_tasks - len(found))) or []
+                if not page:
+                    break
+                found.extend(page)
+        finally:
+            with contextlib.suppress(Exception):
+                collector.DestroyCollector()
+        cut = len(found) >= max_tasks
+        return sorted(found, key=lambda info: info.queueTime), cut
 
     # -- events --------------------------------------------------------------
 

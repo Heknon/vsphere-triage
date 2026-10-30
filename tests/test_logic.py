@@ -701,7 +701,7 @@ def test_nothing_on_the_read_list_writes() -> None:
         "Update",
     )
     # Session-scoped views and collectors: created and destroyed within this session, changing nothing.
-    allowed_sessions = {"CreateContainerView", "DestroyView"}
+    allowed_sessions = {"CreateContainerView", "DestroyView", "CreateCollectorForTasks", "DestroyCollector"}
 
     for name in ALLOWED_METHODS - allowed_sessions:
         assert not any(word in name for word in writes), name
@@ -3799,3 +3799,119 @@ def test_a_datastore_whose_every_host_is_down_is_unknown_not_unreachable() -> No
 
     assert verdict["healthy"] is None
     assert verdict["findings"] == []
+
+
+def test_a_limit_on_the_resource_pool_is_inherited_but_the_root_pool_is_not_a_limit() -> None:
+    from vsphere_triage import inventory  # noqa: PLC0415
+
+    cluster = vim.ClusterComputeResource("domain-c7")
+    root, team, inner = (
+        vim.ResourcePool("resgroup-1"),
+        vim.ResourcePool("resgroup-2"),
+        vim.ResourcePool("resgroup-3"),
+    )
+    rows = [
+        {"moref": "resgroup-1", "name": "Resources", "parent": cluster, "config.cpuAllocation.limit": 90000},
+        {"moref": "resgroup-2", "name": "team", "parent": root, "config.cpuAllocation.limit": 4000},
+        {
+            "moref": "resgroup-3",
+            "name": "batch",
+            "parent": team,
+            "config.cpuAllocation.limit": -1,
+            "config.memoryAllocation.limit": 8192,
+        },
+    ]
+    pools = inventory.pool_limits(SimpleNamespace(retrieve=lambda _kind, _paths: rows))
+
+    assert inventory.inherited_pool_limit(pools, inner._moId, "cpu_limit") == (4000, "team")
+    assert inventory.inherited_pool_limit(pools, inner._moId, "memory_limit") == (8192, "batch")
+    assert inventory.inherited_pool_limit(pools, root._moId, "cpu_limit") == (None, None)
+
+
+def test_a_vm_in_a_limited_pool_is_listed_as_limited() -> None:
+    row = {
+        "cpu_limit_mhz": None,
+        "memory_limit_mb": None,
+        "memory_mb": 4096,
+        "cpu_reservation_mhz": None,
+        "memory_reservation_mb": None,
+        "pool_cpu_limit_mhz": 4000,
+        "pool_cpu_limit_set_on": "team",
+        "pool_memory_limit_mb": None,
+        "pool_memory_limit_set_on": None,
+    }
+
+    assert resources._matches(row, "limits")
+    assert any("resource pool 'team'" in reason for reason in resources._findings_for(row))
+
+
+def test_an_expired_session_mid_scan_is_raised_for_the_pool_to_re_login() -> None:
+    def expired(**_: object) -> None:
+        raise vim.fault.NotAuthenticated
+
+    session = SimpleNamespace(now=lambda: NOW, events=expired)
+    settings = Settings.from_environment(
+        {
+            "VSPHERE_VCENTERS": '[{"name": "vc-a", "host": "a"}]',
+            "VSPHERE_USERNAME": "u",
+            "VSPHERE_PASSWORD": "p",
+        }
+    )
+
+    with pytest.raises(vim.fault.NotAuthenticated):
+        scan.scan_vcenter(session, settings)
+
+
+def test_windows_commands_follow_the_guests_system_root() -> None:
+    root = guestexec.system_root_from(["SystemRoot=D:\\WINDOWS"])
+    program, _ = guestexec.guest_program_spec("ver", r"D:\WINDOWS\Temp\o.txt", windows=True, system_root=root)
+
+    assert root == r"D:\WINDOWS"
+    assert program == r"D:\WINDOWS\System32\cmd.exe"
+    assert (
+        guestexec.guest_temp_path("t", windows=True, system_root=root)
+        == r"D:\WINDOWS\Temp\vsphere-triage-t.txt"
+    )
+    assert guestexec.system_root_from(None) == r"C:\Windows"
+
+
+def test_a_scan_re_judges_a_vm_rebooted_inside_the_guest_from_its_vmware_log() -> None:
+    from vsphere_triage.vcenter import DatastoreFile  # noqa: PLC0415
+
+    machine = vm(
+        moref="vm-7",
+        datacenter="DC0",
+        power_on_time=NOW - timedelta(days=3),
+        cpu_mhz=5.0,
+        tools_running="guestToolsNotRunning",
+    )
+    set_effective_boot(machine, NOW, reboots={})
+    inventory = Inventory("vc-a", NOW, [machine], {}, {}, {}, base_disks_read=True)
+    verdicts = {"vm-7": checks.classify(machine, LIMITS)}
+    rows = [
+        "2026-10-26T02:00:00.000Z In(05) vmx - Powering on the virtual machine",
+        "2026-10-29T02:26:00.000Z In(05) vcpu-0 - CPU reset: soft (mode Emulation)",
+        "2026-10-29T02:26:01.000Z In(05) vmx - EFI boot device order read",
+    ]
+    log = "\n".join(rows)
+    session = SimpleNamespace(
+        retrieve=lambda _kind, _paths, objects: [
+            {"moref": "vm-7", "config.files.vmPathName": "[ds-1] web-01/web-01.vmx"} for _ in objects
+        ],
+        reference=lambda kind, moref: f"{kind}:{moref}",
+        read_datastore_file=lambda _dc, path, _max: DatastoreFile(path, log, len(log), False, 200),
+    )
+    settings = Settings.from_environment(
+        {
+            "VSPHERE_VCENTERS": '[{"name": "vc-a", "host": "a"}]',
+            "VSPHERE_USERNAME": "u",
+            "VSPHERE_PASSWORD": "p",
+        }
+    )
+    assert verdicts["vm-7"].state == checks.HUNG
+
+    notes = scan._recheck_in_guest_reboots(session, inventory, verdicts, {}, {}, settings)
+
+    assert machine.boot_source == "vmware_log"
+    assert verdicts["vm-7"].state == checks.BOOTING
+    assert "1 had rebooted" in notes[0]

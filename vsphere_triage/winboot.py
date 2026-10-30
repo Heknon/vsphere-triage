@@ -81,17 +81,17 @@ def boot_probe_powershell() -> str:
         "ProviderName='Service Control Manager';Id=7000,7009,7011,7026});"
         "$o.boot_performance=@(ev @{"
         "LogName='Microsoft-Windows-Diagnostics-Performance/Operational';Id=100,101,102,103});"
-        "$md='C:\\Windows\\Minidump';"
+        "$md=($env:SystemRoot+'\\Minidump');"
         "$o.newest_minidump=(Get-ChildItem $md -Filter *.dmp | Sort-Object LastWriteTime -Descending |"
         " Select-Object -First 1 | ForEach-Object { @{ name=$_.Name;"
         " time=$_.LastWriteTime.ToUniversalTime().ToString('o') } });"
-        "$o.memory_dmp=(Test-Path 'C:\\Windows\\MEMORY.DMP');"
-        "$o.ntbtlog=(Test-Path 'C:\\Windows\\ntbtlog.txt');"
-        "$srt='C:\\Windows\\System32\\LogFiles\\Srt\\SrtTrail.txt';"
+        "$o.memory_dmp=(Test-Path ($env:SystemRoot+'\\MEMORY.DMP'));"
+        "$o.ntbtlog=(Test-Path ($env:SystemRoot+'\\ntbtlog.txt'));"
+        "$srt=($env:SystemRoot+'\\System32\\LogFiles\\Srt\\SrtTrail.txt');"
         # $( ): `if` is a statement, so inside plain ( ) it is an error that
         # SilentlyContinue hid, and SrtTrail was never reported.
         "$o.srttrail=$(if (Test-Path $srt) { (Get-Content $srt -Tail 40 | Out-String) } else { $null });"
-        "$pan='C:\\Windows\\Panther\\setupact.log';"
+        "$pan=($env:SystemRoot+'\\Panther\\setupact.log');"
         "$o.panther_present=(Test-Path $pan);"
         "$o | ConvertTo-Json -Depth 5 -Compress"
     )

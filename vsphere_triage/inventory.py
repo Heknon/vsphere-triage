@@ -789,6 +789,7 @@ RESOURCE_POLICY_PATHS = (
     "name",
     "parent",
     "parentVApp",
+    "resourcePool",
     "config.template",
     "summary.config.numCpu",
     "summary.config.memorySizeMB",
@@ -797,6 +798,47 @@ RESOURCE_POLICY_PATHS = (
     "config.memoryAllocation.limit",
     "config.memoryAllocation.reservation",
 )
+
+
+POOL_LIMIT_PATHS = ("name", "parent", "config.cpuAllocation.limit", "config.memoryAllocation.limit")
+
+
+def pool_limits(session: VCenterSession) -> dict[str, dict[str, Any]]:
+    """Every resource pool and vApp with its own CPU and memory limit, by moref.
+
+    A cluster's root pool is left out: its allocation is the cluster's capacity,
+    not a limit anyone set. It is the pool whose parent is not a pool.
+    """
+    rows = session.retrieve(vim.ResourcePool, POOL_LIMIT_PATHS)
+    pools = {}
+    for row in rows:
+        parent = row.get("parent")
+        pools[row["moref"]] = {
+            "name": row.get("name", row["moref"]),
+            "parent": parent._moId if isinstance(parent, vim.ResourcePool) else None,  # noqa: SLF001
+            "root": not isinstance(parent, vim.ResourcePool),
+            "cpu_limit": _limit(row.get("config.cpuAllocation.limit")),
+            "memory_limit": _limit(row.get("config.memoryAllocation.limit")),
+        }
+    return pools
+
+
+def inherited_pool_limit(
+    pools: dict[str, dict[str, Any]], moref: str | None, key: str
+) -> tuple[int | None, str | None]:
+    """The tightest `key` limit on the pool `moref` and the pools above it, and the pool that sets it."""
+    tightest: tuple[int | None, str | None] = (None, None)
+    seen: set[str] = set()
+    while moref in pools and moref not in seen:
+        seen.add(moref)
+        pool = pools[moref]
+        if pool["root"]:
+            break
+        limit = pool[key]
+        if limit is not None and (tightest[0] is None or limit < tightest[0]):
+            tightest = (limit, pool["name"])
+        moref = pool["parent"]
+    return tightest
 
 
 def read_vm_resource_policy(session: VCenterSession, folders: dict[str, FolderFacts]) -> list[dict[str, Any]]:
@@ -810,15 +852,29 @@ def read_vm_resource_policy(session: VCenterSession, folders: dict[str, FolderFa
     the same limit on every clone of it.
     """
     rows = session.retrieve(vim.VirtualMachine, RESOURCE_POLICY_PATHS)
+    pools = pool_limits(session)
     constrained = []
     for row in rows:
+        pool = row.get("resourcePool")
+        pool_moref = pool._moId if pool is not None else None  # noqa: SLF001
+        row["_pool_cpu_limit"], row["_pool_cpu_by"] = inherited_pool_limit(pools, pool_moref, "cpu_limit")
+        row["_pool_memory_limit"], row["_pool_memory_by"] = inherited_pool_limit(
+            pools, pool_moref, "memory_limit"
+        )
         row["_cpu_limit"] = _limit(row.get("config.cpuAllocation.limit"))
         row["_cpu_reservation"] = _reservation(row.get("config.cpuAllocation.reservation"))
         row["_memory_limit"] = _limit(row.get("config.memoryAllocation.limit"))
         row["_memory_reservation"] = _reservation(row.get("config.memoryAllocation.reservation"))
         if any(
             row[key] is not None
-            for key in ("_cpu_limit", "_cpu_reservation", "_memory_limit", "_memory_reservation")
+            for key in (
+                "_cpu_limit",
+                "_cpu_reservation",
+                "_memory_limit",
+                "_memory_reservation",
+                "_pool_cpu_limit",
+                "_pool_memory_limit",
+            )
         ):
             constrained.append(row)
     # The base disk (template) is read only for the few VMs that carry a policy,
@@ -842,6 +898,11 @@ def read_vm_resource_policy(session: VCenterSession, folders: dict[str, FolderFa
                 "cpu_reservation_mhz": row["_cpu_reservation"],
                 "memory_limit_mb": row["_memory_limit"],
                 "memory_reservation_mb": row["_memory_reservation"],
+                # A limit on the resource pool or vApp the VM runs in, shared by all its VMs.
+                "pool_cpu_limit_mhz": row["_pool_cpu_limit"],
+                "pool_cpu_limit_set_on": row["_pool_cpu_by"],
+                "pool_memory_limit_mb": row["_pool_memory_limit"],
+                "pool_memory_limit_set_on": row["_pool_memory_by"],
             }
         )
     return result
@@ -1245,6 +1306,7 @@ def set_effective_boot(
     *,
     reboots: dict[str, datetime] | None = None,
     rebooted_at: datetime | None = None,
+    log_boot: datetime | None = None,
 ) -> None:
     """Measure uptime from the most recent reboot, not from power-on.
 
@@ -1255,6 +1317,8 @@ def set_effective_boot(
     and is what the stuck/booting judgement must rest on. Called again by
     `diagnose_vm` once it has fetched
     the events, so a scan's power-on estimate is refined to the real reboot.
+    `log_boot` is the last power-on or reset in the VM's `vmware.log`, the one
+    record of a reboot started inside the guest, which logs no vCenter event.
     """
     reported = as_utc(rebooted_at) if rebooted_at is not None else None
     event_reboot = (reboots or {}).get(facts.moref)
@@ -1263,6 +1327,7 @@ def set_effective_boot(
         for when, source in (
             (reported, "reported_reboot"),
             (event_reboot, "reboot_event"),
+            (as_utc(log_boot) if log_boot is not None else None, "vmware_log"),
             (facts.power_on_time, "power_on"),
         )
         if when is not None

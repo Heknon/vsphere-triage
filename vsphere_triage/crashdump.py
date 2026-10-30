@@ -40,7 +40,7 @@ def dump_probe_powershell() -> str:
     """
     return (
         f"{PS_QUIET}{PS_UTF8_OUTPUT}"
-        "$md='C:\\Windows\\Minidump';"
+        "$md=($env:SystemRoot+'\\Minidump');"
         # Missing folder, unreadable folder (non-admin) and no dump are three answers.
         'if(-not (Test-Path $md)){\'{"found":false,"folder":false}\';exit};'
         "try{$f=Get-ChildItem $md -Filter *.dmp -ErrorAction Stop|"
