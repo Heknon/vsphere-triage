@@ -2557,7 +2557,9 @@ def test_powerflex_health_is_calm_when_all_is_well() -> None:
             "membershipState": "Joined",
         }
     ]
-    summary = powerflex.summarize_health(sds, [], {})
+    devices = [{"id": "d1", "deviceState": "Normal", "errorState": "None"}]
+    stats = {"pendingFwdRebuildCapacityInKb": 0, "pendingRebalanceCapacityInKb": 0}
+    summary = powerflex.summarize_health(sds, devices, stats)
     assert summary["healthy"] is True
 
 
@@ -2652,7 +2654,7 @@ def test_affected_vms_joins_volumes_to_datastores_to_suffering_vms() -> None:
         {"vcenter": "vc-a", "moref": "ds-2", "name": "ds-b", "powerflex_volume_ids": ["vol-zzzz"]},
     ]
     vms_by_datastore = {
-        "ds-1": [
+        "vc-a:ds-1": [
             {"name": "web-01", "moref": "vm-1", "vcenter": "vc-a", "state": "busy_not_up", "suffering": True},
             {"name": "web-02", "moref": "vm-2", "vcenter": "vc-a", "state": "up", "suffering": False},
         ]
@@ -2806,3 +2808,90 @@ def test_a_hard_reset_is_never_sent_twice_after_a_session_expiry(monkeypatch: py
         asyncio.run(power.hard_reset(pool, settings, "vc-a", moref="vm-7", env_id=None, vm_name=None))
 
     assert sent["n"] == 1
+
+
+# -- review of main: PowerFlex ------------------------------------------------------------------
+
+
+def test_powerflex_logs_in_again_when_its_token_expires() -> None:
+    logins = {"count": 0}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.url.path == "/api/login":
+            logins["count"] += 1
+            return httpx.Response(200, text=f'"tok-{logins["count"]}"')
+        token = (request.headers.get("authorization") or "").split()[-1]
+        import base64 as b64  # noqa: PLC0415
+
+        if b64.b64decode(token).decode().endswith("tok-1"):
+            return httpx.Response(401)  # the first token has expired
+        return httpx.Response(200, json=[{"name": "sds-1"}])
+
+    client = _powerflex_client(handler)
+
+    assert asyncio.run(client.sds()) == [{"name": "sds-1"}]  # type: ignore[attr-defined]
+    assert logins["count"] == 2
+
+
+def test_affected_vms_keeps_two_vcenters_same_datastore_moref_apart() -> None:
+    volume_to_pd = {"vol-aaaa": "prod"}
+    datastores = [
+        {"vcenter": "vc-1", "moref": "datastore-12", "name": "sick", "powerflex_volume_ids": ["vol-aaaa"]},
+        {"vcenter": "vc-2", "moref": "datastore-12", "name": "fine", "powerflex_volume_ids": ["vol-zzzz"]},
+    ]
+    vms_by_datastore = {
+        powerflex.datastore_key("vc-1", "datastore-12"): [
+            {"name": "stuck", "moref": "vm-1", "vcenter": "vc-1", "state": "hung", "suffering": True}
+        ],
+        powerflex.datastore_key("vc-2", "datastore-12"): [
+            {"name": "ok", "moref": "vm-1", "vcenter": "vc-2", "state": "healthy", "suffering": False}
+        ],
+    }
+
+    result = powerflex.affected_vms(volume_to_pd, datastores, vms_by_datastore)
+
+    hit = result["affected_datastores"][0]
+    assert hit["vcenter"] == "vc-1"
+    assert [vm["name"] for vm in hit["suffering_vms"]] == ["stuck"]
+
+
+def test_a_rebuilding_system_beside_a_healthy_one_is_not_healthy() -> None:
+    merged = powerflex.merge_statistics(
+        [{"pendingFwdRebuildCapacityInKb": 9000}, {"pendingFwdRebuildCapacityInKb": 0}]
+    )
+    sds = [{"name": "sds-1", "sdsState": "Normal"}]
+    devices = [{"id": "d1", "deviceState": "Normal", "errorState": "None"}]
+
+    summary = powerflex.summarize_health(sds, devices, merged)
+
+    assert merged["pendingFwdRebuildCapacityInKb"] == 9000
+    assert summary["healthy"] is False
+    assert summary["rebuild_active"] is True
+
+
+def test_failed_capacity_means_data_unavailable() -> None:
+    sds = [{"name": "sds-1", "sdsState": "Normal"}]
+    devices = [{"id": "d1", "deviceState": "Normal", "errorState": "None"}]
+
+    summary = powerflex.summarize_health(sds, devices, {"failedCapacityInKb": 100})
+
+    assert summary["healthy"] is False
+    assert summary["data_unavailable"] is True
+
+
+def test_powerflex_with_nothing_read_is_unknown_not_healthy() -> None:
+    summary = powerflex.summarize_health([], [], {})
+
+    assert summary["healthy"] is None
+    assert "not evidence it is healthy" in summary["findings"][0]
+
+
+def test_a_51_49_split_of_two_protection_domains_is_not_a_hotspot() -> None:
+    rows = [
+        {"name": "pd-a", "id": "1", "state": "Active", "traffic": {"total_iops": 510.0}},
+        {"name": "pd-b", "id": "2", "state": "Active", "traffic": {"total_iops": 490.0}},
+    ]
+
+    ranked = powerflex.rank_protection_domains(rows)
+
+    assert any("none dominates" in finding for finding in ranked["findings"])

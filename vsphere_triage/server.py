@@ -1843,7 +1843,8 @@ def _register_powerflex_tools(  # noqa: C901, PLR0915 - one closure per tool
                     "suffering": verdict.state in ABNORMAL,
                 }
                 for datastore_moref in vm.datastore_morefs:
-                    vms_by_datastore.setdefault(datastore_moref, []).append(row)
+                    key = powerflex.datastore_key(session.vcenter.name, datastore_moref)
+                    vms_by_datastore.setdefault(key, []).append(row)
             return datastores, vms_by_datastore
 
         names = _names(fleet, vcenters)
@@ -1859,6 +1860,8 @@ def _register_powerflex_tools(  # noqa: C901, PLR0915 - one closure per tool
             datastores.extend(store_rows)
             vms_by_datastore.update(vm_map)
         join = powerflex.affected_vms(impact["volume_to_pd"], datastores, vms_by_datastore)
+        # A vCenter that was not read is a gap, not "nothing maps there".
+        join["findings"].extend(f"vCenter {name} not read: {error}" for name, error in errors.items())
         return {
             "troubled_protection_domains": impact["troubled_protection_domains"],
             **join,
@@ -1878,13 +1881,15 @@ def _register_powerflex_tools(  # noqa: C901, PLR0915 - one closure per tool
         sds = await client.sds()
         devices = await client.devices()
         systems = await client.systems()
-        stats: dict[str, Any] = {}
+        per_system: list[dict[str, Any]] = []
         for system in systems:
             identifier = system.get("id")
             if identifier:
-                merged = await client.system_statistics(identifier)
-                if isinstance(merged, dict):
-                    stats |= merged
+                read = await client.system_statistics(identifier)
+                if isinstance(read, dict):
+                    per_system.append(read)
+        # The worst value of each statistic across systems, never the last one read.
+        stats = powerflex.merge_statistics(per_system)
         return {
             "systems": [{"id": system.get("id"), "name": system.get("name")} for system in systems],
         } | powerflex.summarize_health(sds, devices, stats)
@@ -1897,7 +1902,8 @@ def _register_powerflex_tools(  # noqa: C901, PLR0915 - one closure per tool
         the hotspot whose datastores and volumes feel load first. Run this when a
         PowerFlex-backed datastore is slow and you suspect a busy PD rather than a
         failure: it reads each PD's read/write bandwidth counters, derives IOPS
-        and throughput, and flags a PD at half or more of the total. Then map the
+        and throughput, and flags a PD carrying more than half of the total and
+        well over its even share (a 51/49 split of two PDs is not a hotspot). Then map the
         slow datastore to its volume (powerflex_find_volume) and confirm it lives
         on that PD.
         """
@@ -1928,6 +1934,9 @@ def _register_powerflex_tools(  # noqa: C901, PLR0915 - one closure per tool
             query: a volume name, a PowerFlex volume id, or an ESXi naa/eui device id.
 
         """
+        if not query.strip():
+            msg = "query is empty: give a volume name, a PowerFlex volume id, or an ESXi naa/eui device id"
+            raise ValueError(msg)
         volumes = await client.volumes()
         candidate = powerflex.volume_id_from_naa(query) or query.strip().lower()
         matches = [
