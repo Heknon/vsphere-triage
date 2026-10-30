@@ -25,7 +25,7 @@ from typing import TYPE_CHECKING, Any
 
 from vsphere_triage import capabilities, vmlog
 from vsphere_triage.diagnose import locate
-from vsphere_triage.guestexec import encode_shell
+from vsphere_triage.guestexec import encode_shell, probe_failed
 
 if TYPE_CHECKING:
     from vsphere_triage.config import Settings
@@ -125,8 +125,8 @@ async def investigate_linux_boot(
     user = username or settings.guest_username
     secret = password or settings.guest_password
 
-    def work(session: VCenterSession) -> dict[str, Any]:
-        located = locate(session, settings, env_id=env_id, vm_name=vm_name, moref=moref)
+    def work(session: VCenterSession) -> dict[str, Any]:  # noqa: PLR0911 - each reason it cannot look
+        located = locate(session, settings, env_id=env_id, vm_name=vm_name, moref=moref, strict=True)
         if not located["found"]:
             return {"found": False, "reason": located["reason"]}
         vm = located["vm"]
@@ -135,8 +135,9 @@ async def investigate_linux_boot(
                 "found": True,
                 "investigated": False,
                 "reason": (
-                    "the VM is powered off, so its boot logs cannot be read. Reboot it first — "
-                    "reboot_guest if Tools can act, else hard_reset — let it come up, then investigate"
+                    "the VM is powered off, so its boot logs cannot be read. Power it on first (from your "
+                    "orchestrator or vCenter: this server has no power-on tool, and reboot_guest / "
+                    "hard_reset only act on a running VM), let it come up, then investigate"
                 ),
             }
         if vm.os_family == "windows":
@@ -175,6 +176,16 @@ async def investigate_linux_boot(
             timeout_seconds=settings.guest_exec_timeout_seconds,
             max_output_bytes=settings.guest_exec_max_output_bytes,
         )
+        failed = probe_failed(result)
+        if failed:
+            return {
+                "found": True,
+                "investigated": False,
+                "vm": vm.identity(),
+                "reason": failed + "; nothing about the guest's boot was read",
+                "exit_code": result.get("exit_code"),
+                "evidence_gaps": capabilities.evidence_gaps(settings, vm),
+            }
         return {
             "found": True,
             "investigated": True,
@@ -183,4 +194,11 @@ async def investigate_linux_boot(
             "evidence_gaps": capabilities.evidence_gaps(settings, vm),
         }
 
-    return await pool.run(name, work)
+    # A guest command inside: never repeated on a dropped session (a second process,
+    # a second temp file), and given the guest timeout on top of the reads.
+    return await pool.run(
+        name,
+        work,
+        retry=False,
+        timeout_seconds=settings.timeout_seconds + settings.guest_exec_timeout_seconds,
+    )

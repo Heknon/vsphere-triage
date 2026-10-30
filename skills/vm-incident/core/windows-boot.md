@@ -8,7 +8,9 @@ enough for VMware Tools. So the Windows boot investigation has an order.
 ## 1. Get the guest up
 
 If the VM is powered off or wedged, you cannot read its running event log.
-Reboot it, preferring the graceful path:
+A powered-off VM has to be powered on from your orchestrator or vCenter (this
+server has no power-on tool; both tools below act only on a running VM). A
+wedged one, reboot, preferring the graceful path:
 
 1. `reboot_guest` — if VMware Tools can still act.
 2. `hard_reset` — only if Tools is down or the graceful reboot never returned.

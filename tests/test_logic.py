@@ -2895,3 +2895,67 @@ def test_a_51_49_split_of_two_protection_domains_is_not_a_hotspot() -> None:
     ranked = powerflex.rank_protection_domains(rows)
 
     assert any("none dominates" in finding for finding in ranked["findings"])
+
+
+# -- review of main: the tools that act on a VM -------------------------------------------------
+
+
+def test_an_acting_tool_refuses_a_moref_whose_name_does_not_match(monkeypatch: pytest.MonkeyPatch) -> None:
+    other = vm(moref="vm-1243", name="web-07")
+    monkeypatch.setattr(diagnose.Layout, "of", classmethod(lambda _cls, _s: SimpleNamespace(folders={})))
+    monkeypatch.setattr(diagnose, "read_vms", lambda *_a, **_k: [(other, {})])
+    session = SimpleNamespace(reference=lambda *_a: None, vcenter=SimpleNamespace(name="vc-a"))
+
+    lenient = diagnose.locate(session, Settings(), env_id=None, vm_name="db01", moref="vm-1243")  # type: ignore[arg-type]
+    strict = diagnose.locate(session, Settings(), env_id=None, vm_name="db01", moref="vm-1243", strict=True)  # type: ignore[arg-type]
+
+    assert lenient["found"] is True
+    assert strict["found"] is False
+    assert "refusing to act" in strict["reason"]
+
+
+def test_an_acting_tool_refuses_a_partial_environment_id(monkeypatch: pytest.MonkeyPatch) -> None:
+    folders = {"g1": folder("g1", "env-142", "g0", "/DC0/vm/env-142", "vm")}
+    monkeypatch.setattr(diagnose.Layout, "of", classmethod(lambda _cls, _s: SimpleNamespace(folders=folders)))
+    monkeypatch.setattr(diagnose, "read_vms", lambda *_a, **_k: [(vm(name="db01"), {})])
+    session = SimpleNamespace(reference=lambda *_a: None, vcenter=SimpleNamespace(name="vc-a"))
+
+    strict = diagnose.locate(session, Settings(), env_id="42", vm_name="db01", moref=None, strict=True)  # type: ignore[arg-type]
+
+    assert strict["found"] is False
+    assert "partial environment id" in strict["reason"]
+
+
+def test_a_boot_entry_without_an_ems_line_is_ems_off_not_access_denied() -> None:
+    from vsphere_triage import emscheck  # noqa: PLC0415
+
+    dump = (
+        "Windows Boot Loader\n-------------------\nidentifier              {current}\n"
+        "path                    \\Windows\\system32\\winload.efi\nbootstatuspolicy        IgnoreAllFailures\n"
+    )
+    localized = dump + "ems                     Ja\n"
+
+    assert emscheck.parse_bcd_output(dump)["ems_enabled"] is False
+    assert emscheck.parse_bcd_output(localized)["ems_enabled"] is True
+    assert emscheck.parse_bcd_output("garbage")["ems_enabled"] is None
+
+
+def test_an_unreadable_minidump_folder_is_not_no_dump() -> None:
+    from vsphere_triage import crashdump  # noqa: PLC0415
+
+    assert "elevated" in crashdump.decode_dump({"found": False, "denied": True})["reason"]
+    assert "not evidence" in crashdump.decode_dump({})["reason"]
+
+
+def test_a_failed_guest_probe_is_not_read_as_a_clean_one() -> None:
+    assert "timeout" in guestexec.probe_failed({"timed_out": True, "exit_code": None, "output": ""})
+    assert "no output" in guestexec.probe_failed({"timed_out": False, "exit_code": 127, "output": " "})
+    assert guestexec.probe_failed({"timed_out": False, "exit_code": 0, "output": "{}"}) is None
+
+
+def test_the_windows_boot_probe_cuts_messages_by_their_collapsed_length() -> None:
+    script = winboot.boot_probe_powershell()
+
+    assert "$m.Substring(0,[Math]::Min(300,$m.Length))" in script
+    assert "($_.Message).Length" not in script
+    assert "$o.srttrail=$(if" in script

@@ -21,9 +21,11 @@ these, in one pass, through the guest:
   (per-driver load list), **`SrtTrail.txt`** (Startup Repair's own diagnosis),
   and the update **Panther** log for "Working on updates" hangs.
 
-The script is read-only — only `Get-WinEvent`, `Get-Item`, `Get-Content`,
-`Test-Path`, never a change. The script-building and the parsing are pure and
-tested here; the guest read is `investigate_windows_boot`.
+The script changes nothing in Windows — only `Get-WinEvent`, `Get-Item`,
+`Get-Content`, `Test-Path` — but it runs through guest exec, so like
+`run_in_guest` it writes its output to a temp file in the guest and deletes it.
+The script-building and the parsing are pure and tested here; the guest read
+is `investigate_windows_boot`.
 """
 
 from __future__ import annotations
@@ -32,7 +34,7 @@ from typing import TYPE_CHECKING, Any
 
 from vsphere_triage import capabilities, vmlog
 from vsphere_triage.diagnose import locate
-from vsphere_triage.guestexec import encode_powershell
+from vsphere_triage.guestexec import encode_powershell, probe_failed
 
 if TYPE_CHECKING:
     from vsphere_triage.config import Settings
@@ -56,7 +58,11 @@ def boot_probe_powershell() -> str:
         f"{PER_KIND} |"
         " ForEach-Object { @{ time=$_.TimeCreated.ToUniversalTime().ToString('o');"
         " id=$_.Id; provider=$_.ProviderName;"
-        " message=($_.Message -replace '\\s+',' ').Substring(0,[Math]::Min(300,($_.Message).Length)) } } }"
+        # Collapse whitespace first, then cut the collapsed text by its own length:
+        # cutting it by the original length throws on any message with a double space
+        # or CRLF (WER 1001 has both), and the catch would drop the whole event kind.
+        " message=$($m=([string]$_.Message -replace '\\s+',' ');"
+        " $m.Substring(0,[Math]::Min(300,$m.Length))) } } }"
         " catch { @() } }"
         "$o=[ordered]@{};"
         "$o.last_boot=(Get-CimInstance Win32_OperatingSystem).LastBootUpTime.ToUniversalTime().ToString('o');"
@@ -75,7 +81,9 @@ def boot_probe_powershell() -> str:
         "$o.memory_dmp=(Test-Path 'C:\\Windows\\MEMORY.DMP');"
         "$o.ntbtlog=(Test-Path 'C:\\Windows\\ntbtlog.txt');"
         "$srt='C:\\Windows\\System32\\LogFiles\\Srt\\SrtTrail.txt';"
-        "$o.srttrail=(if (Test-Path $srt) { (Get-Content $srt -Tail 40 | Out-String) } else { $null });"
+        # $( ): `if` is a statement, so inside plain ( ) it is an error that
+        # SilentlyContinue hid, and SrtTrail was never reported.
+        "$o.srttrail=$(if (Test-Path $srt) { (Get-Content $srt -Tail 40 | Out-String) } else { $null });"
         "$pan='C:\\Windows\\Panther\\setupact.log';"
         "$o.panther_present=(Test-Path $pan);"
         "$o | ConvertTo-Json -Depth 5 -Compress"
@@ -163,7 +171,7 @@ async def investigate_windows_boot(
     secret = password or settings.guest_password
 
     def work(session: VCenterSession) -> dict[str, Any]:  # noqa: PLR0911 - one guard per precondition
-        located = locate(session, settings, env_id=env_id, vm_name=vm_name, moref=moref)
+        located = locate(session, settings, env_id=env_id, vm_name=vm_name, moref=moref, strict=True)
         if not located["found"]:
             return {"found": False, "reason": located["reason"]}
         vm = located["vm"]
@@ -172,8 +180,9 @@ async def investigate_windows_boot(
                 "found": True,
                 "investigated": False,
                 "reason": (
-                    "the VM is powered off, so its running event log cannot be read. Reboot it first — "
-                    "reboot_guest if Tools can act, else hard_reset — let it come up, then investigate"
+                    "the VM is powered off, so its running event log cannot be read. Power it on first "
+                    "(from your orchestrator or vCenter: there is no power-on tool here, and reboot_guest / "
+                    "hard_reset only act on a running VM), let it come up, then investigate"
                 ),
             }
         if vm.os_family != "windows":
@@ -216,6 +225,15 @@ async def investigate_windows_boot(
         )
         from vsphere_triage.emscheck import _extract_json  # noqa: PLC0415 - shared JSON extraction
 
+        failed = probe_failed(result)
+        if failed:
+            return {
+                "found": True,
+                "investigated": False,
+                "vm": vm.identity(),
+                "reason": failed + "; nothing about the guest's boot was read",
+                "evidence_gaps": capabilities.evidence_gaps(settings, vm),
+            }
         parsed = _extract_json(result.get("output", ""))
         if not parsed:
             return {
@@ -233,4 +251,11 @@ async def investigate_windows_boot(
             "evidence_gaps": capabilities.evidence_gaps(settings, vm),
         }
 
-    return await pool.run(name, work)
+    # A guest command inside: never repeated on a dropped session (a second process,
+    # a second temp file), and given the guest timeout on top of the reads.
+    return await pool.run(
+        name,
+        work,
+        retry=False,
+        timeout_seconds=settings.timeout_seconds + settings.guest_exec_timeout_seconds,
+    )

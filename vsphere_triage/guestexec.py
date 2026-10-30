@@ -79,6 +79,20 @@ def encode_shell(script: str) -> str:
     return f"echo {encoded}|base64 -d|sh"
 
 
+def probe_failed(result: dict[str, Any]) -> str | None:
+    """Why a guest probe's result cannot be read as evidence, or None when it can.
+
+    A probe that timed out, or produced no output at all, says nothing about the
+    guest; reading its empty output as "nothing found" would turn a failed check
+    into a clean one.
+    """
+    if result.get("timed_out"):
+        return f"the guest probe did not finish within its timeout (exit code {result.get('exit_code')})"
+    if not str(result.get("output") or "").strip():
+        return f"the guest probe produced no output (exit code {result.get('exit_code')})"
+    return None
+
+
 def rewrite_transfer_url(url: str, host: str) -> str:
     """Resolve the guest file-transfer URL, whose host vCenter returns as `*` ('where you connected')."""
     return url.replace("://*", f"://{host}", 1) if "://*" in url else url
@@ -109,7 +123,7 @@ async def run_in_guest(  # noqa: PLR0913 - one guest command, its target and its
 
     def check(session: VCenterSession) -> dict[str, Any]:
         """Find the VM and whether it can take a command: reads only, so safe to retry."""
-        located = locate(session, settings, env_id=env_id, vm_name=vm_name, moref=moref)
+        located = locate(session, settings, env_id=env_id, vm_name=vm_name, moref=moref, strict=True)
         if not located["found"]:
             return {"found": False, "reason": located["reason"]}
         vm = located["vm"]

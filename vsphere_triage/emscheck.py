@@ -36,7 +36,11 @@ if TYPE_CHECKING:
     from vsphere_triage.config import Settings
     from vsphere_triage.vcenter import VCenterPool, VCenterSession
 
-_EMS_FLAG = re.compile(r"(?im)^\s*ems\s+(Yes|No)\s*$")
+_EMS_FLAG = re.compile(r"(?im)^\s*ems\s+(\S+)\s*$")
+# bcdedit translates Yes/No with the guest's display language.
+_YES = frozenset({"yes", "ja", "oui", "si", "sí", "sim", "да", "是", "はい", "tak", "igen", "ano"})
+# Locale-independent marks that the dump is a real boot entry (the loader path).
+_BOOT_ENTRY = re.compile(r"(?i)\\windows\\system32\\winload")
 _EMS_PORT = re.compile(r"(?im)^\s*emsport\s+(\S+)")
 _EMS_BAUD = re.compile(r"(?im)^\s*emsbaudrate\s+(\d+)")
 _ACCESS_DENIED = re.compile(r"(?i)access is denied|requires elevation|elevated")
@@ -45,7 +49,8 @@ _ACCESS_DENIED = re.compile(r"(?i)access is denied|requires elevation|elevated")
 def bcd_probe_powershell() -> str:
     """A PowerShell script that dumps the boot entry and EMS settings as JSON.
 
-    Read-only: it only runs `bcdedit /enum`, never `/set`. bcdedit needs an
+    It changes nothing: it only runs `bcdedit /enum`, never `/set` (like every
+    guest probe it writes its output to a guest temp file and deletes it). bcdedit needs an
     elevated token to read the store, so a non-admin run returns "Access is
     denied", which the parser reports as "unconfirmed" rather than "off".
     """
@@ -83,8 +88,15 @@ def parse_bcd_output(output: str) -> dict[str, Any]:
     current = str(parsed.get("current", "")) if parsed else output
     settings = str(parsed.get("emssettings", "")) if parsed else output
     flag = _EMS_FLAG.search(current)
-    enabled = None if flag is None else flag.group(1).lower() == "yes"
     access_denied = bool(_ACCESS_DENIED.search(current))
+    if flag is not None:
+        enabled: bool | None = flag.group(1).lower() in _YES
+    elif not access_denied and _BOOT_ENTRY.search(current):
+        # The entry was read and has no `ems` line: bcdedit omits a setting never
+        # set, and EMS is off by default. That is "off", not "unconfirmed".
+        enabled = False
+    else:
+        enabled = None
     port = _EMS_PORT.search(settings)
     baud = _EMS_BAUD.search(settings)
     return {
@@ -92,7 +104,7 @@ def parse_bcd_output(output: str) -> dict[str, Any]:
         "emsport": port.group(1) if port else None,
         "emsbaudrate": int(baud.group(1)) if baud else None,
         "access_denied": access_denied,
-        "read": flag is not None or port is not None,
+        "read": enabled is not None or port is not None,
     }
 
 
@@ -142,12 +154,22 @@ def _verdict(  # noqa: PLR0911 - one capability, each outcome beside it
                 "provide guest access so bcdedit can be read, or enable EMS (see the gap's how_to_enable)"
             ),
         }
-    if bcd.get("access_denied") or bcd.get("ems_enabled") is None:
+    if bcd.get("access_denied"):
         return {
             "available": None,
             "state": "unconfirmed_bcdedit_denied",
             "why": "bcdedit could not read the store (it needs an elevated account), so EMS state is unknown",
             "how_to_enable": "run with an elevated guest account to read {current}/{emssettings}",
+        }
+    if bcd.get("ems_enabled") is None:
+        return {
+            "available": None,
+            "state": "unconfirmed_unreadable",
+            "why": (
+                "the bcdedit output could not be read (exit code "
+                f"{bcd.get('exit_code')}, timed out: {bcd.get('timed_out')}), so EMS state is unknown"
+            ),
+            "how_to_enable": "rerun check_ems, or run `bcdedit /enum {current}` with run_in_guest",
         }
     if bcd.get("ems_enabled") is True:
         return {
@@ -183,7 +205,7 @@ async def check_ems(
     secret = password or settings.guest_password
 
     def work(session: VCenterSession) -> dict[str, Any]:
-        located = locate(session, settings, env_id=env_id, vm_name=vm_name, moref=moref)
+        located = locate(session, settings, env_id=env_id, vm_name=vm_name, moref=moref, strict=True)
         if not located["found"]:
             return {"found": False, "reason": located["reason"]}
         vm = located["vm"]
@@ -202,7 +224,10 @@ async def check_ems(
                 timeout_seconds=settings.guest_exec_timeout_seconds,
                 max_output_bytes=settings.guest_exec_max_output_bytes,
             )
-            bcd = parse_bcd_output(result.get("output", "")) | {"exit_code": result.get("exit_code")}
+            bcd = parse_bcd_output(result.get("output", "")) | {
+                "exit_code": result.get("exit_code"),
+                "timed_out": result.get("timed_out"),
+            }
         gap = capabilities.serial_console_gap(vm)
         verdict = _verdict(
             vm.os_family,
@@ -221,4 +246,11 @@ async def check_ems(
             "guest_checked": bcd is not None,
         }
 
-    return await pool.run(name, work)
+    # A guest command inside: never repeated on a dropped session (a second process,
+    # a second temp file), and given the guest timeout on top of the reads.
+    return await pool.run(
+        name,
+        work,
+        retry=False,
+        timeout_seconds=settings.timeout_seconds + settings.guest_exec_timeout_seconds,
+    )

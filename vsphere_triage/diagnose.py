@@ -182,11 +182,17 @@ def locate(  # noqa: C901, PLR0911, PLR0912 - one lookup, each way it can fail b
     env_id: str | None,
     vm_name: str | None,
     moref: str | None,
+    strict: bool = False,
 ) -> dict[str, Any]:
     """Find one VM by moref, or by its environment and its name inside it.
 
     Never by name alone: the name is reused by later environments. Returns the
     VM, or why it could not be found and what was found instead.
+
+    `strict=True` is for the tools that act on a VM (a guest command, a reboot, a
+    reset): a moref whose name differs from the `vm_name` given is refused rather
+    than noted, and the environment folder and the VM name must match exactly, so
+    a typo never lands the action on a neighbouring VM.
     """
     layout = Layout.of(session)
     if moref:
@@ -198,6 +204,12 @@ def locate(  # noqa: C901, PLR0911, PLR0912 - one lookup, each way it can fail b
             }
         vm, row = found[0]
         if vm_name and vm.name != vm_name:
+            if strict:
+                return {
+                    "found": False,
+                    "reason": f"{moref} is named {vm.name!r}, not {vm_name!r}; refusing to act on a VM "
+                    "whose name does not match — check the moref",
+                }
             vm.notes.append(f"asked for {vm_name!r} but {moref} is named {vm.name!r}")
         return {"found": True, "vm": vm, "row": row, "layout": layout}
     if not env_id or not vm_name:
@@ -210,6 +222,13 @@ def locate(  # noqa: C901, PLR0911, PLR0912 - one lookup, each way it can fail b
             "(the environment may have been destroyed, or be on another vCenter)",
         }
     exact = [folder for folder in folders if folder.name.lower() == env_id.strip().lower()]
+    if strict and not exact:
+        return {
+            "found": False,
+            "reason": f"no folder is named exactly {env_id!r} (only folders containing it); refusing to act "
+            "on a VM found by a partial environment id — give the full id or the moref",
+            "candidates": [folder.path for folder in folders[:MAX_CANDIDATE_FOLDERS]],
+        }
     candidates = exact or folders
     if len(candidates) > MAX_CANDIDATE_FOLDERS:
         # A short id contained in hundreds of folder names: each would be read with the
@@ -228,7 +247,7 @@ def locate(  # noqa: C901, PLR0911, PLR0912 - one lookup, each way it can fail b
             # Nested matching folders read one VM twice; it is still one VM.
             if vm.moref in seen:
                 continue
-            if vm.name == vm_name or vm.name.lower() == vm_name.lower():
+            if vm.name == vm_name or (not strict and vm.name.lower() == vm_name.lower()):
                 seen.add(vm.moref)
                 matches.append((folder, vm, row))
     if len(matches) == 1:

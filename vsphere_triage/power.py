@@ -44,7 +44,7 @@ async def _located(
     """Find the VM: reads only, so this step may be retried on a dropped session."""
 
     def find(session: VCenterSession) -> dict[str, Any]:
-        located = locate(session, settings, env_id=env_id, vm_name=vm_name, moref=moref)
+        located = locate(session, settings, env_id=env_id, vm_name=vm_name, moref=moref, strict=True)
         if not located["found"]:
             return {"found": False, "reason": located["reason"]}
         return {"found": True, "vm": located["vm"]}
