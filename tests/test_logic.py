@@ -695,6 +695,16 @@ def test_a_series_is_summarised_with_its_peak() -> None:
     assert summary is not None
     assert (summary["max"], summary["mean"], summary["last"]) == (9.0, 4.67, 4.0)
     assert summary["peak_at"] == NOW + timedelta(seconds=20)
+    assert summary["steady"] is False
+
+
+def test_a_flat_series_is_steady_not_peaking_at_its_first_sample() -> None:
+    samples = [(NOW + timedelta(seconds=20 * index), 180.0) for index in range(4)]
+
+    summary = contention.summarize(samples)
+
+    assert summary is not None
+    assert summary["steady"] is True
 
 
 # -- read-only --------------------------------------------------------------------------------

@@ -59,6 +59,8 @@ def summarize(samples: list[tuple[datetime, float]]) -> dict[str, Any] | None:
         "mean": round(fmean(values), 2),
         "last": round(values[-1], 2),
         "peak_at": peak_at,
+        # No peak to time: the first sample is the "peak", and moves with the window read.
+        "steady": len(values) > 1 and min(values) == peak,
         "samples": len(values),
         "from": samples[0][0],
         "to": samples[-1][0],
@@ -328,9 +330,14 @@ def storage(  # noqa: C901, PLR0912, PLR0915 - one report over many counters
         for label in ("read_latency_ms", "write_latency_ms"):
             summary = entry[label]
             if summary and summary["max"] >= thresholds.datastore_latency_ms:
+                when = (
+                    f"held at {summary['max']:.0f} ms from {summary['from']:%H:%M:%S}Z "
+                    f"to {summary['to']:%H:%M:%S}Z"
+                    if summary.get("steady")
+                    else f"peaked at {summary['max']:.0f} ms at {summary['peak_at']:%H:%M:%S}Z"
+                )
                 findings.append(
-                    f"datastore {store.get('name')} {label.split('_')[0]} latency peaked at "
-                    f"{summary['max']:.0f} ms at {summary['peak_at']:%H:%M:%S}Z "
+                    f"datastore {store.get('name')} {label.split('_')[0]} latency {when} "
                     f"(threshold {thresholds.datastore_latency_ms:g} ms)"
                 )
         result["datastores"].append(entry)

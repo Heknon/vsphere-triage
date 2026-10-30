@@ -50,13 +50,18 @@ Round 1 found and round 2 checked:
 - A model wanting every abnormal VM re-ran `scan` with a high `limit`; the VMs
   past the limit are now named in `more_abnormal_vms`, one line each.
 
-| scenario | round 1 | round 2 |
-|---|---|---|
-| storage-storm | wrong cause, 16 calls, 163k chars | right, 7 calls, 86k |
-| cpu-starvation | right, 6 calls, 129k | right, 5 calls, 69k |
-| fleet | right, 15 calls, 191k | right, 5 calls, 125k |
-| boot-loop | hedged (server led with a NIC), 3 calls | right, 2 calls |
-| stop-code | right, 1 call | right, 1 call |
-| question | right, 1 call | right, 1 call |
+| scenario | round 1 | round 2 | round 3 |
+|---|---|---|---|
+| storage-storm | wrong cause, 16 calls, 163k chars | right, 7 calls, 86k | right, 7 calls, 103k |
+| cpu-starvation | right, 6 calls, 129k | right, 5 calls, 69k | right, 2 calls, 29k |
+| fleet | right, 15 calls, 191k | right, 5 calls, 125k | right, 6 calls, 114k, one scan |
+| boot-loop | hedged (server led with a NIC), 3 calls | right, 2 calls | |
+| stop-code | right, 1 call | right, 1 call | |
+| question | right, 1 call | right, 1 call | |
+
+Round 3 ran the multi-call scenarios after `more_abnormal_vms` and the CPU fix.
+Across rounds the model kept doubting latency "peaks" whose time moved between
+tools: on a flat series the first sample is the peak. A series that does not
+move is now marked `steady`, and its datastore finding says "held at".
 
 No run, in any round, called a tool that acts on a VM.
