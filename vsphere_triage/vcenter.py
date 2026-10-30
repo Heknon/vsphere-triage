@@ -965,7 +965,8 @@ class _Slot:
 def _not_retried(name: str, why: str) -> VSphereError:
     """The error for work that must not be repeated, when its session broke under it."""
     msg = (
-        f"vCenter {name}: {why} during work that is not repeated automatically (a guest command); "
+        f"vCenter {name}: {why} during work that is not repeated automatically (a guest command, "
+        "a reboot or a reset); "
         "it may or may not have run. The session has been re-opened; check before running it again"
     )
     return VSphereError(msg)
@@ -1039,8 +1040,8 @@ class VCenterPool:
                 if retry:
                     raise
                 msg = (
-                    f"{error}; the guest command may still be running in the guest — check before "
-                    "running it again"
+                    f"{error}; the action (a guest command, a reboot or a reset) may still be under way "
+                    "— check before running it again"
                 )
                 raise VSphereError(msg) from error
             except vim.fault.NotAuthenticated:

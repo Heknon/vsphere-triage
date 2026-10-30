@@ -2202,7 +2202,7 @@ def test_a_guest_command_past_its_deadline_says_it_may_still_be_running(
 
     async def scenario() -> None:
         try:
-            with pytest.raises(VSphereError, match="may still be running"):
+            with pytest.raises(VSphereError, match="may still be under way"):
                 await pool.run("vc-a", lambda _s: stalled.wait(5), retry=False, timeout_seconds=0.05)
         finally:
             stalled.set()
@@ -2771,3 +2771,38 @@ def test_crash_dump_decodes_the_bugcheck_and_parameters() -> None:
 
 def test_crash_dump_absent_is_reported() -> None:
     assert crashdump.decode_dump({"found": False})["found"] is False
+
+
+def test_a_hard_reset_is_never_sent_twice_after_a_session_expiry(monkeypatch: pytest.MonkeyPatch) -> None:
+    from vsphere_triage import power  # noqa: PLC0415
+    from vsphere_triage.vcenter import VCenterPool, VSphereError  # noqa: PLC0415
+
+    settings = Settings.from_environment(
+        {
+            "VSPHERE_VCENTERS": '[{"name": "vc-a", "host": "a"}]',
+            "VSPHERE_USERNAME": "u",
+            "VSPHERE_PASSWORD": "p",
+        }
+    )
+    pool = VCenterPool(settings)
+    session = pool.session("vc-a")
+
+    def fake_login() -> None:
+        session._content = object()
+        session.generation += 1
+
+    monkeypatch.setattr(session, "_login", fake_login)
+    target = vm(moref="vm-7", tools_running="guestToolsNotRunning")
+    monkeypatch.setattr(power, "locate", lambda *_a, **_k: {"found": True, "vm": target})
+    sent = {"n": 0}
+
+    def reset(_moref: str) -> dict:
+        sent["n"] += 1
+        raise vim.fault.NotAuthenticated
+
+    monkeypatch.setattr(session, "hard_reset", reset)
+
+    with pytest.raises(VSphereError, match="may or may not have run"):
+        asyncio.run(power.hard_reset(pool, settings, "vc-a", moref="vm-7", env_id=None, vm_name=None))
+
+    assert sent["n"] == 1
