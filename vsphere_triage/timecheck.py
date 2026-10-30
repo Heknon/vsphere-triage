@@ -13,7 +13,11 @@ each vCenter's hosts and measures skew where the host answers.
 from __future__ import annotations
 
 import asyncio
+import time
+from datetime import timedelta
 from typing import TYPE_CHECKING, Any
+
+from pyVmomi import vim
 
 from vsphere_triage.inventory import read_host_time
 
@@ -79,7 +83,12 @@ def _scan_host_time(session: VCenterSession, *, measure_skew: bool) -> list[dict
     """Read every host's time config, and its clock skew where it answers. Blocking."""
     rows = read_host_time(session)
     if measure_skew:
-        vcenter_now = session.now()
+        # vCenter's clock is read once and carried forward on a monotonic clock,
+        # so each host is compared with vCenter's time at the moment it answered,
+        # not at the start of the loop: on hundreds of hosts the read time alone
+        # would otherwise add up to a false skew.
+        vcenter_then = session.now()
+        started = time.monotonic()
         for row in rows:
             if row.get("connection_state") not in (None, "connected"):
                 continue
@@ -88,8 +97,13 @@ def _scan_host_time(session: VCenterSession, *, measure_skew: bool) -> list[dict
                 row["skew_error"] = "the host does not expose a dateTimeSystem"
                 continue
             try:
+                asked = time.monotonic()
                 host_now = session.host_datetime(system)
-                row["skew_seconds"] = (host_now - vcenter_now).total_seconds()
+                answered = time.monotonic()
+                vcenter_at = vcenter_then + timedelta(seconds=(asked + answered) / 2 - started)
+                row["skew_seconds"] = (host_now - vcenter_at).total_seconds()
+            except vim.fault.NotAuthenticated:
+                raise  # the session expired: let the pool re-login and retry the read
             except Exception as error:  # noqa: BLE001 - a host that will not answer is not a healthy one
                 row["skew_error"] = f"clock not read ({type(error).__name__})"
     return rows
@@ -105,7 +119,7 @@ async def check_host_time(
     """Each host's NTP configuration and clock skew across the vCenters, worst first."""
     results = await asyncio.gather(
         *(
-            pool.run(name, lambda session: _scan_host_time(session, measure_skew=measure_skew))
+            pool.sweep(name, lambda session: _scan_host_time(session, measure_skew=measure_skew))
             for name in names
         ),
         return_exceptions=True,

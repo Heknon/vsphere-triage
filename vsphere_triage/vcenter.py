@@ -63,6 +63,10 @@ class VSphereError(RuntimeError):
     """A vSphere read failed in a way the caller should see, worded for a reader."""
 
 
+class DeadlineError(VSphereError):
+    """A read ran past its deadline; its worker thread may still be running it."""
+
+
 @dataclass
 class DatastoreFile:
     """A file read from a datastore: possibly only its end, and said so."""
@@ -128,6 +132,19 @@ def _declared_size(response: httpx.Response, *, ranged: bool) -> int | None:
     return int(declared) if declared and declared.isdigit() else None
 
 
+_OWN_ONLY_NOTE = (
+    "only this server's own session is visible: either it is the only one open, or (far more "
+    "likely) the account lacks the Sessions.View privilege, which vCenter answers with just the "
+    "caller's session rather than an error; grant it to see the global count"
+)
+
+
+def _only_own(sessions: Sequence[Any], manager: Any) -> bool:
+    """Whether the session list is just this server's own session, as a role without Sessions.View sees it."""
+    own = getattr(getattr(manager, "currentSession", None), "key", None)
+    return len(sessions) <= 1 and all(getattr(entry, "key", None) == own for entry in sessions)
+
+
 def _session_row(entry: Any, now: datetime) -> dict[str, Any]:
     """One UserSession flattened: who, from where, how old and how idle."""
     login = as_utc(entry.loginTime) if getattr(entry, "loginTime", None) else None
@@ -175,12 +192,17 @@ class VCenterSession:
         # a caller can tell whether the session it used has since been replaced.
         self._lock = threading.Lock()
         self.generation = 0
+        # How long the last login took and when: the exhaustion signal, since a
+        # vCenter near its session limit is slow to log in long before it refuses.
+        self.last_login_seconds: float | None = None
+        self.last_login_at: datetime | None = None
 
     # -- the session ---------------------------------------------------------
 
     def _login(self) -> None:
         """Open a fresh session, disconnecting any old one first. Call under `_lock`."""
         username, password = self.settings.credentials_for(self.vcenter)
+        started = time.monotonic()
         try:
             raw = SmartConnect(
                 host=self.vcenter.host,
@@ -200,6 +222,8 @@ class VCenterSession:
         except (OSError, ssl.SSLError) as error:
             msg = f"vCenter {self.vcenter.name} ({self.vcenter.host}) unreachable: {error}"
             raise VSphereError(msg) from error
+        self.last_login_seconds = round(time.monotonic() - started, 2)
+        self.last_login_at = datetime.now(UTC)
         self._teardown()
         self._stub = ReadOnlyStub(raw._stub)  # noqa: SLF001 - wrapping is the point
         self._service = vim.ServiceInstance("ServiceInstance", self._stub)
@@ -298,6 +322,13 @@ class VCenterSession:
                 "note": "the account may not list all sessions; grant Sessions.View to see the global count",
                 "current_user": current,
             }
+        if _only_own(sessions, manager):
+            return {
+                "visible": "own_only",
+                "total": len(sessions),
+                "note": _OWN_ONLY_NOTE,
+                "current_user": current,
+            }
         by_user: dict[str, int] = {}
         for entry in sessions:
             by_user[entry.userName] = by_user.get(entry.userName, 0) + 1
@@ -332,6 +363,13 @@ class VCenterSession:
                     "this account may not list all sessions; grant the Sessions.View privilege (or a role "
                     "that carries it) to diagnose exhaustion, or read the vCenter's session count from vROps"
                 ),
+                "current_user": getattr(manager.currentSession, "userName", None),
+            }
+        if _only_own(raw, manager):
+            return {
+                "visible": "own_only",
+                "total": len(raw),
+                "note": _OWN_ONLY_NOTE,
                 "current_user": getattr(manager.currentSession, "userName", None),
             }
         idle_cut = self._session_timeout_minutes()
@@ -568,6 +606,13 @@ class VCenterSession:
                 exit_code = info.exitCode
                 break
             time.sleep(0.5)
+        terminated = False
+        if exit_code is None:
+            # Stop it rather than leave it running unwatched, still writing to a
+            # file about to be read and deleted.
+            with contextlib.suppress(Exception):
+                process_manager.TerminateProcessInGuest(vm, auth, pid)
+                terminated = True
         output, truncated = "", False
         try:
             transfer = file_manager.InitiateFileTransferFromGuest(vm, auth, out_path)
@@ -583,6 +628,9 @@ class VCenterSession:
             "pid": pid,
             "exit_code": exit_code,
             "timed_out": exit_code is None,
+            # Only the shell Tools started is terminated: processes it spawned (a
+            # pipeline, a background job) can outlive it.
+            "shell_terminated_after_timeout": terminated,
             "output": output,
             "output_truncated": truncated,
         }
@@ -618,17 +666,59 @@ class VCenterSession:
         begin: datetime | None = None,
         end: datetime | None = None,
         types: Sequence[str] = (),
+        recursion: str = "self",
     ) -> list[Any]:
-        """The events on an entity (or everywhere), in a window, oldest first."""
+        """The events on an entity (or everywhere), in a window, oldest first.
+
+        `recursion="all"` takes an entity's children too (a folder's VMs).
+        """
         criteria = vim.event.EventFilterSpec()
         if entity is not None:
-            criteria.entity = vim.event.EventFilterSpec.ByEntity(entity=entity, recursion="self")
+            criteria.entity = vim.event.EventFilterSpec.ByEntity(entity=entity, recursion=recursion)
         if begin or end:
             criteria.time = vim.event.EventFilterSpec.ByTime(beginTime=begin, endTime=end)
         if types:
             criteria.eventTypeId = list(types)
         found = self.content.eventManager.QueryEvents(criteria) or []
         return sorted(found, key=lambda event: event.createdTime)
+
+    def events_covering(
+        self,
+        *,
+        begin: datetime,
+        end: datetime,
+        types: Sequence[str] = (),
+        entity: Any = None,
+        recursion: str = "self",
+        max_queries: int = 16,
+    ) -> tuple[list[Any], bool]:
+        """The events over a window even when it holds more than one QueryEvents answers.
+
+        QueryEvents returns at most QUERY_EVENTS_CAP events, the newest; a busy
+        window is otherwise silently cut to its last minutes. A window that hits
+        the cap is split in half and each half read, up to `max_queries` reads.
+        Returns the events, oldest first, and whether some part was still cut.
+        """
+        found: list[Any] = []
+        still_cut = False
+        pending = [(begin, end)]
+        queries = 0
+        while pending:
+            start, stop = pending.pop()
+            batch = self.events(entity=entity, begin=start, end=stop, types=types, recursion=recursion)
+            queries += 1
+            if len(batch) >= QUERY_EVENTS_CAP:
+                # Split only while the budget covers the reads already waiting too, and
+                # while the window is wide enough to split; otherwise it stays cut, said so.
+                if stop - start > timedelta(seconds=2) and queries + len(pending) + 2 <= max_queries:
+                    middle = start + (stop - start) / 2
+                    pending.extend([(start, middle), (middle, stop)])
+                    continue
+                still_cut = True
+            found.extend(batch)
+        # Halves meet at their boundary: one event can come back from both.
+        unique = {getattr(event, "key", id(event)): event for event in found}
+        return sorted(unique.values(), key=lambda event: event.createdTime), still_cut
 
     # -- performance ---------------------------------------------------------
 
@@ -879,6 +969,47 @@ def _rows(objects: Iterable[Any]) -> list[dict[str, Any]]:
     return rows
 
 
+class _Slot:
+    """One of a vCenter's concurrent-read slots, which a stalled worker thread can keep."""
+
+    def __init__(self, limit: asyncio.Semaphore) -> None:
+        self._limit = limit
+        self._owned = False
+
+    async def acquire(self) -> None:
+        await self._limit.acquire()
+        self._owned = True
+
+    def release(self) -> None:
+        """Give the slot back, unless a stalled thread has taken it over."""
+        if self._owned:
+            self._owned = False
+            self._limit.release()
+
+    def hand_off(self, future: asyncio.Future[Any]) -> None:
+        """Let a thread that outlived its deadline release the slot when it finally ends."""
+        if not self._owned:
+            return
+        self._owned = False
+
+        def done(finished: asyncio.Future[Any]) -> None:
+            if not finished.cancelled():
+                finished.exception()  # retrieved, so it is not reported as unhandled
+            self._limit.release()
+
+        future.add_done_callback(done)
+
+
+def _not_retried(name: str, why: str) -> VSphereError:
+    """The error for work that must not be repeated, when its session broke under it."""
+    msg = (
+        f"vCenter {name}: {why} during work that is not repeated automatically (a guest command, "
+        "a reboot or a reset); "
+        "it may or may not have run. The session has been re-opened; check before running it again"
+    )
+    return VSphereError(msg)
+
+
 def as_utc(value: datetime) -> datetime:
     """A vSphere timestamp as an aware UTC datetime."""
     if value.tzinfo is None:
@@ -910,26 +1041,66 @@ class VCenterPool:
             self._limits[name] = asyncio.Semaphore(self.settings.max_concurrent_per_vcenter)
         return self._sessions[name]
 
-    async def run(self, name: str, work: Callable[[VCenterSession], T]) -> T:
-        """Run one blocking read against a vCenter, bounded, with one re-login or reconnect."""
+    async def run(
+        self,
+        name: str,
+        work: Callable[[VCenterSession], T],
+        *,
+        retry: bool = True,
+        timeout_seconds: float | None = None,
+    ) -> T:
+        """Run one blocking read against a vCenter, bounded, with one re-login or reconnect.
+
+        `retry=False` is for work that must not run twice (a guest command): a
+        dropped session is still re-opened for the next call, but the work is not
+        repeated, and the error says it may or may not have run.
+        """
         session = self.session(name)
-        async with self._limits[name]:
-            await self._bounded(session.connect)
+        deadline = timeout_seconds or self.settings.timeout_seconds
+        slot = _Slot(self._limits[name])
+        try:
+            # Bounded too: slots held by reads stalled past their deadline must not
+            # make every later call on this vCenter wait forever without a word.
+            await asyncio.wait_for(slot.acquire(), timeout=deadline)
+        except TimeoutError:
+            msg = (
+                f"vCenter {name}: all {self.settings.max_concurrent_per_vcenter} read slots are still busy "
+                f"after {deadline:g}s (reads stalled past their deadline hold them until they end); "
+                "the vCenter is likely slow or unresponsive — check_vcenters, or retry later"
+            )
+            raise VSphereError(msg) from None
+        try:
+            await self._bounded(session.connect, slot=slot)
             generation = session.generation
             try:
-                return await self._bounded(lambda: work(session))
+                return await self._bounded(lambda: work(session), deadline, slot=slot)
+            except DeadlineError as error:
+                if retry:
+                    raise
+                msg = (
+                    f"{error}; the action (a guest command, a reboot or a reset) may still be under way "
+                    "— check before running it again"
+                )
+                raise VSphereError(msg) from error
             except vim.fault.NotAuthenticated:
                 # The session expired. Reconnect (a no-op if a sibling call already
                 # did, so we never log its new session out), then retry once.
-                await self._bounded(lambda: session.reconnect(generation))
-                return await self._bounded(lambda: work(session))
-            except (ssl.SSLError, ConnectionError, HTTPException):
+                await self._bounded(lambda: session.reconnect(generation), slot=slot)
+                if not retry:
+                    raise _not_retried(name, "the session expired") from None
+                return await self._bounded(lambda: work(session), deadline, slot=slot)
+            except (ssl.SSLError, ConnectionError, HTTPException) as dropped:
                 # A dropped or reset connection — under load often the vCenter at
                 # its connection or session limit. Reconnect and retry once; if it
                 # happens again, say so plainly rather than as a bare socket error.
+                if not retry:
+                    with contextlib.suppress(Exception):
+                        await self._bounded(lambda: session.reconnect(generation), slot=slot)
+                    why = f"the connection dropped ({type(dropped).__name__})"
+                    raise _not_retried(name, why) from dropped
                 try:
-                    await self._bounded(lambda: session.reconnect(generation))
-                    return await self._bounded(lambda: work(session))
+                    await self._bounded(lambda: session.reconnect(generation), slot=slot)
+                    return await self._bounded(lambda: work(session), deadline, slot=slot)
                 except (ssl.SSLError, ConnectionError, HTTPException) as again:
                     msg = (
                         f"vCenter {name} dropped the connection twice ({type(again).__name__}: {again}). "
@@ -937,13 +1108,35 @@ class VCenterPool:
                         "check_vcenters reports its session count, and vROps has its session history."
                     )
                     raise VSphereError(msg) from again
+        finally:
+            slot.release()
 
-    async def _bounded(self, work: Callable[[], T]) -> T:
+    async def sweep(self, name: str, work: Callable[[VCenterSession], T]) -> T:
+        """A whole-vCenter read (a scan, a fleet report): `run` under VSPHERE_SCAN_TIMEOUT_SECONDS.
+
+        One of these is many reads in a row (inventory, devices, events, counters),
+        so it gets the longer sweep deadline rather than the one meant for one read.
+        """
+        return await self.run(name, work, timeout_seconds=self.settings.scan_timeout_seconds)
+
+    async def _bounded(
+        self, work: Callable[[], T], timeout_seconds: float | None = None, *, slot: _Slot | None = None
+    ) -> T:
+        deadline = timeout_seconds or self.settings.timeout_seconds
+        future = asyncio.ensure_future(asyncio.to_thread(work))
         try:
-            return await asyncio.wait_for(asyncio.to_thread(work), timeout=self.settings.timeout_seconds)
+            return await asyncio.wait_for(asyncio.shield(future), timeout=deadline)
         except TimeoutError as error:
-            msg = f"vCenter read exceeded VSPHERE_TIMEOUT_SECONDS ({self.settings.timeout_seconds:g}s)"
-            raise VSphereError(msg) from error
+            # The worker thread cannot be stopped; it keeps the vCenter's slot until
+            # it ends, so stalled reads cannot pile up past the per-vCenter limit.
+            if slot is not None:
+                slot.hand_off(future)
+            msg = f"vCenter read exceeded its deadline ({deadline:g}s)"
+            raise DeadlineError(msg) from error
+        except asyncio.CancelledError:
+            if slot is not None:
+                slot.hand_off(future)
+            raise
 
     def methods_seen(self) -> set[str]:
         """Every vSphere method any session has sent."""

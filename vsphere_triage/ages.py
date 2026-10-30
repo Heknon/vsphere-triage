@@ -18,7 +18,7 @@ import asyncio
 from collections import Counter
 from typing import TYPE_CHECKING, Any
 
-from vsphere_triage.checks import ABNORMAL, classify
+from vsphere_triage.checks import classify
 from vsphere_triage.inventory import Inventory, VmFacts, read_inventory
 
 if TYPE_CHECKING:
@@ -51,6 +51,10 @@ def under_any(path: str | None, terms: Sequence[str]) -> bool:
     return False
 
 
+# The group for VMs with no parent folder (inside a vApp).
+OUTSIDE_FOLDERS = "(no folder: in a vApp)"
+
+
 def environments(
     inventory: Inventory,
     settings: Settings,
@@ -61,8 +65,13 @@ def environments(
     """Environment folders older than the threshold, oldest first, and those of unknown age."""
     by_folder: dict[str, list[VmFacts]] = {}
     for vm in inventory.vms:
-        if vm.folder_moref and under_any(vm.folder_path, under):
-            by_folder.setdefault(vm.folder_moref, []).append(vm)
+        if under_any(vm.folder_path, under):
+            # A VM in a vApp has no parent folder: grouped by its own vApp, not dropped,
+            # and never merged with the VMs of other vApps.
+            key = vm.folder_moref or (
+                f"{OUTSIDE_FOLDERS} {vm.vapp_moref}" if vm.vapp_moref else OUTSIDE_FOLDERS
+            )
+            by_folder.setdefault(key, []).append(vm)
     old, unknown = [], []
     for moref, vms in by_folder.items():
         folder = inventory.folders.get(moref)
@@ -71,14 +80,15 @@ def environments(
         states = Counter(verdict.state for verdict in verdicts.values())
         entry: dict[str, Any] = {
             "vcenter": inventory.vcenter,
-            "environment": folder.name if folder else None,
+            "environment": folder.name if folder else (moref if moref.startswith(OUTSIDE_FOLDERS) else None),
             "folder": folder.path if folder else None,
             "parent": folder.parent_name if folder else None,
             # The datacenter's own VM folder holds VMs outside any environment.
             "root_vm_folder": bool(folder and folder.parent_moref and folder.parent_name is None),
             "vms": len(vms),
             "powered_on": sum(1 for vm in vms if vm.powered_on),
-            "abnormal": sum(1 for verdict in verdicts.values() if verdict.state in ABNORMAL),
+            # As everywhere else: an abnormal state or an attention flag.
+            "abnormal": sum(1 for verdict in verdicts.values() if verdict.abnormal),
             "states": dict(states),
             "age_unknown_vms": len(vms) - len(ages),
         }
@@ -130,7 +140,7 @@ async def find_old_environments(
     """Environments older than `older_than_hours` across vCenters, oldest first."""
     results = await asyncio.gather(
         *(
-            pool.run(name, lambda session: _scan_ages(session, settings, older_than_hours, under))
+            pool.sweep(name, lambda session: _scan_ages(session, settings, older_than_hours, under))
             for name in names
         ),
         return_exceptions=True,

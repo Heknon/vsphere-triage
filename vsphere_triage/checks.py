@@ -250,7 +250,7 @@ def classify(  # noqa: C901, PLR0911, PLR0912 - one decision list, kept in one p
     return verdict(BOOTED_NOT_UP, up)
 
 
-def _flags(vm: VmFacts, thresholds: Thresholds, resets_in_window: int) -> list[str]:  # noqa: C901 - one test per flag
+def _flags(vm: VmFacts, thresholds: Thresholds, resets_in_window: int) -> list[str]:  # noqa: C901, PLR0912 - one test per flag
     """The flags a VM carries beside its state."""
     flags = []
     if resets_in_window >= thresholds.boot_loop_resets:
@@ -274,7 +274,11 @@ def _flags(vm: VmFacts, thresholds: Thresholds, resets_in_window: int) -> list[s
     if vm.tools_version_status in OUTDATED_TOOLS:
         flags.append(TOOLS_OUTDATED)
     if vm.cpu_limit_mhz is not None:
-        flags.append(CPU_LIMITED)
+        # A limit far above what the vCPUs can use caps nothing; flag it only at
+        # or under `cpu_limit_warn_percent` of full speed, or when that is unknown.
+        full_mhz = (vm.num_cpu or 0) * (vm.host_core_mhz or 0)
+        if not full_mhz or vm.cpu_limit_mhz <= full_mhz * thresholds.cpu_limit_warn_percent / 100:
+            flags.append(CPU_LIMITED)
     if vm.memory_limit_mb is not None and (vm.memory_mb is None or vm.memory_limit_mb < vm.memory_mb):
         flags.append(MEMORY_LIMITED)
     return flags

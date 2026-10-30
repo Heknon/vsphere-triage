@@ -21,18 +21,21 @@ these, in one pass, through the guest:
   (per-driver load list), **`SrtTrail.txt`** (Startup Repair's own diagnosis),
   and the update **Panther** log for "Working on updates" hangs.
 
-The script is read-only — only `Get-WinEvent`, `Get-Item`, `Get-Content`,
-`Test-Path`, never a change. The script-building and the parsing are pure and
-tested here; the guest read is `investigate_windows_boot`.
+The script changes nothing in Windows — only `Get-WinEvent`, `Get-Item`,
+`Get-Content`, `Test-Path` — but it runs through guest exec, so like
+`run_in_guest` it writes its output to a temp file in the guest and deletes it.
+The script-building and the parsing are pure and tested here; the guest read
+is `investigate_windows_boot`.
 """
 
 from __future__ import annotations
 
+from datetime import UTC, datetime, timedelta
 from typing import TYPE_CHECKING, Any
 
 from vsphere_triage import capabilities, vmlog
 from vsphere_triage.diagnose import locate
-from vsphere_triage.guestexec import encode_powershell
+from vsphere_triage.guestexec import encode_powershell, probe_failed
 
 if TYPE_CHECKING:
     from vsphere_triage.config import Settings
@@ -56,7 +59,11 @@ def boot_probe_powershell() -> str:
         f"{PER_KIND} |"
         " ForEach-Object { @{ time=$_.TimeCreated.ToUniversalTime().ToString('o');"
         " id=$_.Id; provider=$_.ProviderName;"
-        " message=($_.Message -replace '\\s+',' ').Substring(0,[Math]::Min(300,($_.Message).Length)) } } }"
+        # Collapse whitespace first, then cut the collapsed text by its own length:
+        # cutting it by the original length throws on any message with a double space
+        # or CRLF (WER 1001 has both), and the catch would drop the whole event kind.
+        " message=$($m=([string]$_.Message -replace '\\s+',' ');"
+        " $m.Substring(0,[Math]::Min(300,$m.Length))) } } }"
         " catch { @() } }"
         "$o=[ordered]@{};"
         "$o.last_boot=(Get-CimInstance Win32_OperatingSystem).LastBootUpTime.ToUniversalTime().ToString('o');"
@@ -75,7 +82,9 @@ def boot_probe_powershell() -> str:
         "$o.memory_dmp=(Test-Path 'C:\\Windows\\MEMORY.DMP');"
         "$o.ntbtlog=(Test-Path 'C:\\Windows\\ntbtlog.txt');"
         "$srt='C:\\Windows\\System32\\LogFiles\\Srt\\SrtTrail.txt';"
-        "$o.srttrail=(if (Test-Path $srt) { (Get-Content $srt -Tail 40 | Out-String) } else { $null });"
+        # $( ): `if` is a statement, so inside plain ( ) it is an error that
+        # SilentlyContinue hid, and SrtTrail was never reported.
+        "$o.srttrail=$(if (Test-Path $srt) { (Get-Content $srt -Tail 40 | Out-String) } else { $null });"
         "$pan='C:\\Windows\\Panther\\setupact.log';"
         "$o.panther_present=(Test-Path $pan);"
         "$o | ConvertTo-Json -Depth 5 -Compress"
@@ -97,13 +106,54 @@ def _decode_bugchecks(rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
     return decoded
 
 
-def summarize_windows_boot(parsed: dict[str, Any]) -> dict[str, Any]:
-    """Turn the raw probe JSON into a boot picture: what Windows says went wrong."""
-    bugchecks = _decode_bugchecks(parsed.get("bugchecks") or [])
-    service_timeouts = parsed.get("service_timeouts") or []
-    boot_perf = parsed.get("boot_performance") or []
-    dirty = parsed.get("dirty_shutdown") or []
-    kernel_power = parsed.get("kernel_power") or []
+# How far before the latest boot an event still counts as this incident's: the
+# boot that failed and the reboot after it. Older events are history, kept apart.
+RECENT_BEFORE_BOOT = timedelta(hours=24)
+
+
+def _when(text: Any) -> datetime | None:
+    try:
+        moment = datetime.fromisoformat(str(text))
+    except (TypeError, ValueError):
+        return None
+    return moment if moment.tzinfo else moment.replace(tzinfo=UTC)
+
+
+def _recent(
+    rows: list[dict[str, Any]], cutoff: datetime | None
+) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
+    """Rows at or after `cutoff` (or of unknown time), and the older ones."""
+    if cutoff is None:
+        return rows, []
+    recent, older = [], []
+    for row in rows:
+        moment = _when(row.get("time"))
+        (older if moment is not None and moment < cutoff else recent).append(row)
+    return recent, older
+
+
+def summarize_windows_boot(parsed: dict[str, Any], *, since: datetime | None = None) -> dict[str, Any]:
+    """Turn the raw probe JSON into a boot picture: what Windows says went wrong.
+
+    The event queries return the newest events of any age, so only those at or
+    after `since` (by default a day before the latest boot) make the picture;
+    older ones are reported as history, never as this incident's cause.
+    """
+    last_boot = _when(parsed.get("last_boot"))
+    cutoff = since or (last_boot - RECENT_BEFORE_BOOT if last_boot else None)
+    bugchecks_all = _decode_bugchecks(parsed.get("bugchecks") or [])
+    bugchecks, old_bugchecks = _recent(bugchecks_all, cutoff)
+    service_timeouts, old_timeouts = _recent(parsed.get("service_timeouts") or [], cutoff)
+    boot_perf, old_perf = _recent(parsed.get("boot_performance") or [], cutoff)
+    dirty, old_dirty = _recent(parsed.get("dirty_shutdown") or [], cutoff)
+    kernel_power, old_power = _recent(parsed.get("kernel_power") or [], cutoff)
+    older_events = {
+        "service_timeouts": old_timeouts,
+        "boot_performance": old_perf,
+        "dirty_shutdowns": old_dirty,
+        "kernel_power": old_power,
+    }
+    older_total = sum(len(rows) for rows in older_events.values())
     picture: list[str] = []
     latest_code = next((code for row in bugchecks for code in row["stop_codes"]), None)
     if latest_code:
@@ -119,7 +169,10 @@ def summarize_windows_boot(parsed: dict[str, Any]) -> dict[str, Any]:
             "not the kernel, may be what hung the boot"
         )
     if dirty or kernel_power:
-        picture.append("the system went down without a clean shutdown (Kernel-Power 41 / EventLog 6008)")
+        picture.append(
+            "the system went down without a clean shutdown (Kernel-Power 41 / EventLog 6008) — a "
+            "hard_reset, including one issued by this server, records exactly this too"
+        )
     slow = [row for row in boot_perf if row.get("id") in (101, 102, 103)]
     if slow:
         picture.append(f"{len(slow)} slow-boot component(s) named by Diagnostics-Performance (101/102/103)")
@@ -127,10 +180,32 @@ def summarize_windows_boot(parsed: dict[str, Any]) -> dict[str, Any]:
         picture.append("Startup Repair ran and left SrtTrail.txt — read it for its own diagnosis")
     if parsed.get("panther_present"):
         picture.append("a Windows Update Panther log is present — a 'Working on updates' hang is possible")
+    if older_total and cutoff:
+        # Not dropped: a VM that hung for more than a day before this boot has the
+        # hang's events here. Kept apart, named, for the reader to place in time.
+        picture.append(
+            f"{older_total} older boot event(s) from before {cutoff.astimezone(UTC):%Y-%m-%d %H:%M}Z "
+            "(service timeouts, unclean shutdowns, slow boots) — history unless the VM hung for over a "
+            "day before this boot; see older_events"
+        )
+    if old_bugchecks:
+        picture.append(
+            f"{len(old_bugchecks)} older bugcheck(s) from before "
+            f"{cutoff.astimezone(UTC):%Y-%m-%d %H:%M}Z — history, not this incident; see older_bugchecks"
+            if cutoff
+            else f"{len(old_bugchecks)} older bugcheck(s)"
+        )
     return {
         "last_boot": parsed.get("last_boot"),
-        "picture": picture or ["no boot faults found in the event log window read"],
+        "events_since": cutoff,
+        "picture": picture
+        or [
+            "no boot faults found in the event log since "
+            + (f"{cutoff.astimezone(UTC):%Y-%m-%d %H:%M}Z" if cutoff else "the newest events read")
+        ],
         "bugchecks": bugchecks,
+        "older_bugchecks": old_bugchecks,
+        "older_events": older_events,
         "service_timeouts": service_timeouts,
         "boot_performance": boot_perf,
         "dirty_shutdowns": dirty,
@@ -162,8 +237,14 @@ async def investigate_windows_boot(
     user = username or settings.guest_username
     secret = password or settings.guest_password
 
+    # Found first, in a read that may be retried; the guest command below never is.
+    pre_located = await pool.run(
+        name,
+        lambda session: locate(session, settings, env_id=env_id, vm_name=vm_name, moref=moref, strict=True),
+    )
+
     def work(session: VCenterSession) -> dict[str, Any]:  # noqa: PLR0911 - one guard per precondition
-        located = locate(session, settings, env_id=env_id, vm_name=vm_name, moref=moref)
+        located = pre_located
         if not located["found"]:
             return {"found": False, "reason": located["reason"]}
         vm = located["vm"]
@@ -172,8 +253,9 @@ async def investigate_windows_boot(
                 "found": True,
                 "investigated": False,
                 "reason": (
-                    "the VM is powered off, so its running event log cannot be read. Reboot it first — "
-                    "reboot_guest if Tools can act, else hard_reset — let it come up, then investigate"
+                    "the VM is powered off, so its running event log cannot be read. Power it on first "
+                    "(from your orchestrator or vCenter: there is no power-on tool here, and reboot_guest / "
+                    "hard_reset only act on a running VM), let it come up, then investigate"
                 ),
             }
         if vm.os_family != "windows":
@@ -216,6 +298,15 @@ async def investigate_windows_boot(
         )
         from vsphere_triage.emscheck import _extract_json  # noqa: PLC0415 - shared JSON extraction
 
+        failed = probe_failed(result)
+        if failed:
+            return {
+                "found": True,
+                "investigated": False,
+                "vm": vm.identity(),
+                "reason": failed + "; nothing about the guest's boot was read",
+                "evidence_gaps": capabilities.evidence_gaps(settings, vm),
+            }
         parsed = _extract_json(result.get("output", ""))
         if not parsed:
             return {
@@ -233,4 +324,11 @@ async def investigate_windows_boot(
             "evidence_gaps": capabilities.evidence_gaps(settings, vm),
         }
 
-    return await pool.run(name, work)
+    # A guest command inside: never repeated on a dropped session (a second process,
+    # a second temp file), and given the guest timeout on top of the reads.
+    return await pool.run(
+        name,
+        work,
+        retry=False,
+        timeout_seconds=settings.timeout_seconds + settings.guest_exec_timeout_seconds,
+    )

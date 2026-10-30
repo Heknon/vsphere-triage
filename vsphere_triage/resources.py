@@ -33,19 +33,22 @@ def _scan_resource_policy(session: VCenterSession, under: Sequence[str]) -> list
     return rows
 
 
+def _memory_capped(row: dict[str, Any]) -> bool:
+    """A memory limit that caps something: below the VM's RAM (or RAM unknown)."""
+    return row["memory_limit_mb"] is not None and (
+        row["memory_mb"] is None or row["memory_limit_mb"] < row["memory_mb"]
+    )
+
+
 def _findings_for(row: dict[str, Any]) -> list[str]:
     """Why this VM's resource policy is worth seeing."""
     reasons = []
     limit = row["cpu_limit_mhz"]
     if limit is not None:
         reasons.append(f"CPU limit {limit} MHz set — caps the VM below full speed (mimics starvation)")
-    if row["memory_limit_mb"] is not None and (
-        row["memory_mb"] is None or row["memory_limit_mb"] < row["memory_mb"]
-    ):
-        reasons.append(
-            f"memory limit {row['memory_limit_mb']} MB set below its {row['memory_mb']} MB RAM — "
-            "forces balloon/swap"
-        )
+    if _memory_capped(row):
+        below = f"below its {row['memory_mb']} MB RAM" if row["memory_mb"] is not None else "(RAM not read)"
+        reasons.append(f"memory limit {row['memory_limit_mb']} MB set {below} — forces balloon/swap")
     if row["cpu_reservation_mhz"] is not None:
         reasons.append(f"CPU reservation {row['cpu_reservation_mhz']} MHz locked")
     if row["memory_reservation_mb"] is not None:
@@ -57,15 +60,24 @@ def _by_template(rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
     """Roll the constrained VMs up by base disk (template), so a template-wide policy stands out."""
     templates: dict[str, dict[str, Any]] = {}
     for row in rows:
-        key = row.get("base_disk")
-        if not key:
+        base = row.get("base_disk")
+        if not base:
             continue
+        # The same path on two vCenters is two templates.
         entry = templates.setdefault(
-            key, {"base_disk": key, "clones": 0, "cpu_limited": 0, "memory_limited": 0, "names": []}
+            f"{row['vcenter']}:{base}",
+            {
+                "vcenter": row["vcenter"],
+                "base_disk": base,
+                "clones": 0,
+                "cpu_limited": 0,
+                "memory_limited": 0,
+                "names": [],
+            },
         )
         entry["clones"] += 1
         entry["cpu_limited"] += row["cpu_limit_mhz"] is not None
-        entry["memory_limited"] += row["memory_limit_mb"] is not None
+        entry["memory_limited"] += _memory_capped(row)
         entry["names"].append(row["name"])
     ranked = sorted(templates.values(), key=lambda entry: entry["clones"], reverse=True)
     for entry in ranked:
@@ -74,7 +86,8 @@ def _by_template(rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
 
 
 def _matches(row: dict[str, Any], kind: str) -> bool:
-    has_limit = row["cpu_limit_mhz"] is not None or row["memory_limit_mb"] is not None
+    # A memory limit at or above the VM's RAM caps nothing, so it is not a limit here.
+    has_limit = row["cpu_limit_mhz"] is not None or _memory_capped(row)
     has_reservation = row["cpu_reservation_mhz"] is not None or row["memory_reservation_mb"] is not None
     if kind == "limits":
         return has_limit
@@ -95,7 +108,7 @@ async def find_resource_limits(
 ) -> dict[str, Any]:
     """VMs with a CPU/memory limit or reservation set across the vCenters, templates marked."""
     results = await asyncio.gather(
-        *(pool.run(name, lambda session: _scan_resource_policy(session, under)) for name in names),
+        *(pool.sweep(name, lambda session: _scan_resource_policy(session, under)) for name in names),
         return_exceptions=True,
     )
     rows: list[dict[str, Any]] = []
@@ -111,11 +124,15 @@ async def find_resource_limits(
     considered = [row for row in rows if include_templates or not row["template"]]
     matched = [row for row in considered if _matches(row, kind)]
     reasons = {id(row): _findings_for(row) for row in matched}
-    # Biggest CPU limit first (the strongest throttle), then memory limit, then reservations.
+    # CPU-limited first, the tightest (smallest) limit leading as the strongest
+    # throttle; then memory limits below RAM, tightest first; then reservations.
     matched.sort(
         key=lambda row: (
             row["cpu_limit_mhz"] is None,
-            -(row["cpu_limit_mhz"] or 0),
+            row["cpu_limit_mhz"] or 0,
+            not _memory_capped(row),
+            row["memory_limit_mb"] or 0,
+            -(row["cpu_reservation_mhz"] or 0),
             -(row["memory_reservation_mb"] or 0),
         )
     )
@@ -135,7 +152,8 @@ async def find_resource_limits(
     if by_template and by_template[0]["clones"] > 1:
         worst = by_template[0]
         findings.append(
-            f"template-wide: {worst['clones']} clones of {worst['base_disk']} carry the same policy — "
+            f"template-wide: {worst['clones']} clones of {worst['vcenter']}:{worst['base_disk']} carry "
+            "the same policy — "
             "the template is the common factor, whatever the clones are named"
         )
     for name, error in errors.items():

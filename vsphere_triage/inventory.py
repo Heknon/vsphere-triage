@@ -28,6 +28,8 @@ if TYPE_CHECKING:
 VM_PATHS = (
     "name",
     "parent",
+    # A VM inside a vApp has no parent folder; the vApp is what groups it.
+    "parentVApp",
     "config.template",
     "config.instanceUuid",
     "config.createDate",
@@ -150,6 +152,7 @@ class VmFacts:
     name: str
     folder: str | None = None
     folder_moref: str | None = None
+    vapp_moref: str | None = None
     folder_path: str | None = None
     folder_parent: str | None = None
     datacenter: str | None = None
@@ -394,8 +397,29 @@ def base_disk_of(devices: Iterable[Any]) -> str | None:
     template folder (e.g. `[DS] Windows-Cool/Windows-Cool.vmdk`). None when the
     VM has no parented disk (a full clone or the template itself).
     """
-    bases = sorted({chain[-1] for chain in disk_chains(devices) if len(chain) > 1})
+    bases = linked_bases(disk_chains(devices))
     return bases[0] if bases else None
+
+
+def _datastore_folder(path: str) -> str:
+    """`[DS] folder/file.vmdk` -> `[DS] folder`: where a disk file lives."""
+    return path.rsplit("/", 1)[0] if "/" in path else path
+
+
+def linked_bases(chains: Iterable[list[str]]) -> list[str]:
+    """The linked-clone base disks of a VM's disk chains, sorted.
+
+    A chain's last link is a base only when it lives outside the VM's own folder
+    (the template's): a full clone with a snapshot also has a parented chain,
+    but every link of it is the VM's own.
+    """
+    return sorted(
+        {
+            chain[-1]
+            for chain in chains
+            if len(chain) > 1 and _datastore_folder(chain[-1]) != _datastore_folder(chain[0])
+        }
+    )
 
 
 def base_disks_for(session: VCenterSession, refs: Iterable[Any]) -> dict[str, str | None]:
@@ -495,7 +519,7 @@ def describe_devices(
         connectable = getattr(device, "connectable", None)
         entry: dict[str, Any] = {
             "label": label,
-            "kind": type(device).__name__.removeprefix("Virtual"),
+            "kind": device_kind(device),
             "category": category,
             "backing": _backing_summary(device),
         }
@@ -570,6 +594,21 @@ def _walk_snapshots(nodes: Any, depth: int = 0) -> list[dict[str, Any]]:
     return flat
 
 
+def _chain_before_snapshots(layoutex: Any) -> dict[int, int]:
+    """Per disk key, how long its chain was when the first snapshot was taken.
+
+    Each snapshot's layout records the disk chain it froze; the shortest of them
+    is the chain before any snapshot existed.
+    """
+    lengths: dict[int, int] = {}
+    for snap in getattr(layoutex, "snapshot", None) or []:
+        for disk in getattr(snap, "disk", None) or []:
+            length = len(getattr(disk, "chain", None) or [])
+            if length and (disk.key not in lengths or length < lengths[disk.key]):
+                lengths[disk.key] = length
+    return lengths
+
+
 def snapshot_usage(snapshot_info: Any, layoutex: Any, read_at: datetime) -> dict[str, Any] | None:
     """How many snapshots a VM has, how old, how deep the redo chain, and how much disk they use.
 
@@ -589,10 +628,16 @@ def snapshot_usage(snapshot_info: Any, layoutex: Any, read_at: datetime) -> dict
     max_chain_depth = 0
     if layoutex is not None:
         files = {f.key: f for f in (layoutex.file or [])}
+        before = _chain_before_snapshots(layoutex)
         for disk in layoutex.disk or []:
             chain = disk.chain or []
-            max_chain_depth = max(max_chain_depth, len(chain) - 1)
-            for unit in chain[1:]:  # chain[0] is the base disk; the rest are snapshot deltas
+            # The links the snapshots added: past the chain as it stood when the
+            # first snapshot was taken. For a linked clone that chain is already two
+            # deep (the template's disk, then the clone's own delta), and neither is
+            # a snapshot. Without the snapshot layout, only the base is skipped.
+            start = before.get(disk.key, 1)
+            max_chain_depth = max(max_chain_depth, len(chain) - start)
+            for unit in chain[start:]:
                 delta_bytes += sum(files[key].size for key in (unit.fileKey or []) if key in files)
         state_bytes = sum(f.size for f in (layoutex.file or []) if f.type in SNAPSHOT_STATE_TYPES)
     return {
@@ -654,6 +699,15 @@ def read_vm_snapshots(session: VCenterSession, folders: dict[str, FolderFacts]) 
     return result
 
 
+def device_kind(device: Any) -> str:
+    """A device's kind as a reader names it: `Vmxnet3`, `HdAudioCard`, `Cdrom`.
+
+    pyVmomi's class name is the full `vim.vm.device.VirtualVmxnet3`; only its
+    last part, without the `Virtual` prefix, is the kind.
+    """
+    return type(device).__name__.rsplit(".", 1)[-1].removeprefix("Virtual")
+
+
 def read_vm_devices(session: VCenterSession, folders: dict[str, FolderFacts]) -> list[dict[str, Any]]:
     """Every VM with the set of device categories and kinds it has — a lean device query.
 
@@ -668,7 +722,7 @@ def read_vm_devices(session: VCenterSession, folders: dict[str, FolderFacts]) ->
         devices = row.get("config.hardware.device") or []
         by_category: dict[str, list[str]] = {}
         for device in devices:
-            kind = type(device).__name__.removeprefix("Virtual")
+            kind = device_kind(device)
             by_category.setdefault(_device_category(device), []).append(kind)
         parent = row.get("parent")
         folder = folders.get(parent._moId) if parent is not None else None  # noqa: SLF001
@@ -679,6 +733,7 @@ def read_vm_devices(session: VCenterSession, folders: dict[str, FolderFacts]) ->
                 "name": row.get("name", row["moref"]),
                 "template": bool(row.get("config.template")),
                 "folder": folder.path if folder else None,
+                "folder_moref": folder.moref if folder else None,
                 "environment": folder.name if folder else None,
                 "categories": sorted(by_category),
                 "kinds": sorted({kind for kinds in by_category.values() for kind in kinds}),
@@ -785,7 +840,8 @@ def read_datastore_mounts(session: VCenterSession) -> list[dict[str, Any]]:
                 "uncommitted_bytes": row.get("summary.uncommitted"),
                 "accessible": row.get("summary.accessible"),
                 "backing_naas": datastore_backing_naas(row.get("info")),
-                "mounts": mounts,
+                # None, not [], when the host list was not read: unknown, not "no hosts".
+                "mounts": mounts if "host" in row else None,
             }
         )
     return result
@@ -872,7 +928,9 @@ def read_folders(session: VCenterSession) -> dict[str, FolderFacts]:
         datacenter_path = datacenter_path_of_folder.get(moref)
         parent_facts = build(parent_moref, depth + 1) if parent_moref in raw else None  # ty: ignore[invalid-argument-type]
         if datacenter is not None:
-            path = f"/{datacenter}/{row['name']}"
+            # The datacenter's full inventory path, so `Prod/DC1` and `Lab/DC1`
+            # give different folder paths; equal to its name when it is at the root.
+            path = f"/{datacenter_path or datacenter}/{row['name']}"
         elif parent_facts is not None:
             path = f"{parent_facts.path}/{row['name']}"
             datacenter = parent_facts.datacenter
@@ -898,7 +956,11 @@ def read_folders(session: VCenterSession) -> dict[str, FolderFacts]:
 
 def read_hosts(session: VCenterSession) -> dict[str, HostFacts]:
     """Every host, with its cluster's name."""
-    clusters = {row["moref"]: row["name"] for row in session.retrieve(vim.ComputeResource, CLUSTER_PATHS)}
+    # Clusters only: a standalone host's parent is a plain ComputeResource named
+    # after the host itself, which is not a cluster.
+    clusters = {
+        row["moref"]: row["name"] for row in session.retrieve(vim.ClusterComputeResource, CLUSTER_PATHS)
+    }
     hosts = {}
     for row in session.retrieve(vim.HostSystem, HOST_PATHS):
         parent = row.get("parent")
@@ -1013,6 +1075,9 @@ def vm_facts(  # noqa: C901, PLR0913, PLR0915 - one flattening of one row
 ) -> VmFacts:
     """Flatten one property-collector row into `VmFacts`, noting what disagrees."""
     facts = VmFacts(vcenter=vcenter, moref=row["moref"], name=row.get("name", row["moref"]), read_at=read_at)
+    vapp = row.get("parentVApp")
+    if vapp is not None:
+        facts.vapp_moref = vapp._moId  # noqa: SLF001
     parent = row.get("parent")
     if parent is not None and isinstance(parent, vim.Folder):
         folder = folders.get(parent._moId)  # noqa: SLF001
@@ -1101,7 +1166,7 @@ def vm_facts(  # noqa: C901, PLR0913, PLR0915 - one flattening of one row
         facts.devices, facts.device_findings, facts.device_blocks = describe_devices(
             devices, powered_on=facts.power_state == "poweredOn"
         )
-        bases = sorted({chain[-1] for chain in facts.disk_chain if len(chain) > 1})
+        bases = linked_bases(facts.disk_chain)
         if bases:
             facts.base_disk = bases[0]
             if len(bases) > 1:

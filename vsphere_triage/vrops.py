@@ -39,6 +39,11 @@ SUGGESTED_STAT_KEYS = {
 KINDS = tuple(SUGGESTED_STAT_KEYS)
 
 
+# Alerts are paged; read this many pages of this size at most.
+ALERT_PAGE_SIZE = 500
+ALERT_PAGES = 10
+
+
 class VropsError(RuntimeError):
     """A vROps request failed, worded for the reader."""
 
@@ -167,7 +172,17 @@ class Vrops:
 
     async def alerts(self, resource_id: str, since: datetime) -> list[dict[str, Any]]:
         """Alerts on a resource that started or updated since a time."""
-        data = await self.get("/alerts", {"resourceId": resource_id})
+        # Every page, up to a cap: the alerts since `since` need not be on the first.
+        found: list[dict[str, Any]] = []
+        for page in range(ALERT_PAGES):
+            data = await self.get(
+                "/alerts", {"resourceId": resource_id, "page": page, "pageSize": ALERT_PAGE_SIZE}
+            )
+            batch = data.get("alerts", [])
+            found.extend(batch)
+            total = (data.get("pageInfo") or {}).get("totalCount")
+            if len(batch) < ALERT_PAGE_SIZE or (isinstance(total, int) and len(found) >= total):
+                break
         cutoff = millis(since)
         return [
             {
@@ -178,7 +193,7 @@ class Vrops:
                 "started": from_millis(alert["startTimeUTC"]) if alert.get("startTimeUTC") else None,
                 "updated": from_millis(alert["updateTimeUTC"]) if alert.get("updateTimeUTC") else None,
             }
-            for alert in data.get("alerts", [])
+            for alert in found
             if max(alert.get("startTimeUTC") or 0, alert.get("updateTimeUTC") or 0) >= cutoff
         ]
 

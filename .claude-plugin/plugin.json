@@ -1,6 +1,6 @@
 {
   "name": "vsphere-triage",
-  "version": "0.1.1",
+  "version": "0.2.0",
   "description": "vSphere VM incident triage: read-only MCP server plus the vm-incident diagnosis skill",
   "author": { "name": "Heknon" },
   "license": "MIT",
@@ -76,7 +76,7 @@
     "guest_username": {
       "type": "string",
       "title": "Guest-OS username (optional)",
-      "description": "VSPHERE_GUEST_USERNAME: default credentials for run_in_guest (the one non-read-only tool); leave blank to require them per call",
+      "description": "VSPHERE_GUEST_USERNAME: default guest credentials for the tools that run a command in the guest (run_in_guest, check_ems, the boot investigations, read_crash_dump); leave blank to require them per call",
       "default": ""
     },
     "guest_password": {
@@ -96,7 +96,7 @@
   "mcpServers": {
     "vsphere-triage": {
       "command": "uvx",
-      "args": ["vsphere-triage"],
+      "args": ["vsphere-triage==0.2.0"],
       "env": {
         "UV_INDEX_URL": "${user_config.index_url}",
         "VSPHERE_VCENTERS": "${user_config.vcenters}",

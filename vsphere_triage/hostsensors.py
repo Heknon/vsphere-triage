@@ -37,14 +37,28 @@ def classify_sensors(sensors: list[dict[str, Any]]) -> dict[str, Any]:
     if yellow:
         names = ", ".join(sorted({str(sensor.get("name")) for sensor in yellow})[:10])
         findings.append(f"{len(yellow)} hardware sensor(s) warning (yellow): {names}")
+    green = [sensor for sensor in sensors if str(sensor.get("health", "")).lower() == "green"]
+    if sensors and not green and not red and not yellow:
+        findings.append(
+            f"none of the host's {len(sensors)} hardware sensor(s) reports a state (all unknown): its CIM "
+            "provider is likely off or broken — the hardware is not judged, not evidence it is fine"
+        )
     if not sensors:
         findings.append(
             "no hardware sensor data from this host (it reports none, or the host is a simulator)"
         )
     return {
-        "healthy": not red and not yellow,
+        # No sensors is no evidence: unknown, not healthy.
+        # Only green proves health: no sensors, or only unknown ones (a CIM provider
+        # that is off or broken on the host), is unknown, not healthy.
+        "healthy": False if (red or yellow) else (True if green else None),
+        "green_total": len(green),
         "sensors_total": len(sensors),
         "red": red[:20],
         "yellow": yellow[:20],
-        "findings": findings or ["all hardware sensors green"],
+        "findings": findings
+        or [
+            f"{len(green)} of {len(sensors)} hardware sensor(s) green, none red or yellow"
+            + (" (the rest report no state)" if len(green) < len(sensors) else "")
+        ],
     }

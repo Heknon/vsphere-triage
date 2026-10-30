@@ -41,13 +41,17 @@ def guest_temp_path(token: str, *, windows: bool) -> str:
 def guest_program_spec(command: str, out_path: str, *, windows: bool) -> tuple[str, str]:
     """The interpreter and arguments to run `command` and capture stdout+stderr to `out_path`.
 
+    The whole command is captured, not only its last part: on Linux the shell's
+    own output is redirected first (`exec >`), so `a; b`, `a || b` and `a && b`
+    all land in the file; on Windows the command is grouped in parentheses.
     The command is handed to the guest's shell as-is; a command containing the
-    shell's own quote character can break the wrapping, which is a known limit
-    of running an arbitrary string rather than an argv.
+    shell's own quote character (or, on Windows, an unbalanced parenthesis) can
+    break the wrapping, which is a known limit of running an arbitrary string
+    rather than an argv.
     """
     if windows:
-        return WINDOWS_SHELL, f'/c {command} > "{out_path}" 2>&1'
-    return LINUX_SHELL, f"-c \"{command} > '{out_path}' 2>&1\""
+        return WINDOWS_SHELL, f'/c ({command}) > "{out_path}" 2>&1'
+    return LINUX_SHELL, f"-c \"exec > '{out_path}' 2>&1; {command}\""
 
 
 def encode_powershell(script: str) -> str:
@@ -73,6 +77,20 @@ def encode_shell(script: str) -> str:
     """
     encoded = base64.b64encode(script.encode()).decode("ascii")
     return f"echo {encoded}|base64 -d|sh"
+
+
+def probe_failed(result: dict[str, Any]) -> str | None:
+    """Why a guest probe's result cannot be read as evidence, or None when it can.
+
+    A probe that timed out, or produced no output at all, says nothing about the
+    guest; reading its empty output as "nothing found" would turn a failed check
+    into a clean one.
+    """
+    if result.get("timed_out"):
+        return f"the guest probe did not finish within its timeout (exit code {result.get('exit_code')})"
+    if not str(result.get("output") or "").strip():
+        return f"the guest probe produced no output (exit code {result.get('exit_code')})"
+    return None
 
 
 def rewrite_transfer_url(url: str, host: str) -> str:
@@ -103,8 +121,9 @@ async def run_in_guest(  # noqa: PLR0913 - one guest command, its target and its
         )
         raise ValueError(msg)
 
-    def work(session: VCenterSession) -> dict[str, Any]:
-        located = locate(session, settings, env_id=env_id, vm_name=vm_name, moref=moref)
+    def check(session: VCenterSession) -> dict[str, Any]:
+        """Find the VM and whether it can take a command: reads only, so safe to retry."""
+        located = locate(session, settings, env_id=env_id, vm_name=vm_name, moref=moref, strict=True)
         if not located["found"]:
             return {"found": False, "reason": located["reason"]}
         vm = located["vm"]
@@ -124,6 +143,14 @@ async def run_in_guest(  # noqa: PLR0913 - one guest command, its target and its
                     "are how a guest with no Tools is seen"
                 ),
             }
+        return {"found": True, "vm": vm}
+
+    checked = await pool.run(name, check)
+    if "vm" not in checked:
+        return checked
+    vm = checked["vm"]
+
+    def execute(session: VCenterSession) -> dict[str, Any]:
         result = session.run_in_guest(
             vm.moref,
             windows=vm.os_family == "windows",
@@ -135,4 +162,11 @@ async def run_in_guest(  # noqa: PLR0913 - one guest command, its target and its
         )
         return {"found": True, "ran": True, "vm": vm.identity(), **result}
 
-    return await pool.run(name, work)
+    # Never repeated on a dropped session: the command may already have run. The
+    # deadline covers the command's own timeout on top of the transfer around it.
+    return await pool.run(
+        name,
+        execute,
+        retry=False,
+        timeout_seconds=settings.timeout_seconds + settings.guest_exec_timeout_seconds,
+    )

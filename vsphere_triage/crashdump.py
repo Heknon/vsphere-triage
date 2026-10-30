@@ -24,7 +24,7 @@ from typing import TYPE_CHECKING, Any
 from vsphere_triage import capabilities, vmlog
 from vsphere_triage.diagnose import locate
 from vsphere_triage.emscheck import _extract_json
-from vsphere_triage.guestexec import encode_powershell
+from vsphere_triage.guestexec import encode_powershell, probe_failed
 
 if TYPE_CHECKING:
     from vsphere_triage.config import Settings
@@ -40,23 +40,63 @@ def dump_probe_powershell() -> str:
     """
     return (
         "$md='C:\\Windows\\Minidump';"
-        "$f=Get-ChildItem $md -Filter *.dmp -ErrorAction SilentlyContinue|"
-        "Sort-Object LastWriteTime -Descending|Select-Object -First 1;"
+        # Missing folder, unreadable folder (non-admin) and no dump are three answers.
+        'if(-not (Test-Path $md)){\'{"found":false,"folder":false}\';exit};'
+        "try{$f=Get-ChildItem $md -Filter *.dmp -ErrorAction Stop|"
+        "Sort-Object LastWriteTime -Descending|Select-Object -First 1}"
+        'catch{\'{"found":false,"denied":true}\';exit};'
         "if(-not $f){'{\"found\":false}';exit};"
         "$buf=New-Object byte[] 96;"
-        "$fs=[System.IO.File]::OpenRead($f.FullName);[void]$fs.Read($buf,0,96);$fs.Close();"
+        # A dump that cannot be opened (locked, denied) is said so, never read as zeros.
+        "try{$fs=[System.IO.File]::OpenRead($f.FullName);[void]$fs.Read($buf,0,96);$fs.Close()}"
+        'catch{\'{"found":false,"unreadable":"\'+$f.Name+\'"}\';exit};'
         "$sig=[System.Text.Encoding]::ASCII.GetString($buf,0,8);"
         "$code=[BitConverter]::ToUInt32($buf,0x38);"
         "$p=@([BitConverter]::ToUInt64($buf,0x40),[BitConverter]::ToUInt64($buf,0x48),"
         "[BitConverter]::ToUInt64($buf,0x50),[BitConverter]::ToUInt64($buf,0x58));"
-        "@{found=$true;name=$f.Name;signature=$sig;code=$code;params=$p}|ConvertTo-Json -Compress"
+        "@{found=$true;name=$f.Name;time=$f.LastWriteTime.ToUniversalTime().ToString('o');"
+        "signature=$sig;code=$code;params=$p}|ConvertTo-Json -Compress"
     )
 
 
-def decode_dump(parsed: dict[str, Any]) -> dict[str, Any]:
+def decode_dump(parsed: dict[str, Any]) -> dict[str, Any]:  # noqa: PLR0911 - one answer per way the read can go
     """Decode the probe JSON: bugcheck code to its name and layer, parameters to hex. Pure."""
-    if not parsed or not parsed.get("found"):
+    if not parsed:
+        return {
+            "found": False,
+            "reason": "the guest probe returned nothing readable; not evidence of no dump",
+        }
+    if parsed.get("denied"):
+        return {
+            "found": False,
+            "reason": (
+                r"C:\Windows\Minidump could not be read (it needs an elevated account); "
+                "not evidence of no dump"
+            ),
+        }
+    if parsed.get("unreadable"):
+        return {
+            "found": False,
+            "reason": f"the newest minidump ({parsed['unreadable']}) could not be opened (locked or denied)",
+        }
+    if parsed.get("folder") is False:
+        return {
+            "found": False,
+            "reason": r"C:\Windows\Minidump does not exist: no small dump was ever written (check that "
+            r"crash dumps are configured, and C:\Windows\MEMORY.DMP)",
+        }
+    if not parsed.get("found"):
         return {"found": False, "reason": r"no minidump found in C:\Windows\Minidump"}
+    if parsed.get("signature") not in (None, "PAGEDU64"):
+        # The offsets read are DUMP_HEADER64's; a 32-bit (PAGEDUMP) header puts the
+        # bugcheck elsewhere, so decoding it would name a wrong stop code.
+        return {
+            "found": True,
+            "dump": parsed.get("name"),
+            "signature": parsed.get("signature"),
+            "bugcheck": None,
+            "note": "not a 64-bit kernel dump (PAGEDU64); its header is not decoded — open it in WinDbg",
+        }
     code = parsed.get("code")
     name, points_at = (None, None)
     if isinstance(code, int):
@@ -65,6 +105,8 @@ def decode_dump(parsed: dict[str, Any]) -> dict[str, Any]:
     return {
         "found": True,
         "dump": parsed.get("name"),
+        # When the dump was written: an old dump is an old crash, not this incident's.
+        "written": parsed.get("time"),
         "signature": parsed.get("signature"),
         "bugcheck": {
             "code": f"0x{code:08X}" if isinstance(code, int) else None,
@@ -94,8 +136,14 @@ async def read_crash_dump(
     user = username or settings.guest_username
     secret = password or settings.guest_password
 
+    # Found first, in a read that may be retried; the guest command below never is.
+    pre_located = await pool.run(
+        name,
+        lambda session: locate(session, settings, env_id=env_id, vm_name=vm_name, moref=moref, strict=True),
+    )
+
     def work(session: VCenterSession) -> dict[str, Any]:
-        located = locate(session, settings, env_id=env_id, vm_name=vm_name, moref=moref)
+        located = pre_located
         if not located["found"]:
             return {"found": False, "reason": located["reason"]}
         vm = located["vm"]
@@ -111,7 +159,8 @@ async def read_crash_dump(
                 "read": False,
                 "reason": (
                     "needs the VM powered on with VMware Tools running and guest credentials; reboot it "
-                    "first if it is down, and pass or configure VSPHERE_GUEST_USERNAME/PASSWORD"
+                    "first if it is hung (power it on from your orchestrator if it is off), and pass or "
+                    "configure VSPHERE_GUEST_USERNAME/PASSWORD"
                 ),
                 "evidence_gaps": capabilities.evidence_gaps(settings, vm),
             }
@@ -124,11 +173,24 @@ async def read_crash_dump(
             timeout_seconds=settings.guest_exec_timeout_seconds,
             max_output_bytes=settings.guest_exec_max_output_bytes,
         )
+        failed = probe_failed(result)
+        if failed:
+            return {"found": True, "read": False, "vm": vm.identity(), "reason": failed}
+        decoded = decode_dump(_extract_json(result.get("output", "")))
+        # `found` is the VM's; whether a dump was found is `dump_found`.
         return {
             "found": True,
             "read": True,
             "vm": vm.identity(),
-            **decode_dump(_extract_json(result.get("output", ""))),
+            "dump_found": decoded.pop("found"),
+            **decoded,
         }
 
-    return await pool.run(name, work)
+    # A guest command inside: never repeated on a dropped session (a second process,
+    # a second temp file), and given the guest timeout on top of the reads.
+    return await pool.run(
+        name,
+        work,
+        retry=False,
+        timeout_seconds=settings.timeout_seconds + settings.guest_exec_timeout_seconds,
+    )

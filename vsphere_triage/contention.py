@@ -111,6 +111,9 @@ def vm_cpu(
         ]
         result["vm_costop_percent_per_vcpu"] = summarize(percents)
     result["vm_cpu_mhz"] = summarize(_aggregate(own.get("cpu.usagemhz.average")))
+    # Whether the window had any samples at all: an old window can come back
+    # empty once vCenter has rolled it up, and empty must not read as healthy.
+    result["window_read"] = any(_aggregate(item) for per in series.values() for item in per.values())
     if host is not None:
         result["host"] = host_cpu_from_series(host, series.get(host.moref, {}), thresholds)
     findings = []
@@ -167,7 +170,8 @@ def host_cpu_from_series(
             "peak_percent_of_capacity": _percent(demand["max"], capacity),
             "mean_percent_of_capacity": _percent(demand["mean"], capacity),
             "peak_at": demand["peak_at"],
-            "overcommitted": bool(over),
+            # Without a capacity the peak cannot be judged: unknown, never "not over".
+            "overcommitted": None if not capacity else bool(over),
         }
     if usage is not None:
         peak_pct = _percent(usage["max"], capacity)
@@ -278,6 +282,7 @@ def storage(  # noqa: C901, PLR0912, PLR0915 - one report over many counters
         "host_devices": [],
     }
     findings: list[str] = []
+    capacity_findings: list[str] = []
     for store in datastores:
         instances = datastore_instances(store)
         entry: dict[str, Any] = {
@@ -307,13 +312,14 @@ def storage(  # noqa: C901, PLR0912, PLR0915 - one report over many counters
         entry["iops"] = summarize(_sum_by_time(iops))
         free, capacity = store.get("free_bytes"), store.get("capacity_bytes")
         if free is not None and capacity:
-            entry["free_percent"] = round(free / capacity * 100, 1)
-            if entry["free_percent"] <= thresholds.datastore_full_percent:
-                findings.append(
+            free_percent = free / capacity * 100
+            entry["free_percent"] = round(free_percent, 1)
+            if free_percent <= thresholds.datastore_full_percent:
+                capacity_findings.append(
                     f"datastore {store.get('name')} is nearly full ({entry['free_percent']}% free)"
                 )
         if store.get("accessible") is False:
-            findings.append(f"datastore {store.get('name')} is not accessible")
+            capacity_findings.append(f"datastore {store.get('name')} is not accessible")
         if not entry["matched_instance"]:
             entry["note"] = (
                 "no datastore counter on these hosts matched this datastore "
@@ -396,8 +402,12 @@ def storage(  # noqa: C901, PLR0912, PLR0915 - one report over many counters
         result["where"] = "host: queue latency high, device latency normal"
     elif queue_slow and device_slow:
         result["where"] = "both device and queue latency high"
+    # "Slow" is latency only. A full or unreachable datastore is a different
+    # cause, kept apart so it is not weighed as latency the counters never showed.
     result["slow"] = bool(findings)
-    result["findings"] = findings
+    result["window_read"] = any(entry.get("matched_instance") for entry in result["datastores"])
+    result["capacity_findings"] = capacity_findings
+    result["findings"] = findings + capacity_findings
     return result
 
 

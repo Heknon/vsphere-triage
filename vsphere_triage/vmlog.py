@@ -20,9 +20,12 @@ it; when it does not, that is said and nothing else changes.
 from __future__ import annotations
 
 import re
+import time
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from typing import Any
+
+import regex
 
 # ESXi 7 and later: `2026-10-29T20:13:05.123Z In(05) vmx - message`
 NEW_LINE = re.compile(
@@ -84,7 +87,10 @@ STAGES: tuple[tuple[str, str, re.Pattern[str]], ...] = (
         # guestinfo config dump that a reset also logs, which would otherwise mark
         # a boot that never reached Tools as having reached it.
         re.compile(
+            # Both spellings of the running-status line: "... to 1" and the
+            # ESXi form "Tools: Changing running status: 0 => 1.".
             r"(?i)(tools (are )?running|toolssetversion|tools: changing running status to .?(1|running)|"
+            r"changing running status:\s*\d+\s*=>\s*1\b|"
             r"guest operations agent|vmtoolsd)"
         ),
     ),
@@ -116,7 +122,8 @@ ANNOTATIONS: tuple[tuple[str, re.Pattern[str]], ...] = (
         "tools_state",
         re.compile(
             r"(?i)(tools.*(stopped (working|responding)|has stopped|not running, restarting|crashed)|"
-            r"changing running status to .?0\b|tools heartbeat timeout)"
+            r"changing running status to .?0\b|changing running status:\s*\d+\s*=>\s*0\b|"
+            r"tools heartbeat timeout)"
         ),
     ),
 )
@@ -164,6 +171,8 @@ EMS_MARK = re.compile(
 # occurrence is the current boot — used to keep a stop code from an earlier
 # crash in the same (appended) serial file out of this boot's reading.
 EMS_BOOT_BANNER = re.compile(r"(?i)computer is booting, sac started")
+# The first line a Linux kernel prints on a serial console, once per boot.
+LINUX_BOOT_BANNER = re.compile(r"(?m)^.*\bLinux version \d")
 LINUX_MARKS: tuple[tuple[str, str | None, re.Pattern[str]], ...] = (
     ("kernel_panic", None, re.compile(r"(?i)kernel panic")),
     (
@@ -256,13 +265,45 @@ def grep(
 
     Returns the lines kept and how many matched in all.
     """
-    expression = DEFAULT_GREP if pattern is None else re.compile(pattern, re.IGNORECASE)
-    matched = [
-        line
-        for line in lines
-        if expression.search(line.message) and (since is None or line.time is None or line.time >= since)
-    ]
+    if pattern is None:
+        matched = [
+            line
+            for line in lines
+            if DEFAULT_GREP.search(line.message)
+            and (since is None or line.time is None or line.time >= since)
+        ]
+        return matched[-limit:], len(matched)
+    expression = caller_pattern(pattern)
+    deadline = time.monotonic() + CALLER_PATTERN_SECONDS
+    matched = []
+    for line in lines:
+        if since is not None and line.time is not None and line.time < since:
+            continue
+        left = deadline - time.monotonic()
+        try:
+            if left <= 0:
+                raise TimeoutError  # noqa: TRY301 - the same answer as a match that ran out
+            hit = expression.search(line.message, concurrent=True, timeout=left)
+        except TimeoutError:
+            msg = (
+                f"the pattern {pattern!r} took over {CALLER_PATTERN_SECONDS:g}s to match the log "
+                "(nested repetition such as (a+)+ backtracks without end); use a simpler pattern"
+            )
+            raise ValueError(msg) from None
+        if hit:
+            matched.append(line)
     return matched[-limit:], len(matched)
+
+
+# A caller's pattern runs on the `regex` engine with a time budget, and releases
+# the GIL while it matches: a pathological pattern (catastrophic backtracking)
+# then costs one refused call, not a server frozen for every other request.
+CALLER_PATTERN_SECONDS = 2.0
+
+
+def caller_pattern(pattern: str) -> Any:  # regex.Pattern, which the regex stubs do not declare as a type
+    """A pattern given by a caller, compiled case-insensitively; `regex.error` if it is not valid."""
+    return regex.compile(pattern, regex.IGNORECASE | regex.VERSION0)
 
 
 def boot_timeline(lines: list[LogLine], *, max_examples: int = 3) -> dict[str, Any]:
@@ -347,11 +388,19 @@ def read_serial(text: str, *, tail_lines: int) -> dict[str, Any]:
     """What a serial console file says: EMS or kernel output, stop codes, errors."""
     lines = text.splitlines()
     ems = bool(EMS_MARK.search(text))
-    linux = []
+    # The same for a Linux console: its kernel banner starts each boot, so an
+    # earlier boot's panic is not this boot's.
+    linux_banners = [match.start() for match in LINUX_BOOT_BANNER.finditer(text)]
+    linux_current = (text[linux_banners[-1] :] if linux_banners else text).splitlines()
+    linux_earlier = (text[: linux_banners[-1]] if linux_banners else "").splitlines()
+    linux, earlier = [], []
     for name, hint, pattern in LINUX_MARKS:
-        hits = [line for line in lines if pattern.search(line)]
+        hits = [line for line in linux_current if pattern.search(line)]
         if hits:
             linux.append({"kind": name, "points_at": hint, "count": len(hits), "examples": hits[:3]})
+        before = [line for line in linux_earlier if pattern.search(line)]
+        if before:
+            earlier.append({"kind": name, "points_at": hint, "count": len(before), "examples": before[-3:]})
     # A serial file is appended across reboots, so a stop code earlier in it may
     # be from a previous boot. When EMS marked the boots, read stop codes only
     # from the current boot (after the last banner); otherwise read the whole
@@ -367,5 +416,9 @@ def read_serial(text: str, *, tail_lines: int) -> dict[str, Any]:
         "windows_stop_codes": codes,
         "stop_codes_scoped_to_current_boot": bool(banners),
         "linux_findings": linux,
+        "linux_findings_scoped_to_current_boot": bool(linux_banners),
+        # Kept apart, not dropped: a kdump/capture kernel prints a fresh banner after
+        # the very panic that matters.
+        "linux_findings_earlier_boots": earlier,
         "tail": lines[-tail_lines:],
     }

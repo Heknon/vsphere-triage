@@ -27,43 +27,92 @@ BUCKETS: tuple[tuple[str, str, re.Pattern[str]], ...] = (
     (
         "ha_vm_restart",
         "vSphere HA restarted a VM after its host failed — a host problem, not a per-VM one",
-        re.compile(r"(?i)(restarted by (vsphere )?ha|VmRestartedByHaEvent|das.*restart)"),
+        # vCenter 6.x-8 logs this as an EventEx, com.vmware.vc.ha.VmRestartedByHAEvent,
+        # whose message reads "vSphere HA restarted virtual machine ...".
+        re.compile(
+            r"(?i)(\brestarted by (vsphere )?HA\b|\bVmRestartedByHAEvent\b|\bvSphere HA restarted\b|"
+            r"\bVmRestartedOnAlternateHostEvent\b)"
+        ),
+    ),
+    (
+        "ha_vm_monitoring_reset",
+        "vSphere HA reset a VM whose guest heartbeat stopped (VM monitoring) — the guest hung",
+        re.compile(r"(?i)(\bVmDasBeingResetEvent\b|\breset by vSphere HA\b|\bvSphere HA reset\b)"),
+    ),
+    (
+        # Before host_isolation: "failed restart after isolation" is a failover failure.
+        # Anchored phrases only: a *completed* failover ("ClusterFailoverActionCompleted",
+        # "completed a failover action") holds both "failover" and "fail".
+        "vm_failover_failed",
+        "a VM could not be restarted or powered on (HA failover may have failed)",
+        re.compile(
+            r"(?i)(\bVmFailedToPowerOnEvent\b|\bFailedRestartAfterIsolation\w*|\bVmFailoverFailed\b|"
+            r"\bNotEnoughResourcesToStartVmEvent\b|\bnot enough resources to (failover|start)\b|"
+            r"\bfailover (was )?(failed|unsuccessful)\b|\bunsuccessfully failed over\b|"
+            r"\bvSphere HA (could not|cannot|failed to|was unable to) restart\b|\bunable to restart\b)"
+        ),
+    ),
+    (
+        # Admission control warning: HA has too little spare capacity to fail over, a
+        # risk for the next failure, not a VM that failed to restart.
+        "ha_capacity_warning",
+        "vSphere HA lacks the spare capacity to fail over (admission control) — a risk, not an outage",
+        re.compile(r"(?i)(\bInsufficientFailoverResources\w*|\binsufficient (failover )?resources\b)"),
+    ),
+    (
+        # Before host_isolation: a missing redundant management link is a config warning.
+        "host_no_redundant_management",
+        "a host has no redundant management network (a configuration warning, not an outage)",
+        re.compile(r"(?i)(NoRedundantManagement|\bno management network redundancy\b)"),
     ),
     (
         "host_isolation",
         "a host was isolated from the management network (HA may have acted)",
-        re.compile(r"(?i)(isolat|HostIsolated|no.*management network|HostNoRedundantManagement)"),
+        re.compile(
+            r"(?i)(\bHostIsolated\w*|\bDasHostIsolated\w*|\bHostIsolationIpPingFailed\w*|"
+            r"\bhost .* is isolated\b|\bnetwork isolation\b|\bisolated\b|\bisolation address\b)"
+        ),
+    ),
+    (
+        # Before host_failure: HostConnectionLostEvent's own message reads "Host X is
+        # not responding", which is vCenter losing the host, not the host failing.
+        "host_connection_lost",
+        "a host lost its connection to vCenter",
+        re.compile(
+            r"(?i)(\bHostConnectionLostEvent\b|\bHostDisconnectedEvent\b|\bconnection .*lost\b|"
+            r"\bis not responding\b|\bdisconnected from\b)"
+        ),
     ),
     (
         "host_failure",
-        "a host failed or stopped responding",
-        re.compile(r"(?i)(HostFailed|DasHostFailed|host .*not responding|NotResponding)"),
-    ),
-    (
-        "host_connection_lost",
-        "a host lost its connection to vCenter",
-        re.compile(r"(?i)(connection.*lost|HostConnectionLost|host .*disconnected)"),
-    ),
-    (
-        "vm_failover_failed",
-        "a VM could not be restarted or powered on (HA failover may have failed)",
-        re.compile(r"(?i)(FailedToPowerOn|failover.*fail|insufficient.*failover|not.*enough.*resources)"),
+        "a host failed (vSphere HA declared it failed)",
+        re.compile(
+            r"(?i)(\bDasHostFailedEvent\b|\bHostFailedEvent\b|\bvSphere HA detected .*host .*failed\b|"
+            r"\bpossible host failure\b|\bstate changed .* to Dead\b)"
+        ),
     ),
     (
         "host_maintenance",
         "a host entered maintenance mode (its VMs were migrated or powered off)",
-        re.compile(r"(?i)(entered maintenance|EnteredMaintenanceMode|EnteringMaintenance)"),
+        re.compile(r"(?i)(\bentered maintenance mode\b|\bEnteredMaintenanceModeEvent\b)"),
     ),
     (
         "drs_migration",
-        "DRS migrated a VM between hosts (load balancing or evacuation)",
-        re.compile(r"(?i)(migrat|vmotion|DrsVm|relocat)"),
+        "a VM was migrated between hosts (DRS load balancing, an evacuation, or by hand)",
+        # The completed migration only: one vMotion also logs a 'being migrated'
+        # event and a task, which would count each move two or three times.
+        re.compile(r"(?i)\b(DrsVmMigratedEvent|VmMigratedEvent)\b"),
     ),
 )
+# Alarm transitions quote the alarm's own name ("Host connection failure ... Green
+# to Red"); they are alarms, not cluster events, and are not bucketed here.
+_SKIPPED_TYPES = re.compile(r"(?i)\bAlarm\w*Event\b")
 
 
 def classify_event(type_name: str, message: str) -> tuple[str, str] | None:
     """The (bucket, meaning) a cluster event falls in, or None if it is not one we track."""
+    if _SKIPPED_TYPES.search(type_name):
+        return None
     text = f"{type_name} {message}"
     for name, meaning, pattern in BUCKETS:
         if pattern.search(text):
@@ -76,9 +125,13 @@ def summarize_cluster_events(
 ) -> dict[str, Any]:
     """Group cluster events by kind over the window, with the hosts and VMs each touched.
 
-    `rows` are plain dicts: {type, time, message, host, vm}. The findings call
-    out the shapes that explain a mass incident — an HA restart wave, a host
-    failure, a migration surge — with the count and the span.
+    `rows` are plain dicts: {type, time, message, host, vm, affected_host?}.
+    `host` is the event's own host: for an HA restart that is the host the VM
+    was restarted *onto*, a survivor. `affected_host` is the host an HA event is
+    about (DasHostFailedEvent.failedHost, DasHostIsolatedEvent.isolatedHost),
+    and wins where present. The findings call out the shapes that explain a mass
+    incident — an HA restart wave, a host failure, a migration surge — with the
+    count and the span.
     """
     begin = now - timedelta(minutes=window_minutes)
     buckets: dict[str, dict[str, Any]] = {}
@@ -95,20 +148,41 @@ def summarize_cluster_events(
         if isinstance(moment, datetime):
             entry["first"] = moment if entry["first"] is None else min(entry["first"], moment)
             entry["last"] = moment if entry["last"] is None else max(entry["last"], moment)
-        if row.get("host"):
-            entry["hosts"].add(row["host"])
+        where = row.get("affected_host") or row.get("host")
+        if where:
+            entry["hosts"].add(where)
         if row.get("vm"):
             entry["vms"].add(row["vm"])
     findings = []
     restart = buckets.get("ha_vm_restart")
     if restart and restart["count"]:
-        hosts = ", ".join(sorted(restart["hosts"])[:5]) or "unknown host(s)"
-        findings.append(
-            f"vSphere HA restarted {restart['count']} VM(s) between {_iso(restart['first'])} and "
-            f"{_iso(restart['last'])} — a host failure on {hosts}, not a per-VM problem; the restarted "
-            "VMs rebooting is expected, so judge them from that restart, not as independent hangs"
+        # The restart events' hosts are where the VMs came back up, not what failed;
+        # the failed or isolated host comes from those events, when they were read.
+        onto = ", ".join(sorted(restart["hosts"])[:5]) or "unknown host(s)"
+        lost = sorted(
+            {
+                host
+                for name in ("host_failure", "host_isolation")
+                for host in buckets.get(name, {}).get("hosts", ())
+            }
         )
-    for name in ("host_failure", "host_isolation", "host_connection_lost", "vm_failover_failed"):
+        cause = (
+            f"after a failure of {', '.join(lost[:5])}" if lost else "after a host failure (host not named)"
+        )
+        findings.append(
+            f"vSphere HA restarted {restart['count']} VM(s) onto {onto} between {_iso(restart['first'])} "
+            f"and {_iso(restart['last'])}, {cause} — not a per-VM problem; the restarted VMs rebooting is "
+            "expected, so judge them from that restart, not as independent hangs"
+        )
+    for name in (
+        "ha_vm_monitoring_reset",
+        "host_failure",
+        "host_isolation",
+        "host_connection_lost",
+        "vm_failover_failed",
+        "host_no_redundant_management",
+        "ha_capacity_warning",
+    ):
         entry = buckets.get(name)
         if entry and entry["count"]:
             hosts = ", ".join(sorted(entry["hosts"])[:5]) or "—"
@@ -116,7 +190,7 @@ def summarize_cluster_events(
     migration = buckets.get("drs_migration")
     if migration and migration["count"] >= 10:  # noqa: PLR2004 - a wave, not a stray balance move
         findings.append(
-            f"{migration['count']} DRS migrations in the window — a migration wave (an evacuation or "
+            f"{migration['count']} VM migrations in the window — a migration wave (an evacuation or "
             "heavy rebalancing) can slow the VMs involved while it runs"
         )
     return {

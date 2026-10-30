@@ -52,7 +52,9 @@ def bounded(result: dict[str, Any]) -> dict[str, Any]:
         if len(json.dumps(cut)) <= MAX_RESPONSE_CHARACTERS:
             cut["truncated"] = f"lists cut to {keep} items to fit the response budget"
             return cut
-    return {
-        "truncated": "the result was too large to return even cut down",
-        "findings": ready.get("findings") or ready.get("finding"),
-    }
+    # Even the findings are cut, so the last resort cannot itself break the budget.
+    findings = _cut(ready.get("findings") or ready.get("finding"), LIST_CUTS[-1])
+    fallback = {"truncated": "the result was too large to return even cut down", "findings": findings}
+    if len(json.dumps(fallback)) > MAX_RESPONSE_CHARACTERS:
+        fallback["findings"] = None
+    return fallback

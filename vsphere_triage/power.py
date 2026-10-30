@@ -32,6 +32,37 @@ if TYPE_CHECKING:
     from vsphere_triage.vcenter import VCenterPool, VCenterSession
 
 
+async def _located(
+    pool: VCenterPool,
+    settings: Settings,
+    name: str,
+    *,
+    moref: str | None,
+    env_id: str | None,
+    vm_name: str | None,
+) -> dict[str, Any]:
+    """Find the VM: reads only, so this step may be retried on a dropped session.
+
+    A moref alone is refused for a power operation: morefs repeat across vCenters
+    (vm-1001 on each), so a moref paired with the wrong vCenter would reset some
+    other VM. The VM's name must come with it, and must match.
+    """
+    if moref and not vm_name:
+        return {
+            "found": False,
+            "reason": "a power operation needs the VM's name with its moref (morefs repeat across "
+            "vCenters); pass vm_name too, so the right VM is checked before anything is sent",
+        }
+
+    def find(session: VCenterSession) -> dict[str, Any]:
+        located = locate(session, settings, env_id=env_id, vm_name=vm_name, moref=moref, strict=True)
+        if not located["found"]:
+            return {"found": False, "reason": located["reason"]}
+        return {"found": True, "vm": located["vm"]}
+
+    return await pool.run(name, find)
+
+
 async def reboot_guest(
     pool: VCenterPool,
     settings: Settings,
@@ -42,27 +73,28 @@ async def reboot_guest(
     vm_name: str | None,
 ) -> dict[str, Any]:
     """Ask the guest OS to reboot gracefully through VMware Tools."""
+    located = await _located(pool, settings, name, moref=moref, env_id=env_id, vm_name=vm_name)
+    if not located["found"]:
+        return located
+    vm = located["vm"]
+    if not vm.powered_on:
+        return {"found": True, "rebooted": False, "reason": "the VM is not powered on"}
+    if not vm.tools_up:
+        return {
+            "found": True,
+            "rebooted": False,
+            "reason": (
+                "VMware Tools is not running in this guest, so a graceful reboot is impossible; "
+                f"Tools status is {vm.tools_running!r}. Use hard_reset to power-cycle a hung VM"
+            ),
+        }
 
-    def work(session: VCenterSession) -> dict[str, Any]:
-        located = locate(session, settings, env_id=env_id, vm_name=vm_name, moref=moref)
-        if not located["found"]:
-            return {"found": False, "reason": located["reason"]}
-        vm = located["vm"]
-        if not vm.powered_on:
-            return {"found": True, "rebooted": False, "reason": "the VM is not powered on"}
-        if not vm.tools_up:
-            return {
-                "found": True,
-                "rebooted": False,
-                "reason": (
-                    "VMware Tools is not running in this guest, so a graceful reboot is impossible; "
-                    f"Tools status is {vm.tools_running!r}. Use hard_reset to power-cycle a hung VM"
-                ),
-            }
-        result = session.reboot_guest(vm.moref)
-        return {"found": True, "rebooted": True, "vm": vm.identity(), **result}
+    def act(session: VCenterSession) -> dict[str, Any]:
+        return {"found": True, "rebooted": True, "vm": vm.identity(), **session.reboot_guest(vm.moref)}
 
-    return await pool.run(name, work)
+    # Sent once: on a dropped session the reboot may already be under way, so it
+    # is never re-sent automatically (two reboots, or a reboot of the fresh boot).
+    return await pool.run(name, act, retry=False)
 
 
 async def hard_reset(
@@ -75,19 +107,20 @@ async def hard_reset(
     vm_name: str | None,
 ) -> dict[str, Any]:
     """Power-cycle the VM immediately, without asking the guest. Destructive."""
+    located = await _located(pool, settings, name, moref=moref, env_id=env_id, vm_name=vm_name)
+    if not located["found"]:
+        return located
+    vm = located["vm"]
+    if not vm.powered_on:
+        return {
+            "found": True,
+            "reset": False,
+            "reason": "the VM is not powered on; there is nothing to reset (power it on instead)",
+        }
 
-    def work(session: VCenterSession) -> dict[str, Any]:
-        located = locate(session, settings, env_id=env_id, vm_name=vm_name, moref=moref)
-        if not located["found"]:
-            return {"found": False, "reason": located["reason"]}
-        vm = located["vm"]
-        if not vm.powered_on:
-            return {
-                "found": True,
-                "reset": False,
-                "reason": "the VM is not powered on; there is nothing to reset (power it on instead)",
-            }
-        result = session.hard_reset(vm.moref)
-        return {"found": True, "reset": True, "vm": vm.identity(), **result}
+    def act(session: VCenterSession) -> dict[str, Any]:
+        return {"found": True, "reset": True, "vm": vm.identity(), **session.hard_reset(vm.moref)}
 
-    return await pool.run(name, work)
+    # Sent once: a second ResetVM_Task after a dropped session would reset the VM
+    # again in the middle of the boot the first one started.
+    return await pool.run(name, act, retry=False)

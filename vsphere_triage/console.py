@@ -19,6 +19,10 @@ from PIL import Image, ImageChops, ImageStat
 from vsphere_triage.vmlog import stop_codes
 
 NEAR_BLACK = 16
+# Grey level from which a pixel counts as light (text), and the share of such
+# pixels on a black screen that means characters are shown.
+BRIGHT = 160
+TEXT_ON_BLACK_FRACTION = 0.0005
 # The screen states a boot can show, by the words on them. Lower-case phrases.
 SCREEN_STATES: tuple[tuple[str, str, tuple[str, ...]], ...] = (
     (
@@ -117,6 +121,9 @@ def analyse(data: bytes) -> dict[str, Any]:
     histogram = gray.histogram()
     pixels = rgb.width * rgb.height or 1
     near_black = sum(histogram[:NEAR_BLACK]) / pixels
+    # Light pixels on a dark screen are text: a text console or a login prompt is
+    # over 98% black too, but unlike a dead screen it has characters on it.
+    bright = sum(histogram[BRIGHT:]) / pixels
     small = rgb.resize((min(rgb.width, 200), min(rgb.height, 150)))
     classic = modern = 0
     raw = small.tobytes()
@@ -131,6 +138,7 @@ def analyse(data: bytes) -> dict[str, Any]:
         "width": rgb.width,
         "height": rgb.height,
         "near_black_fraction": round(near_black, 4),
+        "bright_fraction": round(bright, 5),
         "mean_brightness": round(ImageStat.Stat(gray).mean[0], 1),
         "blue_screen_colour_fraction": round(max(classic, modern) / count, 3),
     }
@@ -152,8 +160,11 @@ def ocr(data: bytes) -> tuple[str | None, str]:
         return None, "pytesseract is not installed"
     if shutil.which("tesseract") is None:
         return None, "the tesseract binary is not on PATH"
-    with Image.open(io.BytesIO(data)) as image:
-        return pytesseract.image_to_string(image.convert("L")), "tesseract"
+    try:
+        with Image.open(io.BytesIO(data)) as image:
+            return pytesseract.image_to_string(image.convert("L")), "tesseract"
+    except Exception as error:  # noqa: BLE001 - a failed OCR loses the text, not the whole console read
+        return None, f"OCR failed ({type(error).__name__}: {error})"
 
 
 def screen_state(text: str) -> list[dict[str, str]]:
@@ -185,8 +196,14 @@ def read_captures(
             else "the screen changed between captures: the guest is doing something"
         )
     black = last["near_black_fraction"] >= black_fraction
+    text_on_black = black and last.get("bright_fraction", 0) >= TEXT_ON_BLACK_FRACTION
     result["black"] = black
-    if black:
+    result["text_on_black"] = text_on_black
+    if text_on_black:
+        findings.append(
+            "the screen is dark with text on it: a text console or login prompt, not a blank display"
+        )
+    elif black:
         findings.append(
             "the screen is black: early boot before the display is set up, a hang, "
             "or a blanked display; the CPU and disk counters tell these apart"

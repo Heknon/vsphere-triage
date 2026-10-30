@@ -155,8 +155,9 @@ host or a saturated datastore, the VM will wedge again on the way back up.
 
 **Windows: build the boot picture.** `vmware.log` shows a boot from the outside,
 never the Windows kernel's own words. Those live in the event log, reachable
-only once the guest is up enough for VMware Tools. So: if the VM is off or hung,
-reboot it (`reboot_guest`, else `hard_reset`) and let it come up; then
+only once the guest is up enough for VMware Tools. So: if the VM is hung,
+reboot it (`reboot_guest`, else `hard_reset`); if it is powered off, power it on
+from the orchestrator or vCenter (this server has no power-on tool); let it come up; then
 **`investigate_windows_boot`** reads, in one pass, the records Windows keeps of
 why a boot failed — the last bugcheck its *next* boot recorded (so a BSOD in a
 reboot loop is still named), unclean shutdowns, **service/driver start timeouts
@@ -260,8 +261,12 @@ been given to me — here is what, and here is how.*
    correlation across layers is only as good as the alignment; when two clocks
    disagree by more than the window, say so.
 
-9. **Never act.** No reset, no answering a VM question, no power change. When
-   the evidence calls for one, the verdict names it and hands it to a person.
+9. **Act only as a diagnostic step, and only with the tools made for it.**
+   Never answer a VM question, never power a VM on or off, and never use a
+   reset to *fix* anything. `reboot_guest` / `hard_reset` are allowed for one
+   purpose only, described above: to make a wedged VM produce a fresh boot
+   record when the read-only evidence leaves a real gap. Any other change the
+   evidence calls for, the verdict names and hands to a person.
 
 ## What you say when you finish
 

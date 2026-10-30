@@ -18,6 +18,7 @@ HTTP is in the client.
 
 from __future__ import annotations
 
+import asyncio
 import contextlib
 import re
 from typing import TYPE_CHECKING, Any
@@ -25,6 +26,7 @@ from typing import TYPE_CHECKING, Any
 import httpx
 
 from vsphere_triage.readonly import ensure_read_request
+from vsphere_triage.vcenter import ssl_context
 
 if TYPE_CHECKING:
     from vsphere_triage.config import Settings
@@ -101,13 +103,24 @@ def traffic_of(stats: dict[str, Any]) -> dict[str, float]:
     }
 
 
+# A PD is "hot" when it carries more than half of all backend IOPS *and* at least
+# 1.5 times its even share: with two PDs a 51/49 split is noise, not a hotspot.
+HOT_SHARE = 0.5
+HOT_OVER_EVEN = 1.5
+
+
+def hot_share(share: float, domains: int) -> bool:
+    """Whether a PD's share of backend IOPS makes it the hot one among `domains`."""
+    return domains > 1 and share > HOT_SHARE and share >= HOT_OVER_EVEN / domains
+
+
 def rank_protection_domains(rows: list[dict[str, Any]]) -> dict[str, Any]:
     """Protection domains sorted by traffic, flagging one that carries a hot share.
 
     `rows`: {name, id, state, traffic} where traffic is from `traffic_of`. A PD
-    carrying more than half of the backend's IOPS is called out — the hotspot
-    whose datastores and volumes feel load first, the pattern behind "this PD
-    gets more traffic than the others".
+    carrying more than half of the backend's IOPS, and well over its even share,
+    is called out — the hotspot whose datastores and volumes feel load first, the
+    pattern behind "this PD gets more traffic than the others".
     """
     ranked = sorted(rows, key=lambda row: row["traffic"]["total_iops"], reverse=True)
     total = round(sum(row["traffic"]["total_iops"] for row in ranked), 2)
@@ -115,7 +128,7 @@ def rank_protection_domains(rows: list[dict[str, Any]]) -> dict[str, Any]:
     if ranked and total > 0 and len(ranked) > 1:
         top = ranked[0]
         share = top["traffic"]["total_iops"] / total
-        if share > 0.5:  # noqa: PLR2004 - more than half of all backend IOPS on one PD is "hot"
+        if hot_share(share, len(ranked)):
             findings.append(
                 f"{top['name']} carries {share:.0%} of backend IOPS ({top['traffic']['total_iops']} IOPS) — "
                 "a hot protection domain; the datastores and volumes on it feel load first. Map a slow "
@@ -128,12 +141,35 @@ def rank_protection_domains(rows: list[dict[str, Any]]) -> dict[str, Any]:
     }
 
 
-_PD_DEGRADED_KEYS = (
+# Statistics that mean a rebuild, a rebalance or lost redundancy. The PowerFlex 3.x
+# names (pending*/activeMovingIn*), plus the older spellings some versions report.
+_REBUILD_KEYS = (
+    "pendingFwdRebuildCapacityInKb",
+    "pendingBckRebuildCapacityInKb",
+    "pendingNormRebuildCapacityInKb",
+    "activeFwdRebuildCapacityInKb",
+    "activeBckRebuildCapacityInKb",
+    "activeNormRebuildCapacityInKb",
+    "activeMovingInFwdRebuildJobs",
+    "activeMovingInBckRebuildJobs",
+    "activeMovingInNormRebuildJobs",
+    "pendingMovingInFwdRebuildJobs",
+    "pendingMovingInBckRebuildJobs",
+    "pendingMovingInNormRebuildJobs",
     "rebuildPendingCapacityInKb",
-    "rebalancePendingCapacityInKb",
     "degradedHealthyCapacityInKb",
     "degradedFailedCapacityInKb",
 )
+_REBALANCE_KEYS = (
+    "pendingRebalanceCapacityInKb",
+    "activeRebalanceCapacityInKb",
+    "activeMovingInRebalanceJobs",
+    "pendingMovingInRebalanceJobs",
+    "rebalancePendingCapacityInKb",
+)
+# Data with no copy left: unavailable, the worst state a pool can be in.
+_FAILED_KEYS = ("failedCapacityInKb",)
+_PD_DEGRADED_KEYS = (*_REBUILD_KEYS, *_REBALANCE_KEYS, *_FAILED_KEYS)
 
 
 def map_backend_impact(
@@ -160,7 +196,7 @@ def map_backend_impact(
     top = ranked["ranked"][0] if ranked["ranked"] else None
     hot_id = (
         top["id"]
-        if top and total > 0 and len(ranked["ranked"]) > 1 and top["traffic"]["total_iops"] / total > 0.5  # noqa: PLR2004
+        if top and total > 0 and hot_share(top["traffic"]["total_iops"] / total, len(ranked["ranked"]))
         else None
     )
     troubled: dict[str, list[str]] = {}
@@ -172,7 +208,7 @@ def map_backend_impact(
         if any(_positive((pd_stats.get(pd_id) or {}).get(key)) for key in _PD_DEGRADED_KEYS):
             reasons.append("rebuild/rebalance or degraded capacity")
         if pd_id == hot_id:
-            reasons.append("hot: more than half of backend IOPS")
+            reasons.append("hot: more than half of backend IOPS, well over its even share")
         if reasons:
             troubled[pd_id] = reasons
     pool_pd = {pool.get("id"): pool.get("protectionDomainId") for pool in pools}
@@ -189,6 +225,11 @@ def map_backend_impact(
     }
 
 
+def datastore_key(vcenter: str, moref: str) -> str:
+    """A datastore across the fleet: `datastore-12` on two vCenters is two datastores."""
+    return f"{vcenter}:{moref}"
+
+
 def affected_vms(
     volume_to_pd: dict[str, str],
     datastores: list[dict[str, Any]],
@@ -199,7 +240,8 @@ def affected_vms(
     """Join troubled-volume ids to datastores to the VMs on them, split by suffering.
 
     `datastores`: {vcenter, moref, name, powerflex_volume_ids}. `vms_by_datastore`:
-    moref -> [{name, moref, vcenter, state, suffering}]. Pure.
+    `datastore_key(vcenter, moref)` -> [{name, moref, vcenter, state, suffering}],
+    keyed by vCenter too because morefs repeat across vCenters. Pure.
     """
     affected = []
     total_suffering = 0
@@ -207,7 +249,7 @@ def affected_vms(
         hit = next((vid for vid in datastore.get("powerflex_volume_ids", []) if vid in volume_to_pd), None)
         if hit is None:
             continue
-        vms = vms_by_datastore.get(datastore["moref"], [])
+        vms = vms_by_datastore.get(datastore_key(datastore["vcenter"], datastore["moref"]), [])
         suffering = [vm for vm in vms if vm.get("suffering")]
         total_suffering += len(suffering)
         affected.append(
@@ -223,11 +265,18 @@ def affected_vms(
             }
         )
     affected.sort(key=lambda item: item["suffering_total"], reverse=True)
-    if affected:
+    if affected and total_suffering:
         findings = [
             (
                 f"{total_suffering} VM(s) suffering on {len(affected)} datastore(s) backed by a troubled "
                 "protection domain — the backend trouble is reaching the VMs"
+            )
+        ]
+    elif affected:
+        findings = [
+            (
+                f"{len(affected)} datastore(s) are backed by a troubled protection domain, but none of their "
+                "VMs is abnormal right now"
             )
         ]
     else:
@@ -259,17 +308,16 @@ def summarize_health(
         if str(device.get("deviceState", "Normal")).lower() not in ("normal", "")
         or str(device.get("errorState", "None")).lower() not in ("none", "")
     ]
-    pending_keys = (
-        "rebuildPendingCapacityInKb",
-        "rebalancePendingCapacityInKb",
-        "degradedHealthyCapacityInKb",
-        "pendingMovingInBckRebuildJobs",
-        "pendingMovingInRebalanceJobs",
-    )
-    pending = {key: system_stats.get(key) for key in pending_keys if _positive(system_stats.get(key))}
-    rebuild_active = any("rebuild" in key.lower() or "degraded" in key.lower() for key in pending)
-    rebalance_active = any("rebalance" in key.lower() for key in pending)
+    pending = {key: system_stats.get(key) for key in _PD_DEGRADED_KEYS if _positive(system_stats.get(key))}
+    rebuild_active = any(key in _REBUILD_KEYS for key in pending)
+    rebalance_active = any(key in _REBALANCE_KEYS for key in pending)
+    data_unavailable = any(key in _FAILED_KEYS for key in pending)
     findings = []
+    if data_unavailable:
+        findings.append(
+            "capacity has failed with no copy left (failedCapacityInKb) — data on it is unavailable, "
+            "so VMs on those volumes are blocked on I/O"
+        )
     if sds_down:
         findings.append(f"{len(sds_down)} SDS node(s) not healthy — the backend is degraded")
     if devices_bad:
@@ -281,9 +329,25 @@ def summarize_health(
         )
     if rebalance_active:
         findings.append("a rebalance is in progress — can add backend load while it runs")
-    healthy = not (sds_down or devices_bad or rebuild_active)
+    # Nothing read is not healthy: no SDS, no devices and no statistics (a schema
+    # or permission mismatch) leave the verdict unknown, never "healthy".
+    unread = [
+        label
+        for label, value in (("SDS list", sds), ("devices", devices), ("system statistics", system_stats))
+        if not value
+    ]
+    trouble = bool(sds_down or devices_bad or rebuild_active or data_unavailable)
+    healthy: bool | None = False if trouble else (None if unread else True)
+    if not trouble and unread:
+        findings.append(
+            "could not judge the backend: "
+            + ", ".join(unread)
+            + " came back empty — not evidence it is healthy"
+        )
     return {
         "healthy": healthy,
+        "not_read": unread,
+        "data_unavailable": data_unavailable,
         "sds_total": len(sds),
         "sds_down": [node.get("name") or node.get("id") for node in sds_down],
         "devices_bad_total": len(devices_bad),
@@ -292,6 +356,26 @@ def summarize_health(
         "pending_capacity": pending,
         "findings": findings or ["PowerFlex backend healthy: SDS up, no device errors, no rebuild/rebalance"],
     }
+
+
+def merge_statistics(per_system: list[dict[str, Any]]) -> dict[str, Any]:
+    """Several systems' statistics as one, keeping the worst (largest) value of each key.
+
+    A plain dict update would let the last system's numbers win, so a rebuilding
+    system beside a healthy one would read as healthy.
+    """
+    merged: dict[str, Any] = {}
+    for stats in per_system:
+        for key, value in stats.items():
+            if key not in merged:
+                merged[key] = value
+            elif isinstance(value, (int, float)) and not isinstance(value, bool):
+                current = merged[key]
+                if isinstance(current, (int, float)) and not isinstance(current, bool):
+                    merged[key] = max(current, value)
+            elif isinstance(value, dict) and isinstance(merged[key], dict):
+                merged[key] = merge_statistics([merged[key], value])
+    return merged
 
 
 def _positive(value: Any) -> bool:
@@ -312,35 +396,59 @@ class PowerFlex:
         """Hold the settings; log in on the first request."""
         self.settings = settings
         self._token: str | None = None
+        self._login_lock = asyncio.Lock()
         self._client = httpx.AsyncClient(
             base_url=settings.powerflex_url or "",
             timeout=settings.timeout_seconds,
             transport=transport,
-            verify=settings.tls_verify,
+            # The same trust as vCenter: VSPHERE_CA_BUNDLE for an internal CA, so a
+            # privately signed Gateway does not force verification off everywhere.
+            verify=ssl_context(settings),
         )
 
-    async def _login(self) -> str:
-        if self._token is None:
-            ensure_read_request("GET")
-            auth = httpx.BasicAuth(
-                self.settings.powerflex_username or "", self.settings.powerflex_password or ""
-            )
-            response = await self._client.get(f"{API}/login", auth=auth)
-            if response.status_code != httpx.codes.OK:
-                msg = f"PowerFlex login failed: HTTP {response.status_code}"
-                raise PowerFlexError(msg)
-            self._token = response.text.strip().strip('"')
-        return self._token
+    async def _login(self, stale: str | None = None) -> str:
+        """The Gateway token, logging in when there is none or `stale` was refused.
+
+        Under a lock, so concurrent first calls log in once, and a refused token
+        is replaced once rather than by every caller that saw it refused.
+        """
+        async with self._login_lock:
+            if self._token is None or self._token == stale:
+                auth = httpx.BasicAuth(
+                    self.settings.powerflex_username or "", self.settings.powerflex_password or ""
+                )
+                response = await self._send("/login", auth)
+                if response.status_code != httpx.codes.OK:
+                    hint = (
+                        " (PowerFlex 4.x uses /rest/auth/login, not supported by this GET-only client)"
+                        if response.status_code in (httpx.codes.NOT_FOUND, httpx.codes.METHOD_NOT_ALLOWED)
+                        else ""
+                    )
+                    msg = f"PowerFlex login failed: HTTP {response.status_code}{hint}"
+                    raise PowerFlexError(msg)
+                self._token = response.text.strip().strip('"')
+            return self._token
+
+    async def _send(self, path: str, auth: httpx.Auth) -> httpx.Response:
+        """Every request this client makes: a GET, checked by the read-only guard."""
+        request = self._client.build_request("GET", f"{API}{path}")
+        ensure_read_request(request.method)
+        return await self._client.send(request, auth=auth)
 
     async def _get(self, path: str) -> Any:
-        token = await self._login()
-        ensure_read_request("GET")
-        auth = httpx.BasicAuth(self.settings.powerflex_username or "", token)
-        response = await self._client.get(f"{API}{path}", auth=auth)
-        if response.status_code != httpx.codes.OK:
-            msg = f"PowerFlex GET {path} failed: HTTP {response.status_code}"
-            raise PowerFlexError(msg)
-        return response.json()
+        for attempt in range(2):
+            token = await self._login()
+            response = await self._send(path, httpx.BasicAuth(self.settings.powerflex_username or "", token))
+            if response.status_code == httpx.codes.UNAUTHORIZED and attempt == 0:
+                # The token expired (idle or past its lifetime): log in again, once.
+                await self._login(stale=token)
+                continue
+            if response.status_code != httpx.codes.OK:
+                msg = f"PowerFlex GET {path} failed: HTTP {response.status_code}"
+                raise PowerFlexError(msg)
+            return response.json()
+        msg = "PowerFlex refused a fresh token too"
+        raise PowerFlexError(msg)
 
     async def systems(self) -> list[dict[str, Any]]:
         """Every PowerFlex system (MDM cluster) the Gateway fronts."""
@@ -378,7 +486,8 @@ class PowerFlex:
         """Release the token and close the client."""
         if self._token is not None:
             with contextlib.suppress(Exception):
-                auth = httpx.BasicAuth(self.settings.powerflex_username or "", self._token)
-                await self._client.get(f"{API}/logout", auth=auth)
+                await self._send(
+                    "/logout", httpx.BasicAuth(self.settings.powerflex_username or "", self._token)
+                )
             self._token = None
         await self._client.aclose()

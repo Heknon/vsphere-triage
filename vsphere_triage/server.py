@@ -21,9 +21,12 @@ import time
 from contextlib import asynccontextmanager
 from datetime import UTC, datetime, timedelta
 from functools import wraps
+from importlib.metadata import PackageNotFoundError
+from importlib.metadata import version as package_version
 from typing import TYPE_CHECKING, Any
 
 import httpx
+import regex
 from mcp.server import MCPServer
 from mcp.server.mcpserver.exceptions import ToolError
 from mcp.types import ToolAnnotations
@@ -52,8 +55,19 @@ from vsphere_triage import (
     winboot,
 )
 from vsphere_triage import scan as scanning
-from vsphere_triage.checks import ABNORMAL, classify, count_states
-from vsphere_triage.config import Settings
+from vsphere_triage.checks import (
+    BLOCKED_ON_QUESTION,
+    BOOTED_NOT_UP,
+    BUSY_NOT_UP,
+    HUNG,
+    INACCESSIBLE,
+    LOST_HEARTBEAT,
+    NO_BOOT_TIME,
+    PAUSED,
+    classify,
+    count_states,
+)
+from vsphere_triage.config import NotFoundError, Settings
 from vsphere_triage.contention import hosts_cpu, storage
 from vsphere_triage.diagnose import (
     Layout,
@@ -73,7 +87,7 @@ from vsphere_triage.inventory import read_datastore_mounts, read_inventory
 from vsphere_triage.powerflex import PowerFlexError
 from vsphere_triage.readonly import ReadOnlyViolationError
 from vsphere_triage.vcenter import VCenterPool, VSphereError
-from vsphere_triage.vmlog import grep, parse_lines
+from vsphere_triage.vmlog import caller_pattern, grep, parse_lines
 from vsphere_triage.vrops import KINDS, SUGGESTED_STAT_KEYS, Vrops, VropsError
 
 if TYPE_CHECKING:
@@ -85,9 +99,12 @@ if TYPE_CHECKING:
 
 # Failures a caller can act on: a bad argument, an unreachable or slow vCenter,
 # a vROps refusal, a refused write. Their message reaches the model.
+logger = logging.getLogger(__name__)
+
 ANTICIPATED = (
     ValueError,
     re.error,
+    regex.error,
     VSphereError,
     VropsError,
     PowerFlexError,
@@ -169,6 +186,14 @@ def _names(pool: VCenterPool, vcenters: list[str] | None) -> list[str]:
     return [pool.resolve(name) for name in vcenters]
 
 
+def _version() -> str:
+    """The installed package's version, so the server reports what is running."""
+    try:
+        return package_version("vsphere-triage")
+    except PackageNotFoundError:
+        return "0+unknown"
+
+
 def _parse_time(text: str) -> datetime:
     value = datetime.fromisoformat(text.strip())
     return value.replace(tzinfo=UTC) if value.tzinfo is None else value.astimezone(UTC)
@@ -178,8 +203,66 @@ def _since(text: str | None, default: datetime) -> datetime:
     return _parse_time(text) if text else default
 
 
-def build_server(settings: Settings | None = None, pool: VCenterPool | None = None) -> MCPServer:
-    """Wire every tool onto a server bound to the configured vCenters."""
+# The longest look-back any tool takes: past it, vCenter keeps nothing finer anyway,
+# and an unbounded number of minutes or hours would overflow a timedelta.
+MAX_LOOKBACK = timedelta(days=366)
+
+
+def _ago(*, minutes: float = 0, hours: float = 0, least: timedelta = timedelta(minutes=1)) -> timedelta:
+    """A caller's look-back as a timedelta: at least `least`, at most `MAX_LOOKBACK`."""
+    # Clamped as a number first: a timedelta of a huge number would itself overflow.
+    seconds = min(max(minutes * 60 + hours * 3600, least.total_seconds()), MAX_LOOKBACK.total_seconds())
+    return timedelta(seconds=seconds)
+
+
+def _clock(moment: datetime | None) -> str:
+    return moment.strftime("%Y-%m-%d %H:%M:%SZ") if moment else "unknown"
+
+
+CAP_NOTE = (
+    "even split into {n} reads, part of the window still held over 1000 events, so the oldest events "
+    "of that part are missing: narrow the window for a complete count"
+)
+
+
+# The VM states a stalled, full or unreachable storage backend produces: a slow
+# boot or hang, and — when a thin disk cannot grow or all paths are down — a VM
+# stunned into a pending question, paused, or inaccessible.
+STORAGE_SUFFERING = frozenset(
+    {
+        HUNG,
+        BUSY_NOT_UP,
+        BOOTED_NOT_UP,
+        LOST_HEARTBEAT,
+        NO_BOOT_TIME,
+        BLOCKED_ON_QUESTION,
+        PAUSED,
+        INACCESSIBLE,
+    }
+)
+
+
+def _event_type(event: Any) -> str:
+    """An event's type as vCenter names it: an EventEx's eventTypeId, else its class."""
+    return getattr(event, "eventTypeId", None) or type(event).__name__.rsplit(".", 1)[-1]
+
+
+def _ordered(begin: datetime, end: datetime) -> tuple[datetime, datetime]:
+    """A window whose start is before its end, or an error that says so."""
+    if begin >= end:
+        msg = f"the window starts ({begin.isoformat()}) at or after it ends ({end.isoformat()})"
+        raise ValueError(msg)
+    return begin, end
+
+
+def build_server(
+    settings: Settings | None = None, pool: VCenterPool | None = None, *, guest_exec: bool = True
+) -> MCPServer:
+    """Wire every tool onto a server bound to the configured vCenters.
+
+    `guest_exec=False` leaves `run_in_guest` unregistered, so the server is
+    read-only end to end; the CLI does that for HTTP unless it is asked not to.
+    """
     resolved = settings or (pool.settings if pool else Settings.from_environment())
     # Every datastore read would otherwise log a line, into a stdio client's log pane.
     logging.getLogger("httpx").setLevel(logging.WARNING)
@@ -202,7 +285,7 @@ def build_server(settings: Settings | None = None, pool: VCenterPool | None = No
     server = MCPServer(
         name="vsphere-triage",
         title="vSphere triage (read-only)",
-        version="0.1.0",
+        version=_version(),
         instructions=INSTRUCTIONS,
         lifespan=lifespan,
     )
@@ -214,7 +297,7 @@ def build_server(settings: Settings | None = None, pool: VCenterPool | None = No
         return JSONResponse({"status": "ok"})
 
     _register_fleet_tools(tool, fleet, resolved, scans, has_vrops=vrops is not None)
-    _register_machine_tools(tool, fleet, resolved)
+    _register_machine_tools(tool, fleet, resolved, guest_exec=guest_exec)
     _register_piece_tools(tool, fleet, resolved)
     _register_infrastructure_tools(tool, fleet, resolved)
     if vrops is not None:
@@ -247,11 +330,16 @@ def _registrar(server: MCPServer, resolved: Settings) -> Callable[[str | None], 
                 active["count"] += 1
                 try:
                     return bounded(await function(*args, **kwargs))
-                except LookupError as error:
+                except NotFoundError as error:
                     return bounded({"found": False, "reason": str(error).strip("'\"")})
                 except ANTICIPATED as error:
-                    # Said to the model in words; anything else is a crash the SDK hides.
+                    # Said to the model in words.
                     raise ToolError(str(error)) from error
+                except Exception as error:
+                    # A bug, not an answer: named as one, never as "not found".
+                    logger.exception("tool %s failed", name or getattr(function, "__name__", "?"))
+                    msg = f"internal error in this server ({type(error).__name__}: {error}); not a finding"
+                    raise ToolError(msg) from error
                 finally:
                     active["count"] -= 1
 
@@ -309,11 +397,15 @@ def _register_fleet_tools(  # noqa: C901, PLR0915 - one closure per tool
         def probe(session: VCenterSession) -> dict[str, Any]:
             started = time.monotonic()
             about = session.about()
-            login_seconds = round(time.monotonic() - started, 2)
+            round_trip = round(time.monotonic() - started, 2)
             return {
                 "reachable": True,
                 **about,
-                "login_seconds": login_seconds,
+                # The login is the one this server's session last made (on first use or
+                # re-login), not a fresh one: a probe does not open a session to time it.
+                "login_seconds": session.last_login_seconds,
+                "login_at": session.last_login_at,
+                "round_trip_seconds": round_trip,
                 "sessions": session.session_count(),
             }
 
@@ -328,7 +420,9 @@ def _register_fleet_tools(  # noqa: C901, PLR0915 - one closure per tool
             sessions = result.get("sessions", {})
             if sessions.get("total") is not None:
                 findings.append(
-                    f"{result['name']}: {sessions['total']} open sessions, login {result['login_seconds']}s"
+                    f"{result['name']}: {sessions['total']} open sessions, this server's last login "
+                    f"took {result['login_seconds']}s (at {_clock(result['login_at'])}), "
+                    f"round trip now {result['round_trip_seconds']}s"
                 )
         gap = capabilities.vrops_gap(resolved)
         return {
@@ -361,14 +455,16 @@ def _register_fleet_tools(  # noqa: C901, PLR0915 - one closure per tool
         """
         name = fleet.resolve(vcenter)
 
+        minutes = int(_ago(minutes=minutes).total_seconds() // 60)
+
         def run(session: VCenterSession) -> dict[str, Any]:
             now = session.now()
-            events = session.events(
+            events, cut = session.events_covering(
                 begin=now - timedelta(minutes=minutes), end=now, types=connhistory.SESSION_EVENT_TYPES
             )
             rows = [
                 {
-                    "type": type(event).__name__,
+                    "type": _event_type(event),
                     "time": getattr(event, "createdTime", None),
                     "user": getattr(event, "userName", None),
                     "source": getattr(event, "ipAddress", None),
@@ -376,9 +472,12 @@ def _register_fleet_tools(  # noqa: C901, PLR0915 - one closure per tool
                 for event in events
             ]
             summary = connhistory.summarize_session_events(rows, now=now, window_minutes=minutes)
+            if cut:
+                summary["findings"] = [*summary.get("findings", []), CAP_NOTE.format(n=16)]
             return {"vcenter": session.vcenter.name, "live_sessions": session.session_count()} | summary
 
-        result = await fleet.run(name, run)
+        # Many QueryEvents reads on a busy vCenter: the sweep deadline, not one read's.
+        result = await fleet.sweep(name, run)
         gap = capabilities.vrops_gap(resolved)
         return result | {"evidence_gaps": [gap] if gap else []}
 
@@ -399,27 +498,39 @@ def _register_fleet_tools(  # noqa: C901, PLR0915 - one closure per tool
 
         """
         names = _names(fleet, vcenters)
+        minutes = int(_ago(minutes=minutes).total_seconds() // 60)
 
         def run(session: VCenterSession) -> dict[str, Any]:
             now = session.now()
-            events = session.events(begin=now - timedelta(minutes=minutes), end=now)
+            # Every event type is read (HA's are EventEx ids that vary by version), so
+            # a busy vCenter fills one QueryEvents answer fast: read it in pieces.
+            events, cut = session.events_covering(begin=now - timedelta(minutes=minutes), end=now)
             rows = [
                 {
-                    "type": type(event).__name__,
+                    "type": _event_type(event),
                     "time": getattr(event, "createdTime", None),
                     "message": getattr(event, "fullFormattedMessage", "") or "",
                     "host": getattr(getattr(event, "host", None), "name", None),
+                    # The host an HA event is about, which is not always the event's own
+                    # host (an HA restart's host is where the VM came back up).
+                    "affected_host": getattr(
+                        getattr(event, "failedHost", None) or getattr(event, "isolatedHost", None),
+                        "name",
+                        None,
+                    ),
                     "vm": getattr(getattr(event, "vm", None), "name", None),
                 }
                 for event in events
             ]
-            return {"vcenter": session.vcenter.name} | clusterevents.summarize_cluster_events(
-                rows, now=now, window_minutes=minutes
-            )
+            summary = clusterevents.summarize_cluster_events(rows, now=now, window_minutes=minutes)
+            if cut:
+                summary["findings"] = [*summary["findings"], CAP_NOTE.format(n=16)]
+            return {"vcenter": session.vcenter.name, "events_read": len(rows), "events_cut": cut} | summary
 
-        results = await asyncio.gather(*(fleet.run(name, run) for name in names), return_exceptions=True)
+        results = await asyncio.gather(*(fleet.sweep(name, run) for name in names), return_exceptions=True)
         rows = [
-            result if not isinstance(result, BaseException) else {"error": str(result)} for result in results
+            result if not isinstance(result, BaseException) else {"vcenter": name, "error": str(result)}
+            for name, result in zip(names, results, strict=True)
         ]
         return {"vcenters": rows}
 
@@ -438,10 +549,13 @@ def _register_fleet_tools(  # noqa: C901, PLR0915 - one closure per tool
 
         """
         name = fleet.resolve(vcenter)
+        minutes = int(_ago(minutes=minutes).total_seconds() // 60)
 
         def run(session: VCenterSession) -> dict[str, Any]:
             now = session.now()
-            events = session.events(begin=now - timedelta(minutes=minutes), end=now, types=("TaskEvent",))
+            events, cut = session.events_covering(
+                begin=now - timedelta(minutes=minutes), end=now, types=("TaskEvent",)
+            )
             rows = []
             for event in events:
                 info = getattr(event, "info", None)
@@ -457,11 +571,12 @@ def _register_fleet_tools(  # noqa: C901, PLR0915 - one closure per tool
                         "user": getattr(reason, "userName", None) or getattr(event, "userName", None),
                     }
                 )
-            return {"vcenter": session.vcenter.name} | taskhistory.summarize_tasks(
-                rows, now=now, window_minutes=minutes
-            )
+            summary = taskhistory.summarize_tasks(rows, now=now, window_minutes=minutes)
+            if cut:
+                summary["findings"] = [*summary["findings"], CAP_NOTE.format(n=16)]
+            return {"vcenter": session.vcenter.name} | summary
 
-        return await fleet.run(name, run)
+        return await fleet.sweep(name, run)
 
     @tool()
     async def vcenter_sessions(*, vcenter: str) -> dict[str, Any]:
@@ -796,12 +911,12 @@ def _register_fleet_tools(  # noqa: C901, PLR0915 - one closure per tool
         """
         names = _names(fleet, vcenters)
         end = _since(until, datetime.now(UTC))
-        begin = _since(since, end - timedelta(minutes=max(1, minutes)))
+        begin, end = _ordered(_since(since, end - _ago(minutes=minutes)), end)
         return await scanning.diagnose_window(fleet, resolved, names, begin, end)
 
 
 def _register_machine_tools(  # noqa: C901, PLR0915 - one closure per tool
-    tool: Callable[..., Any], fleet: VCenterPool, resolved: Settings
+    tool: Callable[..., Any], fleet: VCenterPool, resolved: Settings, *, guest_exec: bool = True
 ) -> None:
     """Environments and machines: finding them, diagnosing them, and each piece on its own."""
     # -- environments and machines ----------------------------------------------
@@ -928,6 +1043,11 @@ def _register_machine_tools(  # noqa: C901, PLR0915 - one closure per tool
         name = fleet.resolve(vcenter)
         return await fleet.run(name, lambda session: diagnose_environment(session, resolved, env_id=env_id))
 
+    # Every tool from here on acts on a VM (guest commands, reboots, resets): left out
+    # entirely when guest_exec is off, as the CLI does over unauthenticated HTTP.
+    if not guest_exec:
+        return
+
     @tool("run_in_guest", annotations=NOT_READ_ONLY)
     async def run_in_guest_tool(
         *,
@@ -997,11 +1117,12 @@ def _register_machine_tools(  # noqa: C901, PLR0915 - one closure per tool
         a fresh boot log, serial console, and (on Windows) the bugcheck its next
         boot records. After it comes back, read get_boot_timeline / read_serial_console.
 
-        Find the VM by moref, or by env_id plus vm_name (never by name alone).
+        Find the VM by moref plus vm_name (both: morefs repeat across vCenters), or
+        by env_id plus vm_name (never by name alone).
 
         Args:
             vcenter: the VM's vCenter.
-            moref: the VM's moref, or give env_id and vm_name.
+            moref: the VM's moref, given together with vm_name; or give env_id and vm_name.
             env_id: the environment id, with vm_name.
             vm_name: the machine's name inside its environment.
 
@@ -1029,11 +1150,12 @@ def _register_machine_tools(  # noqa: C901, PLR0915 - one closure per tool
         graceful reboot was issued and the VM never came back. After it resets,
         read get_boot_timeline / read_serial_console for the fresh boot.
 
-        Find the VM by moref, or by env_id plus vm_name (never by name alone).
+        Find the VM by moref plus vm_name (both: morefs repeat across vCenters), or
+        by env_id plus vm_name (never by name alone).
 
         Args:
             vcenter: the VM's vCenter.
-            moref: the VM's moref, or give env_id and vm_name.
+            moref: the VM's moref, given together with vm_name; or give env_id and vm_name.
             env_id: the environment id, with vm_name.
             vm_name: the machine's name inside its environment.
 
@@ -1109,9 +1231,11 @@ def _register_machine_tools(  # noqa: C901, PLR0915 - one closure per tool
         (Get-WinEvent / Get-Content), run as a guest command, so it is marked
         not-read-only.
 
-        If the VM is powered off, reboot it first (reboot_guest, else hard_reset)
-        and let it come up — the running event log is what this reads. The result
-        says so rather than failing silently.
+        If the VM is hung, reboot it first (reboot_guest, else hard_reset); if it
+        is powered off, power it on from your orchestrator or vCenter (this server
+        has no power-on tool). Let it come up — the running event log is what this
+        reads, and only events from about the last boot count. The result says so
+        rather than failing silently.
 
         Args:
             vcenter: the VM's vCenter.
@@ -1154,9 +1278,11 @@ def _register_machine_tools(  # noqa: C901, PLR0915 - one closure per tool
         mapped to the layer they point at. dmesg/journal may be root-only, so a
         non-privileged run can come back thin; that is reported.
 
-        If the VM is powered off, reboot it first (reboot_guest, else
-        hard_reset) and let it come up. Queries are read-only, run as a guest
-        command, so it is marked not-read-only.
+        If the VM is hung, reboot it first (reboot_guest, else hard_reset); if it
+        is powered off, power it on from your orchestrator or vCenter (this server
+        has no power-on tool). The previous boot's journal (the one that hung) is
+        read too when the journal is persistent, and said when it is not. Queries
+        change nothing but run as a guest command, so it is marked not-read-only.
 
         Args:
             vcenter: the VM's vCenter.
@@ -1286,7 +1412,7 @@ def _register_piece_tools(  # noqa: C901 - one closure per tool
 
         """
         if pattern:
-            re.compile(pattern)
+            caller_pattern(pattern)
         limit = max(1, min(tail, resolved.max_log_lines))
 
         def work(session: VCenterSession, vm: Any, row: dict[str, Any]) -> dict[str, Any]:
@@ -1294,6 +1420,11 @@ def _register_piece_tools(  # noqa: C901 - one closure per tool
             datacenter = vm.datacenter_path or vm.datacenter
             if folder is None or datacenter is None:
                 return {"available": False, "reason": "the VM's folder or datacenter is not known"}
+            if which < 0:
+                return {
+                    "available": False,
+                    "reason": "which is 0 for vmware.log or N (1, 2, ...) for vmware-N.log",
+                }
             file = "vmware.log" if which == 0 else f"vmware-{which}.log"
             read = session.read_datastore_file(datacenter, f"{folder}/{file}", resolved.max_log_bytes)
             if read.status != 200:  # noqa: PLR2004
@@ -1356,10 +1487,10 @@ def _register_piece_tools(  # noqa: C901 - one closure per tool
 
         def work(session: VCenterSession, vm: Any, _row: dict[str, Any]) -> dict[str, Any]:
             result = read_console(session, resolved, vm, captures=count, interval_seconds=interval)
-            if include_image and result.get("available"):
-                status, body, _ = session.screenshot(vm.moref)
-                if status == 200:  # noqa: PLR2004
-                    result["image_jpeg_base64"] = _thumbnail(body)
+            last = result.pop("_last_capture", None)
+            if include_image and last:
+                # The capture the words describe, not a newer one taken after them.
+                result["image_jpeg_base64"] = _thumbnail(last)
             return result
 
         return await _with_vm(vcenter, moref, work)
@@ -1381,7 +1512,7 @@ def _register_piece_tools(  # noqa: C901 - one closure per tool
             try:
                 events = session.events(
                     entity=session.reference("VirtualMachine", moref),
-                    begin=now - timedelta(minutes=max(1, minutes)),
+                    begin=now - _ago(minutes=minutes),
                     end=now,
                 )
             except vmodl.fault.ManagedObjectNotFound:
@@ -1557,7 +1688,7 @@ def _register_infrastructure_tools(tool: Callable[..., Any], fleet: VCenterPool,
 
         """
         if pattern:
-            re.compile(pattern)
+            caller_pattern(pattern)
         name = fleet.resolve(vcenter)
 
         def run(session: VCenterSession) -> dict[str, Any]:
@@ -1637,7 +1768,8 @@ def _register_vrops_tools(tool: Callable[..., Any], vrops: Vrops) -> None:
 
         """
         end = _since(until, datetime.now(UTC))
-        begin = _since(since, end - timedelta(hours=max(0.1, min(hours, 24 * 31))))
+        begin = _since(since, end - min(_ago(hours=hours, least=timedelta(minutes=6)), timedelta(days=31)))
+        begin, end = _ordered(begin, end)
         series = await vrops.stats(
             resource_id, stat_keys, begin, end, interval_minutes=max(1, interval_minutes)
         )
@@ -1680,8 +1812,7 @@ def _register_vrops_tools(tool: Callable[..., Any], vrops: Vrops) -> None:
             interval_minutes: rollup interval.
 
         """
-        begin = _since(since, datetime.now(UTC))
-        end = _since(until, datetime.now(UTC))
+        begin, end = _ordered(_since(since, datetime.now(UTC)), _since(until, datetime.now(UTC)))
         compared = await vrops.compare(
             resource_id,
             stat_keys,
@@ -1710,7 +1841,7 @@ def _register_vrops_tools(tool: Callable[..., Any], vrops: Vrops) -> None:
             hours: how far back.
 
         """
-        since = datetime.now(UTC) - timedelta(hours=max(0.1, hours))
+        since = datetime.now(UTC) - _ago(hours=hours, least=timedelta(minutes=6))
         alerts = await vrops.alerts(resource_id, since)
         return {"count": len(alerts), "alerts": alerts[:100]}
 
@@ -1744,6 +1875,18 @@ def _register_powerflex_tools(  # noqa: C901, PLR0915 - one closure per tool
             if identifier:
                 stats = await client.protection_domain_statistics(identifier)
                 pd_stats[identifier] = stats if isinstance(stats, dict) else {}
+        if not pds or not any(pd_stats.values()):
+            # Nothing to judge is not "nothing troubled".
+            return {
+                "troubled_protection_domains": {},
+                "affected_datastores": [],
+                "findings": [
+                    (
+                        "PowerFlex returned no protection domains or no statistics for them, so whether a "
+                        "protection domain is troubled could not be judged — not evidence the backend is fine"
+                    )
+                ],
+            }
         impact = powerflex.map_backend_impact(pds, pd_stats, pools, volumes)
         if not impact["volume_to_pd"]:
             return {
@@ -1775,10 +1918,13 @@ def _register_powerflex_tools(  # noqa: C901, PLR0915 - one closure per tool
                     "moref": vm.moref,
                     "vcenter": vm.vcenter,
                     "state": verdict.state,
-                    "suffering": verdict.state in ABNORMAL,
+                    # States a slow, full or unreachable backend can cause (see
+                    # STORAGE_SUFFERING); counted only on a troubled PD's datastores.
+                    "suffering": verdict.state in STORAGE_SUFFERING,
                 }
                 for datastore_moref in vm.datastore_morefs:
-                    vms_by_datastore.setdefault(datastore_moref, []).append(row)
+                    key = powerflex.datastore_key(session.vcenter.name, datastore_moref)
+                    vms_by_datastore.setdefault(key, []).append(row)
             return datastores, vms_by_datastore
 
         names = _names(fleet, vcenters)
@@ -1794,6 +1940,8 @@ def _register_powerflex_tools(  # noqa: C901, PLR0915 - one closure per tool
             datastores.extend(store_rows)
             vms_by_datastore.update(vm_map)
         join = powerflex.affected_vms(impact["volume_to_pd"], datastores, vms_by_datastore)
+        # A vCenter that was not read is a gap, not "nothing maps there".
+        join["findings"].extend(f"vCenter {name} not read: {error}" for name, error in errors.items())
         return {
             "troubled_protection_domains": impact["troubled_protection_domains"],
             **join,
@@ -1813,13 +1961,15 @@ def _register_powerflex_tools(  # noqa: C901, PLR0915 - one closure per tool
         sds = await client.sds()
         devices = await client.devices()
         systems = await client.systems()
-        stats: dict[str, Any] = {}
+        per_system: list[dict[str, Any]] = []
         for system in systems:
             identifier = system.get("id")
             if identifier:
-                merged = await client.system_statistics(identifier)
-                if isinstance(merged, dict):
-                    stats |= merged
+                read = await client.system_statistics(identifier)
+                if isinstance(read, dict):
+                    per_system.append(read)
+        # The worst value of each statistic across systems, never the last one read.
+        stats = powerflex.merge_statistics(per_system)
         return {
             "systems": [{"id": system.get("id"), "name": system.get("name")} for system in systems],
         } | powerflex.summarize_health(sds, devices, stats)
@@ -1832,7 +1982,8 @@ def _register_powerflex_tools(  # noqa: C901, PLR0915 - one closure per tool
         the hotspot whose datastores and volumes feel load first. Run this when a
         PowerFlex-backed datastore is slow and you suspect a busy PD rather than a
         failure: it reads each PD's read/write bandwidth counters, derives IOPS
-        and throughput, and flags a PD at half or more of the total. Then map the
+        and throughput, and flags a PD carrying more than half of the total and
+        well over its even share (a 51/49 split of two PDs is not a hotspot). Then map the
         slow datastore to its volume (powerflex_find_volume) and confirm it lives
         on that PD.
         """
@@ -1863,6 +2014,9 @@ def _register_powerflex_tools(  # noqa: C901, PLR0915 - one closure per tool
             query: a volume name, a PowerFlex volume id, or an ESXi naa/eui device id.
 
         """
+        if not query.strip():
+            msg = "query is empty: give a volume name, a PowerFlex volume id, or an ESXi naa/eui device id"
+            raise ValueError(msg)
         volumes = await client.volumes()
         candidate = powerflex.volume_id_from_naa(query) or query.strip().lower()
         matches = [
@@ -1882,6 +2036,15 @@ def _register_powerflex_tools(  # noqa: C901, PLR0915 - one closure per tool
         }
 
 
+def _sensor_reading(sensor: Any) -> float | None:
+    """A numeric sensor's reading in its base units, applying its unitModifier."""
+    raw = getattr(sensor, "currentReading", None)
+    if not isinstance(raw, (int, float)) or isinstance(raw, bool):
+        return None
+    modifier = getattr(sensor, "unitModifier", 0) or 0
+    return round(raw * (10**modifier), 3) if isinstance(modifier, int) else float(raw)
+
+
 def _read_host_sensors(session: VCenterSession, host_moref: str) -> list[dict[str, Any]]:
     """A host's hardware sensors, flattened to {name, type, health, reading}. Read-only."""
     paths = (
@@ -1896,7 +2059,9 @@ def _read_host_sensors(session: VCenterSession, host_moref: str) -> list[dict[st
             "name": getattr(sensor, "name", None),
             "type": getattr(sensor, "sensorType", None),
             "health": getattr(getattr(sensor, "healthState", None), "key", None),
-            "reading": getattr(sensor, "currentReading", None),
+            # currentReading is scaled by 10^unitModifier: 4500 with modifier -2 is 45.0.
+            "reading": _sensor_reading(sensor),
+            "unit": getattr(sensor, "baseUnits", None) or None,
         }
         for sensor in rows[0].get("runtime.healthSystemRuntime.systemHealthInfo.numericSensorInfo") or []
     ]
@@ -1924,9 +2089,9 @@ def _pick[T](items: Any, wanted: str, keys: Callable[[T], tuple[str, str]]) -> T
     if not exact:
         near = [keys(item)[0] for item in pool if text in (keys(item)[0] or "").lower()][:10]
         msg = f"{wanted!r} not found" + (f"; similar: {', '.join(near)}" if near else "")
-        raise LookupError(msg)
+        raise NotFoundError(msg)
     msg = f"{wanted!r} matches {len(exact)} objects; use the moref"
-    raise LookupError(msg)
+    raise NotFoundError(msg)
 
 
 def _console_interval(settings: Settings, captures: int, asked: float) -> float:

@@ -47,6 +47,14 @@ PositiveFloat = Annotated[float, BeforeValidator(_not_a_boolean), Field(gt=0, al
 Fraction = Annotated[float, BeforeValidator(_not_a_boolean), Field(gt=0, le=1, allow_inf_nan=False)]
 
 
+class NotFoundError(LookupError):
+    """Something asked for is not there (a vCenter, an object, a kept scan): an answer, not a crash.
+
+    Distinct from `KeyError` and `IndexError`, which are also `LookupError`s but
+    mean a bug: only this one is turned into a `found: false` result.
+    """
+
+
 class VCenter(BaseModel):
     """One vCenter: where it is, and the other names it goes by."""
 
@@ -237,6 +245,9 @@ class Settings(BaseSettings):
     """
 
     timeout_seconds: PositiveFloat = 60.0
+    """The deadline for one vCenter read (a diagnosis, a log, a property read)."""
+    scan_timeout_seconds: PositiveFloat = 300.0
+    """The deadline for a whole-vCenter sweep (a scan, a fleet report): many reads in a row."""
     max_concurrent_tools: PositiveInt = 4
     max_concurrent_per_vcenter: PositiveInt = 4
     max_log_bytes: PositiveInt = 4 * 1024 * 1024
@@ -270,6 +281,17 @@ class Settings(BaseSettings):
     This is the ONE capability that is not read-only: `run_in_guest` executes a
     command inside a guest through VMware Tools. It needs guest credentials, and
     the guest must have Tools running. Leave unset to require them per call.
+    """
+
+    guest_exec_over_http: bool = False
+    """Offer the tools that act on a VM over the HTTP transport too.
+
+    Those are the guest-command tools (`run_in_guest`, `check_ems`, the boot
+    investigations, `read_crash_dump`) and the power tools (`reboot_guest`,
+    `hard_reset`). Off by default: the HTTP transport has no authentication of
+    its own, so every caller who can reach it could run commands in guests or
+    reset VMs. Over stdio (the default transport) they are always offered. Turn
+    on only behind an authenticating proxy.
     """
 
     guest_exec_timeout_seconds: PositiveFloat = 30.0
@@ -347,7 +369,7 @@ class Settings(BaseSettings):
         else:
             names = ", ".join(vcenter.name for vcenter in matches)
             msg = f"{spelling!r} matches more than one vCenter ({names}); use its name"
-        raise LookupError(msg)
+        raise NotFoundError(msg)
 
     @classmethod
     def from_environment(cls, environment: Mapping[str, str] | None = None) -> Settings:

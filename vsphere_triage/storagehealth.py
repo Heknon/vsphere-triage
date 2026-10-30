@@ -44,7 +44,8 @@ def classify_datastore(row: dict[str, Any], thresholds: Thresholds) -> dict[str,
     uncommitted = row.get("uncommitted_bytes") or 0
     committed = (capacity - free) if (capacity is not None and free is not None) else None
     provisioned = (committed + uncommitted) if committed is not None else None
-    free_percent = round(free / capacity * 100, 1) if (capacity and free is not None) else None
+    exact_free = free / capacity * 100 if (capacity and free is not None) else None
+    free_percent = round(exact_free, 1) if exact_free is not None else None
     ratio = round(provisioned / capacity, 2) if (capacity and provisioned is not None) else None
     apd = [
         {"host_moref": mount["host_moref"], "reason": mount["inaccessible_reason"]}
@@ -53,9 +54,19 @@ def classify_datastore(row: dict[str, Any], thresholds: Thresholds) -> dict[str,
     ]
     findings: list[str] = []
     name = row.get("name")
+    unread = [
+        label
+        for label, value in (
+            ("capacity", capacity),
+            ("free space", free),
+            ("accessibility", row.get("accessible")),
+            ("host mounts", row.get("mounts")),
+        )
+        if value is None
+    ]
     if row.get("accessible") is False:
         findings.append(f"datastore {name} is not accessible from vCenter")
-    if free_percent is not None and free_percent <= thresholds.datastore_full_percent:
+    if exact_free is not None and exact_free <= thresholds.datastore_full_percent:
         findings.append(f"nearly full: {free_percent}% free — a thin disk on it stalls on write")
     if ratio is not None and ratio >= thresholds.datastore_overprovision_ratio:
         findings.append(
@@ -88,7 +99,10 @@ def classify_datastore(row: dict[str, Any], thresholds: Thresholds) -> dict[str,
         "hosts_unreachable": apd,
         "holds_template": row.get("holds_template", False),
         "findings": findings,
-        "healthy": not findings,
+        # Healthy only when it could be judged: a datastore whose capacity, free
+        # space, accessibility or mounts were not read is unknown, not healthy.
+        "healthy": False if findings else (None if unread else True),
+        "not_read": unread,
     }
 
 
@@ -117,7 +131,7 @@ async def check_datastores(
 ) -> dict[str, Any]:
     """Every datastore's fill, over-provisioning and reachability across the vCenters, worst first."""
     results = await asyncio.gather(
-        *(pool.run(name, _scan_datastores) for name in names),
+        *(pool.sweep(name, _scan_datastores) for name in names),
         return_exceptions=True,
     )
     verdicts: list[dict[str, Any]] = []
@@ -130,17 +144,18 @@ async def check_datastores(
         read[name] = len(result)
         verdicts.extend(classify_datastore(row, settings.thresholds) for row in result)
 
-    unhealthy = [verdict for verdict in verdicts if not verdict["healthy"]]
+    unhealthy = [verdict for verdict in verdicts if verdict["healthy"] is False]
+    unjudged = [verdict for verdict in verdicts if verdict["healthy"] is None]
     unhealthy.sort(key=lambda verdict: (verdict["free_percent"] is None, verdict["free_percent"] or 0))
-    shown = unhealthy if only_problems else [*unhealthy, *(v for v in verdicts if v["healthy"])]
+    shown = (
+        [*unhealthy, *unjudged]
+        if only_problems
+        else [*unhealthy, *unjudged, *(v for v in verdicts if v["healthy"] is True)]
+    )
 
     apd = [verdict for verdict in unhealthy if verdict["hosts_unreachable"]]
-    full = [
-        verdict
-        for verdict in unhealthy
-        if verdict["free_percent"] is not None
-        and verdict["free_percent"] <= settings.thresholds.datastore_full_percent
-    ]
+    # The same judgement classify_datastore made (on the unrounded figure).
+    full = [verdict for verdict in unhealthy if any(f.startswith("nearly full") for f in verdict["findings"])]
     over = [
         verdict
         for verdict in unhealthy
@@ -171,6 +186,11 @@ async def check_datastores(
             f"{len(at_risk)} of the troubled datastores hold a template's base disk — a linked clone "
             "reads its base from here, so this takes every clone of that template down"
         )
+    if unjudged:
+        findings.append(
+            f"{len(unjudged)} datastore(s) could not be judged (capacity, free space, accessibility or "
+            "mounts not read, usually permission): not evidence they are healthy"
+        )
     for name, error in errors.items():
         findings.append(f"vCenter {name} not read: {error}")
     return {
@@ -178,7 +198,12 @@ async def check_datastores(
         "datastores_total": len(verdicts),
         "unhealthy_total": len(unhealthy),
         "datastores": shown[:limit],
-        "all_healthy": bool(verdicts) and not unhealthy,
+        # Not when a vCenter went unread, or a datastore could not be judged.
+        "all_healthy": bool(verdicts)
+        and not unhealthy
+        and not errors
+        and all(verdict["healthy"] is True for verdict in verdicts),
+        "unjudged_total": len(unjudged),
         "vcenters_read": read,
         "errors": errors,
         "note": (

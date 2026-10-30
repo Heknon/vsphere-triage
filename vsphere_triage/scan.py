@@ -33,6 +33,7 @@ from vsphere_triage.checks import (
     latest_reboot_by_vm,
     resets_by_vm,
 )
+from vsphere_triage.config import NotFoundError
 from vsphere_triage.contention import hosts_cpu, storage
 from vsphere_triage.inventory import (
     HostFacts,
@@ -129,7 +130,7 @@ class ScanStore:
         except KeyError:
             kept = ", ".join(self._scans) or "none"
             msg = f"No scan {scan_id!r} is kept (kept: {kept}); run scan again"
-            raise LookupError(msg) from None
+            raise NotFoundError(msg) from None
 
 
 def scan_vcenter(session: VCenterSession, settings: Settings) -> VCenterScan:
@@ -191,7 +192,7 @@ async def run_scan(pool: VCenterPool, settings: Settings, names: Sequence[str]) 
     """Scan the named vCenters concurrently; one failing does not fail the rest."""
     started = datetime.now().astimezone()
     results = await asyncio.gather(
-        *(pool.run(name, lambda session: scan_vcenter(session, settings)) for name in names),
+        *(pool.sweep(name, lambda session: scan_vcenter(session, settings)) for name in names),
         return_exceptions=True,
     )
     scans: dict[str, VCenterScan] = {}
@@ -436,8 +437,9 @@ def explain_on_vcenter(
     hosts = [vscan.inventory.hosts[moref] for moref in host_ids if moref in vscan.inventory.hosts]
     cpu, unknown = hosts_cpu(session, hosts, begin=begin, end=end, thresholds=thresholds)
     member_hosts = {vm.host_moref for vm in members}
-    names = {name for vm in members for name in vm.datastores}
-    stores = [store for store in vscan.inventory.datastores.values() if store.get("name") in names]
+    # By moref: a datastore name can repeat across datacenters of one vCenter.
+    morefs = {moref for vm in members for moref in vm.datastore_morefs}
+    stores = [store for moref, store in vscan.inventory.datastores.items() if moref in morefs]
     disk = storage(
         session,
         {host.moref: host.name for host in hosts if host.moref in member_hosts},
@@ -493,7 +495,7 @@ async def explain_group(  # noqa: C901 - one comparison, then one check per vCen
         own = [vm for vm in members if vm.vcenter == name]
         own_healthy = [vm for vm in healthy if vm.vcenter == name]
         try:
-            per_vcenter[name] = await pool.run(
+            per_vcenter[name] = await pool.sweep(
                 name,
                 lambda session, vs=vscan, m=own, h=own_healthy: explain_on_vcenter(
                     session, settings, vs, m, h
@@ -604,7 +606,10 @@ async def diagnose_window(
 ) -> dict[str, Any]:
     """The fleet over a past window, when the VMs themselves may already be gone."""
     results = await asyncio.gather(
-        *(pool.run(name, lambda session: window_on_vcenter(session, settings, begin, end)) for name in names),
+        *(
+            pool.sweep(name, lambda session: window_on_vcenter(session, settings, begin, end))
+            for name in names
+        ),
         return_exceptions=True,
     )
     per_vcenter: dict[str, Any] = {}
@@ -645,10 +650,15 @@ async def diagnose_window(
                 f"{name}: datastore latency for this window could not be read; "
                 "not evidence of healthy storage"
             )
+    # Anything that went wrong in the window counts, resets and failed power-ons
+    # as much as pressure: the "nothing found" line must never sit above them.
+    trouble = (*RESET_EVENTS, "VmFailedToPowerOnEvent")
     pressure = any(
-        result.get("hosts_over_cpu_threshold") or result.get("storage", {}).get("findings")
+        result.get("hosts_over_cpu_threshold")
+        or result.get("storage", {}).get("findings")
+        or any(result.get("events_by_type", {}).get(kind) for kind in trouble)
         for result in per_vcenter.values()
-        if not isinstance(result, dict) or result.get("available", True)
+        if result.get("available", True)
     )
     if not pressure and all(
         r.get("cpu_window_read") and r.get("storage_window_read")

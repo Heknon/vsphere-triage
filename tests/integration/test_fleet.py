@@ -541,7 +541,7 @@ def test_reboot_guest_refuses_a_guest_without_tools(
     # and it is refused in words before any power method is sent.
     moref = worlds[0].moref("environments/env-1001", "web-01")
 
-    result = call(server, "reboot_guest", {"vcenter": "vc-a", "moref": moref})
+    result = call(server, "reboot_guest", {"vcenter": "vc-a", "moref": moref, "vm_name": "web-01"})
 
     assert result["rebooted"] is False
     assert "Tools is not running" in result["reason"]
@@ -558,7 +558,7 @@ def test_power_tools_never_dirty_the_read_only_surface(
         moref = worlds[0].moref("environments/env-1003", "ok-01")
         for tool in ("reboot_guest", "hard_reset"):
             with contextlib.suppress(ToolError):
-                asyncio.run(built.call_tool(tool, {"vcenter": "vc-a", "moref": moref}))
+                asyncio.run(built.call_tool(tool, {"vcenter": "vc-a", "moref": moref, "vm_name": "ok-01"}))
         seen = built.vcenters.methods_seen()
         assert seen <= ALLOWED_METHODS, seen - ALLOWED_METHODS
     finally:

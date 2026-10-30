@@ -53,7 +53,7 @@ async def find_vms_by_device(
 ) -> dict[str, Any]:
     """VMs across the named vCenters that have (present) or lack (not present) a device."""
     results = await asyncio.gather(
-        *(pool.run(name, lambda session: _scan_devices(session, under)) for name in names),
+        *(pool.sweep(name, lambda session: _scan_devices(session, under)) for name in names),
         return_exceptions=True,
     )
     rows: list[dict[str, Any]] = []
@@ -143,7 +143,7 @@ async def hardware_profile(  # noqa: C901 - one fleet walk, kept together
     """
     results = await asyncio.gather(
         *(
-            pool.run(name, lambda s: _profile_scope(s, under, include_templates=include_templates))
+            pool.sweep(name, lambda s: _profile_scope(s, under, include_templates=include_templates))
             for name in names
         ),
         return_exceptions=True,
@@ -169,7 +169,9 @@ async def hardware_profile(  # noqa: C901 - one fleet walk, kept together
     # VMs that differ from it.
     by_env: dict[str, list[dict[str, Any]]] = {}
     for row in rows:
-        by_env.setdefault(f"{row['vcenter']}:{row['environment'] or row['folder']}", []).append(row)
+        # By the folder itself: two environments of the same name elsewhere are not one.
+        where = row.get("folder_moref") or row["folder"] or row["environment"]
+        by_env.setdefault(f"{row['vcenter']}:{where}", []).append(row)
     outliers: list[dict[str, Any]] = []
     for members in by_env.values():
         if len(members) < 2:  # noqa: PLR2004 - need a majority to deviate from
@@ -178,9 +180,10 @@ async def hardware_profile(  # noqa: C901 - one fleet walk, kept together
         majority, majority_n = signatures.most_common(1)[0]
         if majority_n == len(members):
             continue  # the whole environment matches
-        common = set(majority)
+        # Counted, not as sets: two NICs where the norm is one is a difference.
+        common = Counter(majority)
         for row in members:
-            mine = set(_signature(row))
+            mine = Counter(_signature(row))
             if mine == common:
                 continue
             outliers.append(
@@ -189,8 +192,8 @@ async def hardware_profile(  # noqa: C901 - one fleet walk, kept together
                     "moref": row["moref"],
                     "name": row["name"],
                     "environment": row["environment"],
-                    "extra": sorted(mine - common),
-                    "missing": sorted(common - mine),
+                    "extra": sorted((mine - common).elements()),
+                    "missing": sorted((common - mine).elements()),
                 }
             )
     findings = [
