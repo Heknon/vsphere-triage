@@ -12,6 +12,7 @@ from __future__ import annotations
 
 import asyncio
 import itertools
+import time
 import uuid
 from collections import Counter, OrderedDict
 from dataclasses import dataclass, field
@@ -223,11 +224,15 @@ def scan_vcenter(session: VCenterSession, settings: Settings) -> VCenterScan:  #
 # States that rest on uptime: a VM rebooted inside the guest looks long-stuck in
 # them, because vCenter logs no event for that reboot.
 UPTIME_STATES = (HUNG, BUSY_NOT_UP, BOOTED_NOT_UP)
-# How many such VMs a scan re-checks against their vmware.log, per vCenter.
+# How many such VMs a scan re-checks against their vmware.log, per vCenter, in
+# how long, reading how much of each log, waiting how long for each read.
 LOG_RECHECKS = 40
+LOG_RECHECK_SECONDS = 30.0
+LOG_RECHECK_BYTES = 256 * 1024
+LOG_RECHECK_TIMEOUT = 10.0
 
 
-def _recheck_in_guest_reboots(
+def _recheck_in_guest_reboots(  # noqa: C901 - one bounded pass, each way a read can fail beside it
     session: VCenterSession,
     inventory: Inventory,
     verdicts: dict[str, Verdict],
@@ -243,7 +248,7 @@ def _recheck_in_guest_reboots(
     suspects = [
         vm
         for vm in inventory.vms
-        if verdicts[vm.moref].state in UPTIME_STATES and vm.boot_source == "power_on"
+        if verdicts[vm.moref].state in UPTIME_STATES and vm.boot_source in ("power_on", "quickstats")
     ]
     if not suspects:
         return []
@@ -262,9 +267,18 @@ def _recheck_in_guest_reboots(
     except Exception as error:  # noqa: BLE001 - the scan stands without the re-check
         return [f"in-guest reboots not re-checked in vmware.log ({type(error).__name__})"]
     rebooted = 0
+    read = 0
+    # Suspects often sit on a slow or unreachable datastore: the re-check gets its
+    # own time budget and reads little per VM, so it cannot sink the whole scan.
+    deadline = time.monotonic() + LOG_RECHECK_SECONDS
     for vm in checked:
+        if time.monotonic() >= deadline:
+            break
+        read += 1
         try:
-            log_boot = boot_from_vmware_log(session, vm, rows.get(vm.moref, {}))
+            log_boot = boot_from_vmware_log(
+                session, vm, rows.get(vm.moref, {}), LOG_RECHECK_BYTES, timeout_seconds=LOG_RECHECK_TIMEOUT
+            )
         except vim.fault.NotAuthenticated:
             raise
         except Exception:  # noqa: BLE001, S112 - one unreadable log leaves that VM as judged
@@ -277,14 +291,14 @@ def _recheck_in_guest_reboots(
             verdicts[vm.moref] = classify(vm, settings.thresholds, resets_in_window=resets.get(vm.moref, 0))
     notes = [
         (
-            f"{len(checked)} VM(s) stuck by uptime from power-on re-checked against vmware.log for an "
+            f"{read} VM(s) stuck by uptime from power-on re-checked against vmware.log for an "
             f"in-guest reboot: {rebooted} had rebooted since and were re-judged from that reboot"
         )
     ]
-    if len(suspects) > len(checked):
+    if len(suspects) > read:
         notes.append(
-            f"{len(suspects) - len(checked)} more were not re-checked (limit {LOG_RECHECKS}); diagnose_vm "
-            "re-checks any one of them"
+            f"{len(suspects) - read} more were not re-checked (at most {LOG_RECHECKS} VMs or "
+            f"{LOG_RECHECK_SECONDS:g} s); diagnose_vm re-checks any one of them"
         )
     return notes
 
@@ -552,7 +566,8 @@ def summary(scan: Scan, *, states: Sequence[str] = FLAGGED, limit: int) -> dict[
         "hosts_over_cpu_threshold": overcommitted,
         "hosts_near_memory_capacity": memory_pressed,
         "hosts_not_connected": not_connected,
-        "hosts_with_hardware_problems": failing_hardware,
+        "hosts_with_hardware_problems": failing_hardware[:50],
+        "hosts_with_hardware_problems_total": len(failing_hardware),
         "storage_findings": slow_storage,
         "vcenters": {
             name: {

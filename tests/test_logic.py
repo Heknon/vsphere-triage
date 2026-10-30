@@ -3899,7 +3899,7 @@ def test_a_scan_re_judges_a_vm_rebooted_inside_the_guest_from_its_vmware_log() -
             {"moref": "vm-7", "config.files.vmPathName": "[ds-1] web-01/web-01.vmx"} for _ in objects
         ],
         reference=lambda kind, moref: f"{kind}:{moref}",
-        read_datastore_file=lambda _dc, path, _max: DatastoreFile(path, log, len(log), False, 200),
+        read_datastore_file=lambda _dc, path, _max, **_: DatastoreFile(path, log, len(log), False, 200),
     )
     settings = Settings.from_environment(
         {
@@ -3979,3 +3979,107 @@ def test_sensors_are_read_for_many_hosts_in_one_call() -> None:
 
     assert len(calls) == 1
     assert found["host-2"][0]["health"] == "red"
+
+
+def test_a_device_reset_line_does_not_start_a_new_boot() -> None:
+    rows = [
+        "2026-10-26T02:00:00.000Z In(05) vmx - Powering on the virtual machine",
+        "2026-10-26T02:01:00.000Z In(05) vmx - Tools: Changing running status: 0 => 1.",
+        "2026-10-29T02:28:00.000Z In(05) vcpu-1 - AHCI-VMM: sata0:0: Reset request",
+        "2026-10-29T02:28:01.000Z In(05) vmx - PVSCSI: scsi0: Bus reset request",
+    ]
+
+    timeline = vmlog.boot_timeline(vmlog.parse_lines("\n".join(rows)))
+
+    assert timeline["boot_started"] == datetime(2026, 10, 26, 2, 0, tzinfo=UTC)
+
+
+@pytest.mark.parametrize(
+    ("log_boot", "expected"),
+    [
+        (NOW - timedelta(days=3) + timedelta(seconds=5), "power_on"),  # the power-on itself
+        (NOW + timedelta(minutes=10), "power_on"),  # a host clock running ahead
+        (NOW - timedelta(minutes=4), "vmware_log"),  # a real reboot since
+    ],
+)
+def test_a_log_boot_counts_only_when_it_is_a_later_reboot(log_boot: datetime, expected: str) -> None:
+    machine = vm(power_on_time=NOW - timedelta(days=3), tools_running="guestToolsNotRunning")
+
+    set_effective_boot(machine, NOW, reboots={}, log_boot=log_boot)
+
+    assert machine.boot_source == expected
+
+
+def test_a_caller_reboot_time_wins_over_the_log() -> None:
+    machine = vm(power_on_time=NOW - timedelta(days=3))
+
+    set_effective_boot(
+        machine, NOW, reboots={}, rebooted_at=NOW - timedelta(minutes=30), log_boot=NOW - timedelta(minutes=4)
+    )
+
+    assert machine.boot_source == "reported_reboot"
+
+
+def test_a_lost_redundant_power_supply_weighs_less_than_a_hot_cpu() -> None:
+    def weight_of(sensor: dict) -> int:
+        machine = vm(cpu_mhz=3600.0)
+        result = diagnose.conclude(
+            checks.classify(machine, LIMITS),
+            vm=machine,
+            cpu={"findings": [], "starved": False},
+            disk={"findings": [], "slow": False, "datastores": []},
+            environment={"signals": []},
+            logs={"available": False},
+            serial={"available": False},
+            console={"available": False},
+            host_log={"available": False},
+            host_hardware=hostsensors.classify_sensors([sensor]),
+        )
+        return next(cause["score"] for cause in result["causes"] if cause["cause"] == diagnose.HOST_HARDWARE)
+
+    assert weight_of({"name": "PS Redundancy", "type": "power", "health": "red"}) == 1
+    assert weight_of({"name": "CPU1 Temp", "type": "temperature", "health": "red"}) == 2
+
+
+def test_a_green_software_components_sensor_is_no_proof_of_hardware_health() -> None:
+    verdict = hostsensors.classify_sensors(
+        [{"name": "Software Components", "type": "Software Components", "health": "green"}]
+    )
+
+    assert verdict["healthy"] is None
+
+
+def test_a_pool_well_under_its_limit_is_not_a_limit_in_play() -> None:
+    from vsphere_triage import inventory  # noqa: PLC0415
+
+    cluster = vim.ClusterComputeResource("domain-c7")
+    root = vim.ResourcePool("resgroup-1")
+    rows = [
+        {"moref": "resgroup-1", "name": "Resources", "parent": cluster},
+        {
+            "moref": "resgroup-2",
+            "name": "tenant",
+            "parent": root,
+            "config.cpuAllocation.limit": 100000,
+            "runtime.cpu.overallUsage": 2000,
+        },
+        {
+            "moref": "resgroup-3",
+            "name": "busy",
+            "parent": root,
+            "config.cpuAllocation.limit": 4000,
+            "runtime.cpu.overallUsage": 3900,
+        },
+    ]
+    pools = inventory.pool_limits(SimpleNamespace(retrieve=lambda _kind, _paths: rows))
+
+    assert inventory.inherited_pool_limit(pools, "resgroup-2", "cpu_limit") == (None, None)
+    assert inventory.inherited_pool_limit(pools, "resgroup-3", "cpu_limit") == (4000, "busy")
+
+
+def test_a_task_started_by_an_alarm_or_schedule_names_it() -> None:
+    from vsphere_triage.server import _task_started_by  # noqa: PLC0415
+
+    assert _task_started_by(vim.TaskReasonUser(userName="VSPHERE.LOCAL\\ops")) == "VSPHERE.LOCAL\\ops"
+    assert _task_started_by(vim.TaskReasonAlarm(alarmName="Host down")) == "alarm: Host down"
+    assert _task_started_by(vim.TaskReasonSystem()) == "system"

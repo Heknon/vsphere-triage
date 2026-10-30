@@ -23,6 +23,7 @@ if TYPE_CHECKING:
 
     from vsphere_triage.vcenter import VCenterSession
 
+SENSOR_BATCH = 20
 SENSOR_PATHS = (
     "runtime.healthSystemRuntime.systemHealthInfo.numericSensorInfo",
     "runtime.healthSystemRuntime.hardwareStatusInfo",
@@ -66,21 +67,27 @@ def flatten(row: dict[str, Any]) -> list[dict[str, Any]]:
 
 
 def read_sensors(session: VCenterSession, host_morefs: Sequence[str]) -> dict[str, list[dict[str, Any]]]:
-    """The hardware sensors of each host, by moref, in one property read. Read-only."""
-    if not host_morefs:
-        return {}
-    rows = session.retrieve(
-        vim.HostSystem,
-        SENSOR_PATHS,
-        objects=[session.reference("HostSystem", moref) for moref in host_morefs],
-    )
-    return {row["moref"]: flatten(row) for row in rows}
+    """The hardware sensors of each host, by moref. Read-only."""
+    found: dict[str, list[dict[str, Any]]] = {}
+    # In batches: a host can carry hundreds of sensors, and one read of a whole
+    # large vCenter's would be tens of megabytes of XML at once.
+    for start in range(0, len(host_morefs), SENSOR_BATCH):
+        batch = host_morefs[start : start + SENSOR_BATCH]
+        rows = session.retrieve(
+            vim.HostSystem, SENSOR_PATHS, objects=[session.reference("HostSystem", moref) for moref in batch]
+        )
+        found.update({row["moref"]: flatten(row) for row in rows})
+    return found
 
 
 # unknown is not a failure signal — many sensors report it when idle — so only
 # red and yellow count against health.
 _RED = "red"
 _YELLOW = "yellow"
+
+
+def _software(sensor: dict[str, Any]) -> bool:
+    return "software" in f"{sensor.get('type') or ''} {sensor.get('name') or ''}".lower()
 
 
 def classify_sensors(sensors: list[dict[str, Any]]) -> dict[str, Any]:
@@ -99,7 +106,13 @@ def classify_sensors(sensors: list[dict[str, Any]]) -> dict[str, Any]:
     if yellow:
         names = ", ".join(sorted({str(sensor.get("name")) for sensor in yellow})[:10])
         findings.append(f"{len(yellow)} hardware sensor(s) warning (yellow): {names}")
-    green = [sensor for sensor in sensors if str(sensor.get("health", "")).lower() == "green"]
+    # "Software Components" is listed green on hosts with no hardware provider at
+    # all: it says nothing about the hardware, so it proves no health.
+    green = [
+        sensor
+        for sensor in sensors
+        if str(sensor.get("health", "")).lower() == "green" and not _software(sensor)
+    ]
     if sensors and not green and not red and not yellow:
         findings.append(
             f"none of the host's {len(sensors)} hardware sensor(s) reports a state (all unknown): its CIM "

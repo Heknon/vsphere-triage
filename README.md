@@ -215,7 +215,7 @@ server always matches the skill. Invoke the skill as
 | `hardware_profile` | device counts per category and kind across the fleet, NIC types, and VMs whose devices differ from the rest of their environment |
 | `find_vms_by_device` | VMs that have, or lack, a device category (`sound`, `usb`, `ethernet`, ...) or kind (`Vmxnet3`, `HdAudioCard`) |
 | `find_vms_by_snapshot` | VMs with snapshots, largest first: delta and memory-state size, oldest age, redo-chain depth, consolidation needed; rolled up per template |
-| `find_resource_limits` | VMs with a CPU or memory limit or reservation, tightest limit first, templates marked (linked clones inherit a template's limit), and VMs in a resource pool or vApp that carries a limit, with the pool named |
+| `find_resource_limits` | VMs with a CPU or memory limit or reservation, tightest limit first, templates marked (linked clones inherit a template's limit), and VMs in a resource pool or vApp running at 85% or more of a limit set on it, with the pool named |
 | `check_datastores` | each datastore's free space, thin over-provisioning ratio and per-host reachability (APD/PDL); datastores holding a template's base disk are marked |
 | `check_host_time` | each host's NTP configuration and clock skew from vCenter |
 

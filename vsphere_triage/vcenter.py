@@ -967,8 +967,20 @@ class VCenterSession:
             headers={"Cookie": session_cookie(self._stub.cookie), **(headers or {})},
         )
 
-    def read_datastore_file(self, datacenter: str, path: str, max_bytes: int) -> DatastoreFile:
-        """The end of a datastore file, at most `max_bytes` of it, over HTTPS GET."""
+    def read_datastore_file(  # noqa: C901 - one bounded tail read, each response shape beside it
+        self,
+        datacenter: str,
+        path: str,
+        max_bytes: int,
+        *,
+        timeout_seconds: float | None = None,
+        ceiling: int | None = None,
+    ) -> DatastoreFile:
+        """The end of a datastore file, at most `max_bytes` of it, over HTTPS GET.
+
+        `timeout_seconds` bounds each wait on the network for this read, and
+        `ceiling` how much a vCenter that ignores Range may stream before giving up.
+        """
         datastore, inside = parse_datastore_path(path)
         # Ask for only the last `max_bytes` with a suffix Range. A vCenter that
         # honors it answers 206 with the tail; one that ignores it answers 200
@@ -985,7 +997,10 @@ class VCenterSession:
         kept = 0
         total = 0
         capped = False
-        ceiling = max(self.settings.max_download_bytes, max_bytes)
+        if ceiling is None:
+            ceiling = max(self.settings.max_download_bytes, max_bytes)
+        if timeout_seconds is not None:
+            request.extensions["timeout"] = httpx.Timeout(timeout_seconds).as_dict()
         response = self._http.send(request, stream=True)
         try:
             if response.is_redirect:

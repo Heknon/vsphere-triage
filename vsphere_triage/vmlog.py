@@ -57,9 +57,11 @@ STAGES: tuple[tuple[str, str, re.Pattern[str]], ...] = (
         "power_on_or_reset",
         "the VM was powered on or reset",
         re.compile(
+            # The VM's own power-on or reset only: device-level lines ("sata0:0: Reset
+            # request", "PVSCSI: Bus reset") must not start a boot, or a hung VM whose
+            # controller resets reads as freshly booting.
             r"(?i)(powering on|transitioned vmx/execstate/val to poweredon|vmx_poweron|"
-            r"resetting (the )?(vm|virtual machine)|guest[- ]initiated reset|reset request|"
-            r"vmx_reset|soft reset|requested a reset|vmautomation_reset|"
+            r"vmautomation_reset|^guest[- ]initiated reset|"
             # A guest reboot or a vCenter reset continues the same log: the chipset
             # line, and the boot CPU's reset (each vCPU logs one; vcpu-0 is the boot CPU).
             r"requested that the virtual machine be (hard )?reset|^cpu reset: (soft|hard))"

@@ -144,7 +144,7 @@ async def find_resource_limits(
     # throttle; then memory limits below RAM, tightest first; then reservations.
     matched.sort(
         key=lambda row: (
-            row["cpu_limit_mhz"] is None,
+            row["cpu_limit_mhz"] is None and row.get("pool_cpu_limit_mhz") is None,
             row["cpu_limit_mhz"] or 0,
             not _memory_capped(row),
             row["memory_limit_mb"] or 0,
@@ -195,7 +195,8 @@ async def find_resource_limits(
                 "memory_reservation_mb": row["memory_reservation_mb"],
                 "pool_cpu_limit_mhz": row.get("pool_cpu_limit_mhz"),
                 "pool_memory_limit_mb": row.get("pool_memory_limit_mb"),
-                "pool_limit_set_on": row.get("pool_cpu_limit_set_on") or row.get("pool_memory_limit_set_on"),
+                "pool_cpu_limit_set_on": row.get("pool_cpu_limit_set_on"),
+                "pool_memory_limit_set_on": row.get("pool_memory_limit_set_on"),
                 "problems": reasons[id(row)],
             }
             for row in matched[:limit]
@@ -204,6 +205,7 @@ async def find_resource_limits(
         "errors": errors,
         "note": (
             "a CPU limit (MHz) throttles the VM and mimics host starvation; a memory limit forces "
-            "balloon/swap; reservations lock capacity. -1/0 (unlimited/none) are omitted"
+            "balloon/swap; reservations lock capacity. -1/0 (unlimited/none) are omitted. A resource "
+            "pool's limit is listed only while the pool uses 85% of it or more"
         ),
     }

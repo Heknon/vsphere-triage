@@ -565,7 +565,7 @@ def _register_fleet_tools(  # noqa: C901, PLR0915 - one closure per tool
                         "target": getattr(info, "entityName", None),
                         "state": str(getattr(info, "state", "")),
                         "time": getattr(info, "queueTime", None),
-                        "user": getattr(reason, "userName", None),
+                        "user": _task_started_by(reason),
                         "error": (getattr(error, "msg", None) or type(error).__name__) if error else None,
                     }
                 )
@@ -2058,6 +2058,17 @@ def _register_powerflex_tools(  # noqa: C901, PLR0915 - one closure per tool
             ],
             "match_count": len(matches),
         }
+
+
+def _task_started_by(reason: Any) -> str | None:
+    """Who or what started a task: a user, or the alarm, schedule or system behind it."""
+    if reason is None:
+        return None
+    if getattr(reason, "userName", None):
+        return reason.userName
+    kind = type(reason).__name__.rsplit(".", 1)[-1].removeprefix("TaskReason").lower()
+    detail = getattr(reason, "alarmName", None) or getattr(reason, "name", None)
+    return f"{kind}: {detail}" if detail else kind
 
 
 def _read_host_sensors(session: VCenterSession, host_moref: str) -> list[dict[str, Any]]:

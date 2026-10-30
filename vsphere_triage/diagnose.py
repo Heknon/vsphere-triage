@@ -368,8 +368,23 @@ def vm_folder(row: dict[str, Any], vm: VmFacts) -> str | None:
 LOG_REBOOT_BYTES = 512 * 1024
 
 
+# Sensor kinds whose failure slows the VMs on a host (throttling, memory errors).
+_SLOWING_SENSORS = ("temperature", "temp", "processor", "cpu", "memory")
+
+
+def _slows_vms(sensor: dict[str, Any]) -> bool:
+    """Whether a failing sensor is of a kind that slows the host's VMs."""
+    text = f"{sensor.get('type') or ''} {sensor.get('name') or ''}".lower()
+    return any(kind in text for kind in _SLOWING_SENSORS)
+
+
 def boot_from_vmware_log(
-    session: VCenterSession, vm: VmFacts, row: dict[str, Any], max_bytes: int = LOG_REBOOT_BYTES
+    session: VCenterSession,
+    vm: VmFacts,
+    row: dict[str, Any],
+    max_bytes: int = LOG_REBOOT_BYTES,
+    *,
+    timeout_seconds: float | None = None,
 ) -> datetime | None:
     """When the last boot in the VM's `vmware.log` began, or None if it cannot be read.
 
@@ -380,7 +395,9 @@ def boot_from_vmware_log(
     datacenter = vm.datacenter_path or vm.datacenter
     if folder is None or datacenter is None:
         return None
-    found = session.read_datastore_file(datacenter, f"{folder}/vmware.log", max_bytes)
+    found = session.read_datastore_file(
+        datacenter, f"{folder}/vmware.log", max_bytes, timeout_seconds=timeout_seconds, ceiling=max_bytes * 4
+    )
     if found.status != 200:  # noqa: PLR2004
         return None
     timeline = boot_timeline(parse_lines(found.text))
@@ -677,14 +694,14 @@ def conclude(  # noqa: C901, PLR0912, PLR0913, PLR0915 - one ordered list of cau
     if HOST_NOT_CONNECTED in verdict.flags:
         evidence(HOST_DISCONNECTED, weight=3, text="vCenter reports the host not connected")
     hardware = host_hardware or {}
-    if hardware.get("red"):
-        # A red sensor (a power supply, a temperature, a DIMM) can throttle or stall
-        # every VM on the host while its CPU and memory numbers look normal.
-        names = ", ".join(sorted({str(sensor.get("name")) for sensor in hardware["red"]})[:5])
-        evidence(HOST_HARDWARE, weight=3, text=f"host hardware sensors red: {names}")
-    elif hardware.get("yellow"):
-        names = ", ".join(sorted({str(sensor.get("name")) for sensor in hardware["yellow"]})[:5])
-        evidence(HOST_HARDWARE, weight=1, text=f"host hardware sensors yellow: {names}")
+    red = hardware.get("red") or []
+    if red:
+        # A hot CPU or failing memory throttles or stalls every VM on the host while
+        # its CPU numbers look normal; a lost redundant power supply or fan usually
+        # does not, so it weighs less, under the counter-based causes.
+        slows = [sensor for sensor in red if _slows_vms(sensor)]
+        names = ", ".join(sorted({str(sensor.get("name")) for sensor in slows or red})[:5])
+        evidence(HOST_HARDWARE, weight=2 if slows else 1, text=f"host hardware sensors red: {names}")
     if HEARTBEAT_INTERMITTENT in verdict.flags:
         evidence(TOOLS_FLAPPING_CAUSE, weight=2, text="Tools runs but its heartbeat is intermittent (yellow)")
     if CPU_LIMITED in verdict.flags and verdict.state in (BUSY_NOT_UP, HUNG, BOOTED_NOT_UP):

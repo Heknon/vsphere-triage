@@ -13,7 +13,7 @@ the fact, for the reader to see, rather than smoothed over.
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-from datetime import datetime
+from datetime import datetime, timedelta
 from typing import TYPE_CHECKING, Any
 
 from pyVmomi import vim
@@ -119,6 +119,8 @@ HOST_TIME_PATHS = (
     "config.dateTimeInfo.ntpConfig.server",
     # ESXi 7.0U3 and later: "ntp" or "ptp". An older host rejects it, which drops it.
     "config.dateTimeInfo.systemClockProtocol",
+    # A PTP host that lost its PTP source and fell back to NTP.
+    "config.dateTimeInfo.inFallbackState",
     "config.service.service",
     "configManager.dateTimeSystem",
 )
@@ -800,14 +802,37 @@ RESOURCE_POLICY_PATHS = (
 )
 
 
-POOL_LIMIT_PATHS = ("name", "parent", "config.cpuAllocation.limit", "config.memoryAllocation.limit")
+POOL_LIMIT_PATHS = (
+    "name",
+    "parent",
+    "config.cpuAllocation.limit",
+    "config.memoryAllocation.limit",
+    "runtime.cpu.overallUsage",
+    "runtime.memory.overallUsage",
+)
+# A pool using this share of its limit or more is running into it.
+POOL_NEAR_LIMIT = 0.85
+
+
+def _pool_limit_in_play(limit: int | None, usage: float | None) -> int | None:
+    """The limit, unless the pool is plainly well under it (usage read and below POOL_NEAR_LIMIT).
+
+    Tenant pools (vCloud Director, Tanzu namespaces) always carry a limit; one the
+    pool is nowhere near throttles nothing, and listing it would list every VM.
+    """
+    if limit is None or limit == 0:
+        return limit
+    if usage is not None and usage < POOL_NEAR_LIMIT * limit:
+        return None
+    return limit
 
 
 def pool_limits(session: VCenterSession) -> dict[str, dict[str, Any]]:
     """Every resource pool and vApp with its own CPU and memory limit, by moref.
 
     A cluster's root pool is left out: its allocation is the cluster's capacity,
-    not a limit anyone set. It is the pool whose parent is not a pool.
+    not a limit anyone set. It is the pool whose parent is not a pool. A limit the
+    pool is well under is left out too: it throttles nothing now.
     """
     rows = session.retrieve(vim.ResourcePool, POOL_LIMIT_PATHS)
     pools = {}
@@ -817,8 +842,16 @@ def pool_limits(session: VCenterSession) -> dict[str, dict[str, Any]]:
             "name": row.get("name", row["moref"]),
             "parent": parent._moId if isinstance(parent, vim.ResourcePool) else None,  # noqa: SLF001
             "root": not isinstance(parent, vim.ResourcePool),
-            "cpu_limit": _limit(row.get("config.cpuAllocation.limit")),
-            "memory_limit": _limit(row.get("config.memoryAllocation.limit")),
+            "cpu_limit": _pool_limit_in_play(
+                _limit(row.get("config.cpuAllocation.limit")), _number(row.get("runtime.cpu.overallUsage"))
+            ),
+            # Memory usage is in bytes, its limit in MB.
+            "memory_limit": _pool_limit_in_play(
+                _limit(row.get("config.memoryAllocation.limit")),
+                (used / 1024**2)
+                if (used := _number(row.get("runtime.memory.overallUsage"))) is not None
+                else None,
+            ),
         }
     return pools
 
@@ -963,6 +996,8 @@ def read_host_time(session: VCenterSession) -> list[dict[str, Any]]:
         services = row.get("config.service.service") or []
         protocol = row.get("config.dateTimeInfo.systemClockProtocol")
         # The service of the protocol in use: a PTP host's ntpd is off by design.
+        if protocol == "ptp" and row.get("config.dateTimeInfo.inFallbackState"):
+            protocol = "ntp (PTP fell back)"
         wanted = ("ptpd",) if protocol == "ptp" else TIME_SERVICE_KEYS
         time_service = next(
             (service for service in services if getattr(service, "key", None) in wanted), None
@@ -1300,6 +1335,25 @@ def vm_facts(  # noqa: C901, PLR0912, PLR0913, PLR0915 - one flattening of one r
     return facts
 
 
+# A log boot this close to the power-on is that power-on, not a later reboot.
+LOG_BOOT_AFTER_POWER_ON = timedelta(seconds=60)
+# How far ahead of vCenter a host's clock may run before its log time is not trusted.
+LOG_CLOCK_SLACK = timedelta(minutes=2)
+
+
+def _plausible_log_boot(facts: VmFacts, read_at: datetime, log_boot: datetime | None) -> datetime | None:
+    """`log_boot` when it is a reboot after the power-on, by a host clock that agrees with vCenter's."""
+    if log_boot is None:
+        return None
+    when = as_utc(log_boot)
+    if facts.power_on_time is not None and when <= facts.power_on_time + LOG_BOOT_AFTER_POWER_ON:
+        return None
+    if when > read_at + LOG_CLOCK_SLACK:
+        # The host's clock runs ahead: the time cannot be placed against vCenter's.
+        return None
+    return min(when, read_at)
+
+
 def set_effective_boot(
     facts: VmFacts,
     read_at: datetime,
@@ -1318,10 +1372,13 @@ def set_effective_boot(
     `diagnose_vm` once it has fetched
     the events, so a scan's power-on estimate is refined to the real reboot.
     `log_boot` is the last power-on or reset in the VM's `vmware.log`, the one
-    record of a reboot started inside the guest, which logs no vCenter event.
+    record of a reboot started inside the guest, which logs no vCenter event. It
+    is used only when it is clearly after the power-on and the host's clock is
+    not running ahead, and never over a reboot time the caller gave.
     """
     reported = as_utc(rebooted_at) if rebooted_at is not None else None
     event_reboot = (reboots or {}).get(facts.moref)
+    log_boot = _plausible_log_boot(facts, read_at, log_boot) if reported is None else None
     candidates = [
         (when, source)
         for when, source in (
