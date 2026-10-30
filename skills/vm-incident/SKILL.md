@@ -187,9 +187,11 @@ them into the verdict in plain words:
   read (the Windows event log, the BCD, dmesg); ask for `VSPHERE_GUEST_*` or a
   reboot to bring Tools back.
 - **PowerFlex not configured** → a PowerFlex-backed datastore can read as slow
-  in vSphere while the real cause (a rebuild after a failed drive/node) is only
-  visible in the backend; `check_datastores` names this gap. Ask for
-  `VSPHERE_POWERFLEX_*`, then read `powerflex_health`.
+  in vSphere while the real cause is only visible in the backend; `check_datastores`
+  names this gap. Ask for `VSPHERE_POWERFLEX_*`, then read `powerflex_health`
+  (failure/rebuild) and `powerflex_protection_domains` (a hot PD carrying a
+  disproportionate share of IOPS — the busy-PD pattern); map the slow datastore
+  to its volume with `powerflex_find_volume` and confirm which PD it is on.
 
 The honest sentence is: *there is something better I could use, but it has not
 been given to me — here is what, and here is how.*

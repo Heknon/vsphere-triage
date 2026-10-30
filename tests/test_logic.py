@@ -1689,3 +1689,39 @@ def test_vmci_device_surfaces_its_config_and_flags_unrestricted() -> None:
     assert described[0]["category"] == "vmci"
     assert described[0]["allow_unrestricted_communication"] is True
     assert any("unrestricted" in finding for finding in findings)
+
+
+def test_powerflex_bwc_rate_and_traffic_prefers_user_data() -> None:
+    assert powerflex.bwc_rate({"numOccured": 600, "numSeconds": 10, "totalWeightInKb": 20000}) == {
+        "iops": 60.0,
+        "kb_per_s": 2000.0,
+    }
+    assert powerflex.bwc_rate({"numSeconds": 0}) == {"iops": 0.0, "kb_per_s": 0.0}
+    stats = {
+        "userDataReadBwc": {"numOccured": 100, "numSeconds": 10, "totalWeightInKb": 4000},
+        "userDataWriteBwc": {"numOccured": 50, "numSeconds": 10, "totalWeightInKb": 2000},
+        "totalReadBwc": {"numOccured": 9999, "numSeconds": 10, "totalWeightInKb": 9999},
+    }
+    traffic = powerflex.traffic_of(stats)
+    assert traffic["read_iops"] == 10.0  # userData wins over totalReadBwc
+    assert traffic["total_iops"] == 15.0
+
+
+def test_powerflex_ranks_a_hot_protection_domain() -> None:
+    rows = [
+        {"name": "pd-busy", "id": "1", "state": "Active", "traffic": {"total_iops": 800.0}},
+        {"name": "pd-quiet", "id": "2", "state": "Active", "traffic": {"total_iops": 200.0}},
+    ]
+    ranked = powerflex.rank_protection_domains(rows)
+    assert ranked["ranked"][0]["name"] == "pd-busy"
+    assert ranked["total_iops"] == 1000.0
+    assert any("hot protection domain" in finding for finding in ranked["findings"])
+
+
+def test_powerflex_even_traffic_names_no_hotspot() -> None:
+    rows = [
+        {"name": "pd-a", "id": "1", "state": "Active", "traffic": {"total_iops": 300.0}},
+        {"name": "pd-b", "id": "2", "state": "Active", "traffic": {"total_iops": 300.0}},
+    ]
+    ranked = powerflex.rank_protection_domains(rows)
+    assert any("none dominates" in finding for finding in ranked["findings"])

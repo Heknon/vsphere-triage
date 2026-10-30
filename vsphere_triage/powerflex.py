@@ -58,6 +58,76 @@ def volume_id_from_naa(naa: str | None) -> str | None:
     return hexrun[-1][-16:].lower() if hexrun else None
 
 
+# The read/write bandwidth counters a PowerFlex statistics object may carry, in
+# order of preference — the first present one is used (summing would double-count
+# user vs primary/secondary). Each is a "Bwc": {numOccured, numSeconds,
+# totalWeightInKb}, from which IOPS and KB/s over the sample window are derived.
+_READ_BWC = ("userDataReadBwc", "totalReadBwc", "primaryReadBwc")
+_WRITE_BWC = ("userDataWriteBwc", "totalWriteBwc", "primaryWriteBwc")
+
+
+def bwc_rate(bwc: Any) -> dict[str, float]:
+    """IOPS and KB/s from a PowerFlex bandwidth counter, or zeros when it is empty."""
+    if not isinstance(bwc, dict):
+        return {"iops": 0.0, "kb_per_s": 0.0}
+    seconds = bwc.get("numSeconds") or 0
+    if seconds <= 0:
+        return {"iops": 0.0, "kb_per_s": 0.0}
+    return {
+        "iops": round((bwc.get("numOccured") or 0) / seconds, 2),
+        "kb_per_s": round((bwc.get("totalWeightInKb") or 0) / seconds, 2),
+    }
+
+
+def _first_present(stats: dict[str, Any], keys: tuple[str, ...]) -> Any:
+    """The first of `keys` present in `stats` as a counter dict, or {}."""
+    for key in keys:
+        if isinstance(stats.get(key), dict):
+            return stats[key]
+    return {}
+
+
+def traffic_of(stats: dict[str, Any]) -> dict[str, float]:
+    """Read/write IOPS and throughput from a statistics object (PD, pool, volume, …)."""
+    read = bwc_rate(_first_present(stats, _READ_BWC))
+    write = bwc_rate(_first_present(stats, _WRITE_BWC))
+    return {
+        "read_iops": read["iops"],
+        "write_iops": write["iops"],
+        "read_kb_per_s": read["kb_per_s"],
+        "write_kb_per_s": write["kb_per_s"],
+        "total_iops": round(read["iops"] + write["iops"], 2),
+        "total_kb_per_s": round(read["kb_per_s"] + write["kb_per_s"], 2),
+    }
+
+
+def rank_protection_domains(rows: list[dict[str, Any]]) -> dict[str, Any]:
+    """Protection domains sorted by traffic, flagging one that carries a hot share.
+
+    `rows`: {name, id, state, traffic} where traffic is from `traffic_of`. A PD
+    carrying more than half of the backend's IOPS is called out — the hotspot
+    whose datastores and volumes feel load first, the pattern behind "this PD
+    gets more traffic than the others".
+    """
+    ranked = sorted(rows, key=lambda row: row["traffic"]["total_iops"], reverse=True)
+    total = round(sum(row["traffic"]["total_iops"] for row in ranked), 2)
+    findings = []
+    if ranked and total > 0 and len(ranked) > 1:
+        top = ranked[0]
+        share = top["traffic"]["total_iops"] / total
+        if share > 0.5:  # noqa: PLR2004 - more than half of all backend IOPS on one PD is "hot"
+            findings.append(
+                f"{top['name']} carries {share:.0%} of backend IOPS ({top['traffic']['total_iops']} IOPS) — "
+                "a hot protection domain; the datastores and volumes on it feel load first. Map a slow "
+                "datastore to its volume (powerflex_find_volume) and check it is on this PD"
+            )
+    return {
+        "ranked": ranked,
+        "total_iops": total,
+        "findings": findings or ["traffic is spread across protection domains; none dominates"],
+    }
+
+
 def summarize_health(
     sds: list[dict[str, Any]], devices: list[dict[str, Any]], system_stats: dict[str, Any]
 ) -> dict[str, Any]:
@@ -180,6 +250,14 @@ class PowerFlex:
     async def system_statistics(self, system_id: str) -> dict[str, Any]:
         """One system's statistics, where the rebuild/rebalance pending capacity lives."""
         return await self._get(f"/instances/System::{system_id}/relationships/Statistics")
+
+    async def protection_domains(self) -> list[dict[str, Any]]:
+        """Every protection domain (the traffic/fault boundary) and its state."""
+        return await self._get("/types/ProtectionDomain/instances")
+
+    async def protection_domain_statistics(self, domain_id: str) -> dict[str, Any]:
+        """One protection domain's statistics, including its read/write bandwidth counters."""
+        return await self._get(f"/instances/ProtectionDomain::{domain_id}/relationships/Statistics")
 
     async def volumes(self) -> list[dict[str, Any]]:
         """Every volume (id, name, size), for mapping a datastore to its backend volume."""

@@ -211,6 +211,7 @@ internal index.
 | `investigate_windows_boot` | **not read-only** (reads the guest) — the Windows boot picture from the guest's own event log: last bugcheck (WER 1001, decoded), unclean shutdowns, service/driver timeouts, slow-boot components, crash dumps and repair/update logs |
 | `investigate_linux_boot` | **not read-only** (reads the guest) — the Linux boot picture: dmesg (panics, soft-lockups, hung tasks, device timeouts, filesystem errors), systemd-analyze blame/critical-chain, journalctl -b, mapped to the layer each points at |
 | `powerflex_health` | **optional** (PowerFlex configured) — Dell PowerFlex backend health: SDS/device state and any rebuild/rebalance in progress, the usual cause of a PowerFlex-backed datastore going slow |
+| `powerflex_protection_domains` | **optional** — protection domains ranked by traffic (read/write IOPS + throughput), flagging a hot PD carrying a disproportionate share — the busy-PD pattern behind datastores on it going slow |
 | `powerflex_find_volume` | **optional** — map a slow datastore to its PowerFlex volume by name, id, or ESXi device id (naa/eui) |
 | `get_boot_timeline` | how far the last boot got, from `vmware.log`, plus the serial console |
 | `read_vm_log` | `vmware.log` / `vmware-N.log` lines, filtered on the server |

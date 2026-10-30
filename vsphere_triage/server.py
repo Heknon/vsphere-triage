@@ -1697,6 +1697,33 @@ def _register_powerflex_tools(tool: Callable[..., Any], client: powerflex.PowerF
             "systems": [{"id": system.get("id"), "name": system.get("name")} for system in systems],
         } | powerflex.summarize_health(sds, devices, stats)
 
+    @tool("powerflex_protection_domains")
+    async def powerflex_protection_domains() -> dict[str, Any]:
+        """PowerFlex protection domains ranked by traffic — find the hot one.
+
+        A protection domain carrying a disproportionate share of backend IOPS is
+        the hotspot whose datastores and volumes feel load first. Run this when a
+        PowerFlex-backed datastore is slow and you suspect a busy PD rather than a
+        failure: it reads each PD's read/write bandwidth counters, derives IOPS
+        and throughput, and flags a PD at half or more of the total. Then map the
+        slow datastore to its volume (powerflex_find_volume) and confirm it lives
+        on that PD.
+        """
+        domains = await client.protection_domains()
+        rows = []
+        for domain in domains:
+            identifier = domain.get("id")
+            stats = await client.protection_domain_statistics(identifier) if identifier else {}
+            rows.append(
+                {
+                    "name": domain.get("name") or identifier,
+                    "id": identifier,
+                    "state": domain.get("protectionDomainState"),
+                    "traffic": powerflex.traffic_of(stats if isinstance(stats, dict) else {}),
+                }
+            )
+        return powerflex.rank_protection_domains(rows)
+
     @tool("powerflex_find_volume")
     async def powerflex_find_volume(*, query: str) -> dict[str, Any]:
         """Find a PowerFlex volume by name, id, or an ESXi device id (naa.*/eui.*).
