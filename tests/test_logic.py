@@ -351,6 +351,7 @@ def test_serial_output_without_ems_or_errors_is_plain() -> None:
         "windows_stop_codes": [],
         "stop_codes_scoped_to_current_boot": False,
         "linux_findings": [],
+        "linux_findings_scoped_to_current_boot": False,
         "tail": ["world"],
     }
 
@@ -1472,3 +1473,133 @@ def test_guest_exec_can_be_left_out_of_the_server() -> None:
     assert "run_in_guest" in with_exec
     assert "run_in_guest" not in without
     assert with_exec - without == {"run_in_guest"}
+
+
+# -- conclusions that used to point the wrong way ----------------------------------------------
+
+
+def _conclude_on(machine: VmFacts, **parts: dict) -> dict:
+    defaults: dict[str, dict] = {
+        "cpu": {"findings": [], "starved": False},
+        "disk": {"findings": [], "slow": False, "datastores": []},
+        "environment": {"signals": []},
+        "logs": {"available": False},
+        "serial": {"available": False},
+        "console": {"available": False},
+        "host_log": {"available": False},
+    }
+    defaults.update(parts)
+    return diagnose.conclude(checks.classify(machine, LIMITS), vm=machine, **defaults)
+
+
+def test_a_hung_vm_frozen_on_starting_windows_is_not_still_working() -> None:
+    hung = vm(cpu_mhz=10.0, uptime_minutes=40.0)
+    console_read = {
+        "available": True,
+        "frozen": True,
+        "black": False,
+        "screen_states": [{"state": "windows_starting", "meaning": "Starting Windows"}],
+        "stop_codes": [],
+    }
+
+    result = _conclude_on(hung, console=console_read)
+
+    assert checks.classify(hung, LIMITS).state == checks.HUNG
+    assert result["causes"][0]["cause"] == diagnose.EARLY_HANG
+    still = [entry for entry in result["causes"] if entry["cause"] == diagnose.STILL_WORKING]
+    assert not still  # argued down to zero or below
+
+
+def test_an_unknown_host_capacity_is_not_evidence_against_cpu() -> None:
+    host = contention.host_cpu_from_series(
+        _host(core_mhz=None), {"cpu.demand.average": _series("cpu.demand.average", 99999)}, LIMITS
+    )
+
+    assert host["overcommitted"] is None
+    result = conclude(cpu={"findings": [], "starved": False, "host": host})
+    ranked = [*result["causes"], *result["argued_against"]]
+    cpu = [entry for entry in ranked if entry["cause"] == diagnose.CPU]
+    assert not cpu or not any("None%" in text for text in cpu[0]["against"])
+
+
+def test_a_full_datastore_is_its_own_cause_not_latency() -> None:
+    disk = {
+        "findings": ["datastore ds-1 is nearly full (2.0% free)"],
+        "capacity_findings": ["datastore ds-1 is nearly full (2.0% free)"],
+        "slow": False,
+        "datastores": [],
+    }
+
+    result = conclude(disk=disk)
+
+    names = [entry["cause"] for entry in result["causes"]]
+    assert diagnose.DATASTORE_CAPACITY in names
+    assert diagnose.STORAGE not in names
+
+
+def test_counters_read_but_empty_for_the_window_are_a_gap() -> None:
+    result = conclude(
+        cpu={"findings": [], "starved": False, "window_read": False},
+        disk={"findings": [], "slow": False, "datastores": [], "window_read": False},
+    )
+
+    gaps = " ".join(result["not_checked"])
+    assert "CPU counters (no samples" in gaps
+    assert "storage counters (no samples" in gaps
+
+
+def test_an_earlier_boots_kernel_panic_is_not_this_boots() -> None:
+    text = (
+        "[    0.000000] Linux version 5.14.0 (old boot)\n"
+        "Kernel panic - not syncing: VFS: Unable to mount root fs\n"
+        "[    0.000000] Linux version 5.14.0 (this boot)\n"
+        "host login:\n"
+    )
+
+    result = vmlog.read_serial(text, tail_lines=5)
+
+    assert result["linux_findings"] == []
+    assert result["linux_findings_scoped_to_current_boot"] is True
+
+
+def test_the_esxi_tools_running_status_lines_are_read() -> None:
+    up = "2026-10-29T02:00:00.000Z In(05) vcpu-0 - Tools: Changing running status: 0 => 1."
+    down = "2026-10-29T02:05:00.000Z In(05) vcpu-0 - Tools: Changing running status: 1 => 0."
+    lines = vmlog.parse_lines(
+        "2026-10-29T01:59:00.000Z In(05) vmx - Powering on the VM\n" + up + "\n" + down + "\n"
+    )
+
+    timeline = vmlog.boot_timeline(lines)
+
+    assert timeline["last_stage"] == "tools"
+    assert timeline["annotations"]["tools_state"]["count"] == 1
+
+
+class _WindowPool:
+    def __init__(self, result: dict) -> None:
+        self.result = result
+
+    async def run(self, _name: str, _work: object) -> dict:
+        return self.result
+
+
+def test_a_window_with_resets_never_opens_with_nothing_found() -> None:
+    quiet_but_reset = {
+        "events_read": 50,
+        "events_capped": False,
+        "events_by_type": {"VmResettingEvent": 50},
+        "events_by_host": {"esx-1": 50},
+        "vms_with_most_events": {},
+        "hosts_over_cpu_threshold": [],
+        "cpu_counters_unavailable": [],
+        "cpu_window_read": True,
+        "storage_window_read": True,
+        "storage": {"findings": []},
+    }
+
+    pool = _WindowPool(quiet_but_reset)
+    begin = NOW - timedelta(hours=1)
+    result = asyncio.run(scan.diagnose_window(pool, Settings(), ["vc-a"], begin, NOW))  # type: ignore[arg-type]
+
+    assert not result["findings"][0].startswith("no resets")
+    assert "50 resets" in result["findings"][0]

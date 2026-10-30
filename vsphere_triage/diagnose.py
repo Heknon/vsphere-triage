@@ -22,10 +22,9 @@ from collections import Counter
 from datetime import datetime, timedelta
 from typing import TYPE_CHECKING, Any
 
-from pyVmomi import vim
+from pyVmomi import vim, vmodl
 
 from vsphere_triage.checks import (
-    ABNORMAL,
     BLOCKED_ON_QUESTION,
     BOOTED_NOT_UP,
     BUSY_NOT_UP,
@@ -93,6 +92,7 @@ CPU_LIMIT_CAUSE = "throttled by a configured CPU limit (not host starvation)"
 MEMORY_LIMIT_CAUSE = "a configured memory limit is forcing reclamation"
 PAUSED_CAUSE = "the VM is paused"
 MEMORY = "memory pressure (the host ballooning or swapping the VM)"
+DATASTORE_CAPACITY = "its datastore is full or unreachable (APD/PDL)"
 HOST_DISCONNECTED = "its ESXi host is not connected to vCenter"
 
 DIAGNOSE_PATHS = (
@@ -593,8 +593,12 @@ def conclude(  # noqa: C901, PLR0912, PLR0913, PLR0915 - one ordered list of cau
                 f"{host['peak_percent_of_capacity']}% of capacity",
             )
     if disk.get("available", True):
+        capacity_findings = disk.get("capacity_findings", [])
         for text in disk.get("findings", []):
-            evidence(STORAGE, weight=2, text=text)
+            if text in capacity_findings:
+                evidence(DATASTORE_CAPACITY, weight=3, text=text)
+            else:
+                evidence(STORAGE, weight=2, text=text)
         if not disk.get("slow") and any(
             entry.get("matched_instance") for entry in disk.get("datastores", [])
         ):
@@ -664,6 +668,10 @@ def conclude(  # noqa: C901, PLR0912, PLR0913, PLR0915 - one ordered list of cau
                 evidence(TOOLS_DID_NOT_START, weight=4, text=f"console: {state['meaning']}")
         if console.get("frozen") and console.get("black"):
             evidence(EARLY_HANG, weight=2, text="console black and unchanged across captures")
+        elif console.get("frozen"):
+            # A boot screen that does not move is not a boot that is progressing.
+            evidence(STILL_WORKING, weight=2, against=True, text="the console did not change across captures")
+            evidence(EARLY_HANG, weight=1, text="the console screen is unchanged across captures")
         if console.get("frozen") is False:
             evidence(EARLY_HANG, weight=2, against=True, text="the console changed between captures")
             evidence(STILL_WORKING, weight=1, text="the console changed between captures")
@@ -679,6 +687,8 @@ def conclude(  # noqa: C901, PLR0912, PLR0913, PLR0915 - one ordered list of cau
                 weight=1,
                 text=f"vmware.log: the boot got as far as {last}, then nothing further was logged",
             )
+        elif last in ("guest_drivers", "tools"):
+            evidence(EARLY_HANG, weight=1, against=True, text=f"vmware.log: the boot reached {last}")
         if timeline.get("annotations", {}).get("fault"):
             evidence(VM_FAULT, weight=3, text="vmware.log reports a fault during boot")
         if timeline.get("annotations", {}).get("storage"):
@@ -694,6 +704,7 @@ def conclude(  # noqa: C901, PLR0912, PLR0913, PLR0915 - one ordered list of cau
     if verdict.state == HUNG:
         evidence(EARLY_HANG, weight=1, text=verdict.reasons[-1])
         evidence(CPU, weight=1, against=True, text="the VM uses almost no CPU")
+        evidence(STILL_WORKING, weight=1, against=True, text="the VM uses almost no CPU")
     if verdict.state == BUSY_NOT_UP:
         evidence(STILL_WORKING, weight=1, text=verdict.reasons[-1])
 
@@ -722,6 +733,12 @@ def conclude(  # noqa: C901, PLR0912, PLR0913, PLR0915 - one ordered list of cau
         )
         if not part.get("available", True)
     ]
+    # Read, but empty: a window vCenter no longer keeps at this resolution.
+    not_checked.extend(
+        f"{name} (no samples for the window: rolled up, or below the statistics level)"
+        for name, part in (("CPU counters", cpu), ("storage counters", disk))
+        if part.get("available", True) and part.get("window_read") is False
+    )
     headline = (
         f"likely cause: {likely[0]['cause']} ({likely[0]['confidence']} confidence)"
         if likely
@@ -754,6 +771,10 @@ def next_checks(conclusion: dict[str, Any], vm: VmFacts) -> list[str]:
         steps.append("vROps: the host's or cluster's CPU demand over the past days at this hour")
     if MEMORY in leading:
         steps.append(f"get_host_health on {vm.host!r}: is the host itself out of memory?")
+    if DATASTORE_CAPACITY in leading:
+        steps.append(
+            "check_datastores: the datastore's fill, thin over-provisioning and per-host reachability"
+        )
     if leading & {STORAGE, BOOT_STORM}:
         steps.append("get_datastore_health on the VM's datastores over a wider window")
         steps.append("PowerFlex (if available): the pool behind the datastore, its IOPS and any rebuild")
@@ -776,16 +797,24 @@ def next_checks(conclusion: dict[str, Any], vm: VmFacts) -> list[str]:
 
 
 def _env_reboots(
-    session: VCenterSession, now: datetime, peers: list[VmFacts], lookback_hours: float
-) -> dict[str, datetime]:
-    """The latest reboot event per VM for a set of peers, in one query over the folder's window."""
+    session: VCenterSession,
+    now: datetime,
+    peers: list[VmFacts],
+    lookback_hours: float,
+    window_minutes: float,
+) -> tuple[dict[str, datetime], dict[str, int]]:
+    """The latest reboot event per VM for a set of peers, and their resets in the boot-loop window.
+
+    One query over the window, so a mass warm reboot does not make every peer
+    look long-stuck and a peer in a boot loop is not counted as healthy.
+    """
     if not peers:
-        return {}
+        return {}, {}
     try:
         events = session.events(begin=now - timedelta(hours=lookback_hours), end=now, types=RESET_EVENTS)
-    except VSphereError:
-        return {}
-    return latest_reboot_by_vm(events)
+    except (VSphereError, vmodl.MethodFault):
+        return {}, {}
+    return latest_reboot_by_vm(events), resets_by_vm(events, window_minutes, now)
 
 
 def diagnose_vm(
@@ -838,13 +867,20 @@ def diagnose_vm(
         siblings = read_vms(session, layout, root=session.reference("Folder", vm.folder_moref))
         # The peers were read without reboot events; a mass reboot would make
         # them all look long-stuck. Refine each from its own reset/reboot event.
-        peer_reboots = _env_reboots(session, now, [peer for peer, _ in siblings], lookback)
+        peer_reboots, peer_resets = _env_reboots(
+            session, now, [peer for peer, _ in siblings], lookback, thresholds.boot_loop_window_minutes
+        )
         peers = []
         for peer, _ in siblings:
             if peer.folder_moref != vm.folder_moref:
                 continue
+            if peer.moref == vm.moref:
+                # The VM itself, already judged with its own events and rebooted_at.
+                peers.append((vm, verdict))
+                continue
             set_effective_boot(peer, now, reboots=peer_reboots)
-            peers.append((peer, classify(peer, thresholds)))
+            resets_seen = peer_resets.get(peer.moref, 0)
+            peers.append((peer, classify(peer, thresholds, resets_in_window=resets_seen)))
     environment = environment_pattern(vm, peers) if peers else {"vms": 0, "findings": []}
     cpu = piece("CPU", lambda: vm_cpu(session, vm, host, begin=begin, end=end, thresholds=thresholds))
     stores = [layout.datastores[m] for m in vm.datastore_morefs if m in layout.datastores]
@@ -944,7 +980,13 @@ def diagnose_environment(session: VCenterSession, settings: Settings, *, env_id:
     thresholds = settings.thresholds
     vms = [vm for vm, _ in read_vms(session, layout, root=session.reference("Folder", folder.moref))]
     now = session.now()
-    verdicts = [(vm, classify(vm, thresholds)) for vm in vms]
+    # As in diagnose_vm: a warm reboot does not move bootTime, so measure each VM
+    # from its latest reset or guest-reboot event, and count its boot-loop resets.
+    lookback = min(max(max((vm.age_hours or 0.0) for vm in vms) if vms else 24.0, 1.0), 24.0)
+    reboots, resets = _env_reboots(session, now, vms, lookback, thresholds.boot_loop_window_minutes)
+    for vm in vms:
+        set_effective_boot(vm, now, reboots=reboots)
+    verdicts = [(vm, classify(vm, thresholds, resets_in_window=resets.get(vm.moref, 0))) for vm in vms]
     if not vms:
         return {
             "found": True,
@@ -990,7 +1032,7 @@ def diagnose_environment(session: VCenterSession, settings: Settings, *, env_id:
         for host in over
     )
     findings.extend(disk.get("findings", []))
-    abnormal = [(vm, verdict) for vm, verdict in verdicts if verdict.state in ABNORMAL]
+    abnormal = [(vm, verdict) for vm, verdict in verdicts if verdict.abnormal]
     if not findings:
         findings.append(
             "no abnormal VMs"

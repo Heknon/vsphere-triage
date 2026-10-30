@@ -645,10 +645,15 @@ async def diagnose_window(
                 f"{name}: datastore latency for this window could not be read; "
                 "not evidence of healthy storage"
             )
+    # Anything that went wrong in the window counts, resets and failed power-ons
+    # as much as pressure: the "nothing found" line must never sit above them.
+    trouble = (*RESET_EVENTS, "VmFailedToPowerOnEvent")
     pressure = any(
-        result.get("hosts_over_cpu_threshold") or result.get("storage", {}).get("findings")
+        result.get("hosts_over_cpu_threshold")
+        or result.get("storage", {}).get("findings")
+        or any(result.get("events_by_type", {}).get(kind) for kind in trouble)
         for result in per_vcenter.values()
-        if not isinstance(result, dict) or result.get("available", True)
+        if result.get("available", True)
     )
     if not pressure and all(
         r.get("cpu_window_read") and r.get("storage_window_read")

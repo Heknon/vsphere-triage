@@ -84,7 +84,10 @@ STAGES: tuple[tuple[str, str, re.Pattern[str]], ...] = (
         # guestinfo config dump that a reset also logs, which would otherwise mark
         # a boot that never reached Tools as having reached it.
         re.compile(
+            # Both spellings of the running-status line: "... to 1" and the
+            # ESXi form "Tools: Changing running status: 0 => 1.".
             r"(?i)(tools (are )?running|toolssetversion|tools: changing running status to .?(1|running)|"
+            r"changing running status:\s*\d+\s*=>\s*1\b|"
             r"guest operations agent|vmtoolsd)"
         ),
     ),
@@ -116,7 +119,8 @@ ANNOTATIONS: tuple[tuple[str, re.Pattern[str]], ...] = (
         "tools_state",
         re.compile(
             r"(?i)(tools.*(stopped (working|responding)|has stopped|not running, restarting|crashed)|"
-            r"changing running status to .?0\b|tools heartbeat timeout)"
+            r"changing running status to .?0\b|changing running status:\s*\d+\s*=>\s*0\b|"
+            r"tools heartbeat timeout)"
         ),
     ),
 )
@@ -164,6 +168,8 @@ EMS_MARK = re.compile(
 # occurrence is the current boot — used to keep a stop code from an earlier
 # crash in the same (appended) serial file out of this boot's reading.
 EMS_BOOT_BANNER = re.compile(r"(?i)computer is booting, sac started")
+# The first line a Linux kernel prints on a serial console, once per boot.
+LINUX_BOOT_BANNER = re.compile(r"(?m)^.*\bLinux version \d")
 LINUX_MARKS: tuple[tuple[str, str | None, re.Pattern[str]], ...] = (
     ("kernel_panic", None, re.compile(r"(?i)kernel panic")),
     (
@@ -347,9 +353,13 @@ def read_serial(text: str, *, tail_lines: int) -> dict[str, Any]:
     """What a serial console file says: EMS or kernel output, stop codes, errors."""
     lines = text.splitlines()
     ems = bool(EMS_MARK.search(text))
+    # The same for a Linux console: its kernel banner starts each boot, so an
+    # earlier boot's panic is not this boot's.
+    linux_banners = [match.start() for match in LINUX_BOOT_BANNER.finditer(text)]
+    linux_current = (text[linux_banners[-1] :] if linux_banners else text).splitlines()
     linux = []
     for name, hint, pattern in LINUX_MARKS:
-        hits = [line for line in lines if pattern.search(line)]
+        hits = [line for line in linux_current if pattern.search(line)]
         if hits:
             linux.append({"kind": name, "points_at": hint, "count": len(hits), "examples": hits[:3]})
     # A serial file is appended across reboots, so a stop code earlier in it may
@@ -367,5 +377,6 @@ def read_serial(text: str, *, tail_lines: int) -> dict[str, Any]:
         "windows_stop_codes": codes,
         "stop_codes_scoped_to_current_boot": bool(banners),
         "linux_findings": linux,
+        "linux_findings_scoped_to_current_boot": bool(linux_banners),
         "tail": lines[-tail_lines:],
     }
