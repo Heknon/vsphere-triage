@@ -489,8 +489,11 @@ async def explain_group(  # noqa: C901 - one comparison, then one check per vCen
     inside = [
         (vm, verdict) for vm, verdict in scan.all_vms() if value in values_of(vm) and verdict.state != OFF
     ]
-    members = [vm for vm, verdict in inside if _counts(verdict, STUCK)]
-    healthy = [vm for vm, verdict in inside if not _counts(verdict, STUCK)]
+    # As scan's groups count them; a group from a scan for context flags alone
+    # (long_running) is made of those, so fall back to them.
+    counted = STUCK if any(_counts(verdict, STUCK) for _, verdict in inside) else FLAGGED
+    members = [vm for vm, verdict in inside if _counts(verdict, counted)]
+    healthy = [vm for vm, verdict in inside if not _counts(verdict, counted)]
     if not members:
         return {"found": False, "reason": f"no abnormal VMs on {dimension} {value!r} in scan {scan.id}"}
     comparison = {}

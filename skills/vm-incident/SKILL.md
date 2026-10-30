@@ -145,7 +145,7 @@ the verdict so the next incident has the serial console.
 
 When a better source exists but is not configured or not reachable, say so in
 the verdict: what it is, what it would have shown, and how to enable it.
-`diagnose_vm`, `check_vcenters`, `vcenter_history` and the guest investigations
+`diagnose_vm`, `check_vcenters`, `vcenter_history`, `check_datastores` and the guest investigations
 (`investigate_windows_boot`, `investigate_linux_boot`, `read_crash_dump`) return
 an `evidence_gaps` list to carry over. The common ones:
 

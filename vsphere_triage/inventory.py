@@ -117,6 +117,8 @@ HOST_TIME_PATHS = (
     "name",
     "runtime.connectionState",
     "config.dateTimeInfo.ntpConfig.server",
+    # ESXi 7.0U3 and later: "ntp" or "ptp". An older host rejects it, which drops it.
+    "config.dateTimeInfo.systemClockProtocol",
     "config.service.service",
     "configManager.dateTimeSystem",
 )
@@ -655,11 +657,37 @@ def snapshot_usage(snapshot_info: Any, layoutex: Any, read_at: datetime) -> dict
         "max_chain_depth": max_chain_depth,
         "oldest_age_hours": oldest_age,
         "oldest_name": oldest["name"] if oldest else None,
-        "has_memory_snapshot": state_bytes > 0,
+        "has_memory_snapshot": any(
+            f.type == "snapshotMemory" and f.size for f in (getattr(layoutex, "file", None) or [])
+        ),
         "delta_bytes": delta_bytes,
         "state_bytes": state_bytes,
         "total_bytes": delta_bytes + state_bytes,
         "snapshots": nodes,
+    }
+
+
+def orphaned_delta_usage(layoutex: Any) -> dict[str, Any]:
+    """Usage for a VM with no snapshot tree but delta disks left behind (consolidation needed)."""
+    delta_bytes = 0
+    if layoutex is not None:
+        files = {f.key: f for f in (layoutex.file or [])}
+        for disk in layoutex.disk or []:
+            chain = disk.chain or []
+            for unit in chain[1:]:
+                delta_bytes += sum(files[key].size for key in (unit.fileKey or []) if key in files)
+    return {
+        "count": 0,
+        "max_chain_depth": max((len(disk.chain or []) - 1 for disk in (layoutex.disk or [])), default=0)
+        if layoutex is not None
+        else None,
+        "oldest_age_hours": None,
+        "oldest_name": None,
+        "has_memory_snapshot": False,
+        "delta_bytes": delta_bytes,
+        "state_bytes": 0,
+        "total_bytes": delta_bytes,
+        "snapshots": [],
     }
 
 
@@ -672,7 +700,11 @@ def read_vm_snapshots(session: VCenterSession, folders: dict[str, FolderFacts]) 
     """
     read_at = session.now()
     rows = session.retrieve(vim.VirtualMachine, SNAPSHOT_LIST_PATHS)
-    with_snaps = [row for row in rows if row.get("snapshot") is not None]
+    # A VM that needs consolidation is kept even with no snapshot tree: a failed
+    # "Delete All" leaves its delta disks behind with the snapshot manager empty.
+    with_snaps = [
+        row for row in rows if row.get("snapshot") is not None or row.get("runtime.consolidationNeeded")
+    ]
     layouts: dict[str, Any] = {}
     bases: dict[str, str | None] = {}
     if with_snaps:
@@ -690,7 +722,9 @@ def read_vm_snapshots(session: VCenterSession, folders: dict[str, FolderFacts]) 
     for row in with_snaps:
         usage = snapshot_usage(row.get("snapshot"), layouts.get(row["moref"]), read_at)
         if usage is None:
-            continue
+            if not row.get("runtime.consolidationNeeded"):
+                continue
+            usage = orphaned_delta_usage(layouts.get(row["moref"]))
         folder = folder_of(row, folders)
         result.append(
             {
@@ -866,8 +900,11 @@ def read_host_time(session: VCenterSession) -> list[dict[str, Any]]:
     result = []
     for row in rows:
         services = row.get("config.service.service") or []
+        protocol = row.get("config.dateTimeInfo.systemClockProtocol")
+        # The service of the protocol in use: a PTP host's ntpd is off by design.
+        wanted = ("ptpd",) if protocol == "ptp" else TIME_SERVICE_KEYS
         time_service = next(
-            (service for service in services if getattr(service, "key", None) in TIME_SERVICE_KEYS), None
+            (service for service in services if getattr(service, "key", None) in wanted), None
         )
         dt_system = row.get("configManager.dateTimeSystem")
         result.append(
@@ -877,6 +914,7 @@ def read_host_time(session: VCenterSession) -> list[dict[str, Any]]:
                 "name": row.get("name", row["moref"]),
                 "connection_state": row.get("runtime.connectionState"),
                 "ntp_servers": list(row.get("config.dateTimeInfo.ntpConfig.server") or []),
+                "clock_protocol": protocol,
                 "service_key": getattr(time_service, "key", None) if time_service else None,
                 "service_running": getattr(time_service, "running", None) if time_service else None,
                 "service_policy": getattr(time_service, "policy", None) if time_service else None,

@@ -66,10 +66,17 @@ BUCKETS: tuple[tuple[str, str, re.Pattern[str]], ...] = (
         re.compile(r"(?i)(NoRedundantManagement|\bno management network redundancy\b)"),
     ),
     (
+        # Before host_isolation: one isolation address not answering a ping is a
+        # warning about that address, not a host cut off.
+        "isolation_address_unreachable",
+        "a host could not ping an HA isolation address (a warning, not an isolation)",
+        re.compile(r"(?i)\bHostIsolationIpPingFailed\w*"),
+    ),
+    (
         "host_isolation",
         "a host was isolated from the management network (HA may have acted)",
         re.compile(
-            r"(?i)(\bHostIsolated\w*|\bDasHostIsolated\w*|\bHostIsolationIpPingFailed\w*|"
+            r"(?i)(\bHostIsolated\w*|\bDasHostIsolated\w*|"
             r"\bhost .* is isolated\b|\bnetwork isolation\b|\bisolated\b|\bisolation address\b)"
         ),
     ),
@@ -88,7 +95,7 @@ BUCKETS: tuple[tuple[str, str, re.Pattern[str]], ...] = (
         "a host failed (vSphere HA declared it failed)",
         re.compile(
             r"(?i)(\bDasHostFailedEvent\b|\bHostFailedEvent\b|\bvSphere HA detected .*host .*failed\b|"
-            r"\bpossible host failure\b|\bstate changed .* to Dead\b)"
+            r"\bpossible host failure\b|\b(state|state of the host .*) (has )?changed .* ?to Dead\b)"
         ),
     ),
     (

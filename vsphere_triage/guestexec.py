@@ -53,7 +53,11 @@ def guest_program_spec(command: str, out_path: str, *, windows: bool) -> tuple[s
     """
     if windows:
         return WINDOWS_SHELL, f'/c ({command}) > "{out_path}" 2>&1'
-    return LINUX_SHELL, f"-c \"exec > '{out_path}' 2>&1; {encode_shell(command)}\""
+    # Escaped for the double quotes the outer shell reads it in.
+    inner = encode_shell(command)
+    for char in ("\\", '"', "$", "`"):
+        inner = inner.replace(char, "\\" + char)
+    return LINUX_SHELL, f"-c \"exec > '{out_path}' 2>&1; {inner}\""
 
 
 # PowerShell writes what it prints in the guest's OEM codepage (437, 850, 932,
@@ -83,13 +87,18 @@ def encode_powershell(script: str) -> str:
 def encode_shell(script: str) -> str:
     """A shell-safe command that runs a multi-line `script` under /bin/sh.
 
-    The script is base64-encoded and piped through `base64 -d | sh`, so the whole
-    thing — pipes, quotes, greps — travels as one token with nothing for the
-    guest's shell wrapper to mis-parse, the Linux counterpart of
-    `encode_powershell`.
+    The script is base64-encoded and decoded into `sh -c`, so the whole thing —
+    pipes, quotes, greps — travels as one token with nothing for the guest's
+    shell wrapper to mis-parse, the Linux counterpart of `encode_powershell`.
+    The script is an argument, not piped in: bash reads a piped script as it
+    runs, so a command that reads stdin would swallow the lines after it; its
+    stdin is /dev/null instead. A guest without `base64` says so and exits 127.
     """
     encoded = base64.b64encode(script.encode()).decode("ascii")
-    return f"echo {encoded}|base64 -d|sh"
+    return (
+        'command -v base64 >/dev/null || { echo "base64 is not installed in the guest"; exit 127; }; '
+        f'sh -c "$(echo {encoded}|base64 -d)" </dev/null'
+    )
 
 
 def probe_failed(result: dict[str, Any]) -> str | None:

@@ -58,7 +58,9 @@ def classify_host_time(row: dict[str, Any], thresholds: Thresholds) -> dict[str,
         result["healthy"] = None
         return result
     result["checked"] = True
-    if not ntp_servers:
+    ptp = row.get("clock_protocol") == "ptp"
+    result["clock_protocol"] = row.get("clock_protocol")
+    if not ntp_servers and not ptp:
         findings.append("no NTP servers configured: the clock is free-running and will drift")
     if running is False:
         findings.append("the time service is not running: the clock is not being disciplined")

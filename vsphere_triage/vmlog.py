@@ -116,7 +116,7 @@ ANNOTATIONS: tuple[tuple[str, re.Pattern[str]], ...] = (
             r"permanent device loss|lost access|i/o error|failed to issue io|"
             # Not the stun/unstun of every snapshot and backup, nor a Tools RPC timeout.
             r"aiomgr.*(error|fail)|aiognrc.*fail|disklib.*(error|fail)|"
-            r"(scsi\d*|disk|\bio\b|aio).*timed out|scsi\d+:\d+: command .* took)"
+            r"(scsi\d*|disk|\bio\b|aio).*timed out|(scsi|nvme|sata)\d+:\d+: command .* took)"
         ),
     ),
     ("question", re.compile(r"(?i)(msg_question|msg_hint|\bquestion\b)")),

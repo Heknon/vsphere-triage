@@ -826,12 +826,13 @@ def test_a_vm_without_tools_is_not_abnormal_but_is_explained() -> None:
     ("fields", "flag", "attention"),
     [
         ({"tools_running": "guestToolsRunning", "heartbeat": "yellow"}, checks.HEARTBEAT_INTERMITTENT, True),
-        ({"swapped_mb": 10}, checks.MEMORY_RECLAIMED, True),
-        ({"ballooned_mb": 10}, checks.MEMORY_RECLAIMED, True),
-        ({"host_memory_percent": 97.0}, checks.HOST_MEMORY_PRESSURE, True),
-        ({"alarms": [{"alarm": "VM CPU", "status": "red"}]}, checks.VCENTER_ALARM, True),
+        # Context flags: reported, but a VM with only these is not abnormal.
+        ({"swapped_mb": 10}, checks.MEMORY_RECLAIMED, False),
+        ({"ballooned_mb": 10}, checks.MEMORY_RECLAIMED, False),
+        ({"host_memory_percent": 97.0}, checks.HOST_MEMORY_PRESSURE, False),
+        ({"alarms": [{"alarm": "VM CPU", "status": "red"}]}, checks.VCENTER_ALARM, False),
         ({"host_connection_state": "notResponding"}, checks.HOST_NOT_CONNECTED, True),
-        ({"created": NOW - timedelta(hours=30), "read_at": NOW}, checks.LONG_RUNNING, True),
+        ({"created": NOW - timedelta(hours=30), "read_at": NOW}, checks.LONG_RUNNING, False),
         ({"host_maintenance": True}, checks.HOST_IN_MAINTENANCE, False),
         ({"tools_version_status": "guestToolsTooOld"}, checks.TOOLS_OUTDATED, False),
     ],
@@ -1136,7 +1137,8 @@ def test_snapshot_usage_sums_delta_and_memory_state() -> None:
             _File(2, "diskExtent", 40 * gb),  # base disk — not counted
             _File(3, "diskExtent", 30 * gb),  # snapshot delta — counted
             _File(4, "diskExtent", 20 * gb),  # a second snapshot delta — counted
-            _File(5, "snapshotData", 8 * gb),  # .vmsn memory state — counted
+            _File(5, "snapshotData", 1 * gb),  # .vmsn state — counted
+            _File(6, "snapshotMemory", 7 * gb),  # .vmem memory — counted
         ],
         disks=[_Disk(200, [_Unit(2), _Unit(3), _Unit(4)])],  # base + two deltas: chain depth 2
     )
@@ -1438,7 +1440,7 @@ def test_the_linux_shell_wraps_the_command_and_captures_output() -> None:
     program, arguments = guestexec.guest_program_spec("systemctl status", "/tmp/o.txt", windows=False)  # noqa: S108
 
     assert program == "/bin/sh"
-    assert arguments.startswith("-c \"exec > '/tmp/o.txt' 2>&1; echo ")
+    assert arguments.startswith("-c \"exec > '/tmp/o.txt' 2>&1; command -v base64")
     assert "systemctl" not in arguments
 
 
@@ -1456,6 +1458,26 @@ def test_a_linux_command_survives_the_shell_tools_starts_it_through(tmp_path: pa
     subprocess.run(["/bin/sh", "-c", f'"{program}" {arguments}'], check=True)
 
     assert out.read_text().splitlines() == ["b", "tick done"]
+
+
+@pytest.mark.parametrize("shell", ["sh", "bash"])
+def test_a_linux_command_that_reads_stdin_does_not_swallow_the_rest(
+    tmp_path: pathlib.Path, shell: str
+) -> None:
+    import shutil  # noqa: PLC0415
+    import subprocess  # noqa: PLC0415
+
+    if shutil.which(shell) is None or shutil.which("base64") is None:
+        pytest.skip(f"needs {shell} and base64")
+    out = tmp_path / "o.txt"
+    program, arguments = guestexec.guest_program_spec(
+        "read x; echo got=$x\necho second", str(out), windows=False
+    )
+
+    done = subprocess.run([shell, "-c", f'"{program}" {arguments}'], check=False)
+
+    assert out.read_text().splitlines() == ["got=", "second"]
+    assert done.returncode == 0
 
 
 def test_the_guest_temp_path_is_os_specific() -> None:
@@ -1487,7 +1509,10 @@ def test_the_linux_wrapping_captures_every_part_of_a_compound_command(
 
     out = f"{tmp_path}/o.txt"
     program, arguments = guestexec.guest_program_spec(command, out, windows=False)
-    leaked = subprocess.run([program, *shlex.split(arguments)], capture_output=True, text=True, check=False)
+    # As open-vm-tools starts it: the program line through /bin/sh -c.
+    leaked = subprocess.run(
+        ["/bin/sh", "-c", f"{shlex.quote(program)} {arguments}"], capture_output=True, text=True, check=False
+    )
 
     assert leaked.stdout == ""
     with open(out, encoding="utf-8") as handle:  # noqa: PTH123
@@ -3195,7 +3220,11 @@ def test_an_ha_restart_names_the_failed_host_not_the_one_the_vms_came_back_on() 
             "Insufficient resources to satisfy HA failover",
             "ha_capacity_warning",
         ),
-        ("HostIsolationIpPingFailedEvent", "Host esx-1 could not reach isolation address", "host_isolation"),
+        (
+            "HostIsolationIpPingFailedEvent",
+            "Host esx-1 could not reach isolation address",
+            "isolation_address_unreachable",
+        ),
     ],
 )
 def test_ha_wordings_the_patterns_had_missed(kind: str, message: str, bucket: str) -> None:
@@ -3678,3 +3707,66 @@ def test_a_vm_in_a_vapp_gets_the_vapp_as_its_environment_folder() -> None:
     assert facts.folder_parent == "vdc-prod"
     assert facts.datacenter == "DC0"
     assert [folder.moref for folder in find_environment(folders, "env-1003")] == ["resgroup-v42"]
+
+
+def test_a_host_that_is_down_does_not_make_its_datastores_unreachable() -> None:
+    mounts = [
+        {"host_moref": "host-1", "mounted": True, "accessible": True, "inaccessible_reason": None},
+        {
+            "host_moref": "host-2",
+            "mounted": True,
+            "accessible": False,
+            "inaccessible_reason": None,
+            "host_up": False,
+        },
+    ]
+
+    verdict = storagehealth.classify_datastore(_store(mounts=mounts), LIMITS)
+
+    assert verdict["healthy"] is True
+    assert verdict["hosts_unreachable"] == []
+    assert verdict["hosts_down_mounting"] == 1
+    assert "not connected" in verdict["host_note"]
+
+
+def test_a_ptp_host_is_not_faulted_for_having_no_ntp() -> None:
+    verdict = timecheck.classify_host_time(
+        _host_time(ntp_servers=[], clock_protocol="ptp", service_key="ptpd"), LIMITS
+    )
+
+    assert verdict["healthy"] is True
+
+
+def test_a_vm_needing_consolidation_with_no_snapshot_tree_is_listed() -> None:
+    from vsphere_triage import inventory  # noqa: PLC0415
+
+    gb = 1024**3
+    layout = _LayoutEx(
+        files=[_File(1, "diskExtent", 40 * gb), _File(2, "diskExtent", 12 * gb)],
+        disks=[_Disk(200, [_Unit(1), _Unit(2)])],
+    )
+    ref = vim.VirtualMachine("vm-9")
+    rows = {
+        ("name", "parent", "parentVApp", "config.template", "runtime.consolidationNeeded", "snapshot"): [
+            {
+                "moref": "vm-9",
+                "_ref": ref,
+                "name": "db-01",
+                "runtime.consolidationNeeded": True,
+                "snapshot": None,
+            }
+        ],
+    }
+
+    def retrieve(_kind: object, paths: tuple, objects: object = None) -> list:
+        if objects is not None:
+            return [{"moref": "vm-9", "layoutEx": layout, "config.hardware.device": []}]
+        return rows[tuple(paths)]
+
+    session = SimpleNamespace(retrieve=retrieve, now=lambda: NOW, vcenter=SimpleNamespace(name="vc-a"))
+
+    found = inventory.read_vm_snapshots(session, {})
+
+    assert [item["moref"] for item in found] == ["vm-9"]
+    assert found[0]["consolidation_needed"] is True
+    assert found[0]["delta_bytes"] == 12 * gb

@@ -81,7 +81,7 @@ from vsphere_triage.diagnose import (
     summarize_events,
     vm_folder,
 )
-from vsphere_triage.formatting import bounded
+from vsphere_triage.formatting import MAX_RESPONSE_CHARACTERS, bounded, jsonable, size
 from vsphere_triage.inventory import find_environment as environment_folders
 from vsphere_triage.inventory import read_datastore_mounts, read_inventory
 from vsphere_triage.powerflex import PowerFlexError
@@ -604,7 +604,7 @@ def _register_fleet_tools(  # noqa: C901, PLR0915 - one closure per tool
         *,
         vcenters: list[str] | None = None,
         states: list[str] | None = None,
-        limit: int = 40,
+        limit: int = 20,
     ) -> dict[str, Any]:
         """Find abnormal VMs on some or all vCenters, and what the abnormal ones share.
 
@@ -618,7 +618,8 @@ def _register_fleet_tools(  # noqa: C901, PLR0915 - one closure per tool
             vcenters: vCenter names (any spelling they are known by); all when empty.
             states: only these states or flags, e.g. ["no_tools"] or ["long_running"]; the
                 abnormal states and attention flags when empty.
-            limit: how many abnormal VMs to list (groups and counts always cover all).
+            limit: how many abnormal VMs to list (groups and counts always cover all); fewer
+                are listed when the full rows would not fit the response.
 
         """
         names = _names(fleet, vcenters)
@@ -629,7 +630,14 @@ def _register_fleet_tools(  # noqa: C901, PLR0915 - one closure per tool
             raise ValueError(msg)
         result = await scanning.run_scan(fleet, resolved, names)
         scans.put(result)
-        return scanning.summary(result, states=wanted, limit=max(1, min(limit, MAX_LIMIT)))
+        # The VM rows are the bulk of a scan: list fewer of them before the
+        # generic cut would trim the groups and findings along with them.
+        keep = max(1, min(limit, MAX_LIMIT))
+        summary = scanning.summary(result, states=wanted, limit=keep)
+        while keep > 1 and size(jsonable(summary)) > MAX_RESPONSE_CHARACTERS:
+            keep //= 2
+            summary = scanning.summary(result, states=wanted, limit=keep)
+        return summary
 
     @tool()
     async def explain_group(*, scan_id: str, dimension: str, value: str) -> dict[str, Any]:
