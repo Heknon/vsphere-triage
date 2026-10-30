@@ -458,6 +458,11 @@ def test_every_call_the_tools_made_is_on_the_read_list(
         "read_serial_console",
         "get_vm_console",
         "get_vm_events",
+        # check_ems and investigate_windows_boot only reach the raw (guest) stub
+        # when Tools is up and credentials are given; with neither here they stay
+        # on the guarded surface, which is what this sweep checks.
+        "check_ems",
+        "investigate_windows_boot",
     ):
         call(server, tool, {"vcenter": "vc-a", "moref": moref})
     call(server, "get_host_health", {"vcenter": "vc-a", "host": "DC0_C0_H0"})
@@ -470,6 +475,7 @@ def test_every_call_the_tools_made_is_on_the_read_list(
     call(server, "check_host_time", {"vcenters": ["vc-a"]})
     call(server, "check_datastores", {"vcenters": ["vc-a"]})
     call(server, "check_vcenters")
+    call(server, "vcenter_history", {"vcenter": "vc-a", "minutes": 60})
     call(server, "vcenter_sessions", {"vcenter": "vc-a"})
 
     seen = server.vcenters.methods_seen()

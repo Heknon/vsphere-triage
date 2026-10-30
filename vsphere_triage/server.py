@@ -31,7 +31,20 @@ from PIL import Image
 from pyVmomi import vim, vmodl
 from starlette.responses import JSONResponse
 
-from vsphere_triage import ages, guestexec, hardware, power, resources, snapshots, storagehealth, timecheck
+from vsphere_triage import (
+    ages,
+    capabilities,
+    connhistory,
+    emscheck,
+    guestexec,
+    hardware,
+    power,
+    resources,
+    snapshots,
+    storagehealth,
+    timecheck,
+    winboot,
+)
 from vsphere_triage import scan as scanning
 from vsphere_triage.checks import classify, count_states
 from vsphere_triage.config import Settings
@@ -303,7 +316,57 @@ def _register_fleet_tools(  # noqa: C901, PLR0915 - one closure per tool
                 findings.append(
                     f"{result['name']}: {sessions['total']} open sessions, login {result['login_seconds']}s"
                 )
-        return {"vcenters": rows, "findings": findings or ["all configured vCenters reachable"]}
+        gap = capabilities.vrops_gap(resolved)
+        return {
+            "vcenters": rows,
+            "findings": findings or ["all configured vCenters reachable"],
+            "note": (
+                "this is the live state only; for a failure that has since cleared (an SSL EOF hours "
+                "ago) read vcenter_history for the session-event window"
+                + ("" if gap else ", or the vrops_* tools for the session-count curve")
+            ),
+            "evidence_gaps": [gap] if gap else [],
+        }
+
+    @tool()
+    async def vcenter_history(*, vcenter: str, minutes: int = 180) -> dict[str, Any]:
+        """A vCenter's session/login events over a past window, for a failure that has cleared.
+
+        check_vcenters sees only the live state, so an SSL EOF or session spike
+        from earlier is invisible to it. This reads the vCenter's own session
+        events over the last `minutes` and looks for the shape of session or
+        connection exhaustion — a surge of logins, failed logins, or many
+        logins from one source (a client leaking sessions). It is the
+        vCenter-native history; vROps keeps the actual session-count curve, and
+        the result names it when it is not configured.
+
+        Args:
+            vcenter: the vCenter to read.
+            minutes: how far back to read (default 180).
+
+        """
+        name = fleet.resolve(vcenter)
+
+        def run(session: VCenterSession) -> dict[str, Any]:
+            now = session.now()
+            events = session.events(
+                begin=now - timedelta(minutes=minutes), end=now, types=connhistory.SESSION_EVENT_TYPES
+            )
+            rows = [
+                {
+                    "type": type(event).__name__,
+                    "time": getattr(event, "createdTime", None),
+                    "user": getattr(event, "userName", None),
+                    "source": getattr(event, "ipAddress", None),
+                }
+                for event in events
+            ]
+            summary = connhistory.summarize_session_events(rows, now=now, window_minutes=minutes)
+            return {"vcenter": session.vcenter.name, "live_sessions": session.session_count()} | summary
+
+        result = await fleet.run(name, run)
+        gap = capabilities.vrops_gap(resolved)
+        return result | {"evidence_gaps": [gap] if gap else []}
 
     @tool()
     async def vcenter_sessions(*, vcenter: str) -> dict[str, Any]:
@@ -878,6 +941,99 @@ def _register_machine_tools(  # noqa: C901 - one closure per tool
         """
         name = fleet.resolve(vcenter)
         return await power.hard_reset(fleet, resolved, name, moref=moref, env_id=env_id, vm_name=vm_name)
+
+    @tool("check_ems", annotations=NOT_READ_ONLY)
+    async def check_ems_tool(
+        *,
+        vcenter: str,
+        moref: str | None = None,
+        env_id: str | None = None,
+        vm_name: str | None = None,
+        username: str | None = None,
+        password: str | None = None,
+    ) -> dict[str, Any]:
+        """Report whether this VM's serial console (EMS on Windows) can carry the guest's boot words.
+
+        Answers the capability in full: whether a virtual serial port writes to a
+        file (hardware, no guest needed), whether EMS/console output has actually
+        landed there, and — on Windows when VMware Tools and guest credentials
+        are available — whether EMS is turned on in the guest's BCD
+        (`bcdedit /enum {current}`/`{emssettings}`, read-only). The verdict says
+        whether the boot words are readable and, when not, why (no serial port /
+        EMS off / unconfirmed) and how to enable it. Use it when serial-console
+        evidence is missing, so you can tell the user the hole exists and how to
+        close it. Reading the BCD runs a read-only command in the guest, so this
+        is marked not-read-only.
+
+        Find the VM by moref, or by env_id plus vm_name.
+
+        Args:
+            vcenter: the VM's vCenter.
+            moref: the VM's moref, or give env_id and vm_name.
+            env_id: the environment id, with vm_name.
+            vm_name: the machine's name inside its environment.
+            username: guest-OS account for the BCD read; the configured default when omitted.
+            password: that account's password; the configured default when omitted.
+
+        """
+        name = fleet.resolve(vcenter)
+        return await emscheck.check_ems(
+            fleet,
+            resolved,
+            name,
+            moref=moref,
+            env_id=env_id,
+            vm_name=vm_name,
+            username=username,
+            password=password,
+        )
+
+    @tool("investigate_windows_boot", annotations=NOT_READ_ONLY)
+    async def investigate_windows_boot_tool(
+        *,
+        vcenter: str,
+        moref: str | None = None,
+        env_id: str | None = None,
+        vm_name: str | None = None,
+        username: str | None = None,
+        password: str | None = None,
+    ) -> dict[str, Any]:
+        """Build the picture of a Windows boot from the guest's own event log and crash records.
+
+        Reads, in one pass through the guest (VMware Tools + credentials needed):
+        the last bugcheck the next boot recorded (WER 1001), unclean shutdowns
+        (Kernel-Power 41 / EventLog 6008), service/driver start timeouts (SCM
+        7009/7011 — often what "the kernel timed out" really is), the slow-boot
+        components named by Diagnostics-Performance (100-103), and the presence
+        of crash dumps, ntbtlog, SrtTrail and the update Panther log. Bugcheck
+        codes are decoded to the layer they point at. The queries are read-only
+        (Get-WinEvent / Get-Content), run as a guest command, so it is marked
+        not-read-only.
+
+        If the VM is powered off, reboot it first (reboot_guest, else hard_reset)
+        and let it come up — the running event log is what this reads. The result
+        says so rather than failing silently.
+
+        Args:
+            vcenter: the VM's vCenter.
+            moref: the VM's moref, or give env_id and vm_name.
+            env_id: the environment id, with vm_name.
+            vm_name: the machine's name inside its environment.
+            username: guest-OS account; the configured default when omitted.
+            password: that account's password; the configured default when omitted.
+
+        """
+        name = fleet.resolve(vcenter)
+        return await winboot.investigate_windows_boot(
+            fleet,
+            resolved,
+            name,
+            moref=moref,
+            env_id=env_id,
+            vm_name=vm_name,
+            username=username,
+            password=password,
+        )
 
 
 def _register_piece_tools(  # noqa: C901 - one closure per tool

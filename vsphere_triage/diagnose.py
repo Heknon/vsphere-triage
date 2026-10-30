@@ -24,6 +24,7 @@ from typing import TYPE_CHECKING, Any
 
 from pyVmomi import vim
 
+from vsphere_triage import capabilities
 from vsphere_triage.checks import (
     ABNORMAL,
     BLOCKED_ON_QUESTION,
@@ -921,6 +922,10 @@ def diagnose_vm(
         "host_log": host_log,
         "snapshots": snapshots or {"count": 0},
         "events": summarize_events(raw_events) if "events" in events else events,
+        # Stronger sources this diagnosis lacked: name them so a reader does not
+        # mistake "could not see it" for "it did not happen", and knows what to
+        # turn on. Empty when nothing better was missing.
+        "evidence_gaps": capabilities.evidence_gaps(settings, vm),
     }
 
 

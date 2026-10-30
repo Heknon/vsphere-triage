@@ -20,11 +20,13 @@ vROps (Aria / VCF Operations) is an **optional** integration: configure
 than vCenter keeps). Everything else — the whole diagnosis — runs on vCenter
 alone, so the server is fully useful with no vROps at all.
 
-It is read-only with three deliberate exceptions that act on a VM: `run_in_guest`
-executes a command inside a guest OS for a diagnostic a read cannot answer, and
-`reboot_guest` / `hard_reset` reboot a wedged VM so it writes a fresh boot log.
-They are marked not-read-only and routed outside the read-only guard on purpose
-(see below); nothing else can change a VM.
+It is read-only with deliberate exceptions that act on a VM: `run_in_guest`
+executes a command inside a guest OS for a diagnostic a read cannot answer,
+`reboot_guest` / `hard_reset` reboot a wedged VM so it writes a fresh boot log,
+and `check_ems` / `investigate_windows_boot` read the guest's BCD and event log
+(so they too run a command in the guest). All are marked not-read-only and
+routed outside the read-only guard on purpose (see below); nothing else can
+change a VM.
 
 It answers two kinds of question:
 
@@ -191,6 +193,7 @@ internal index.
 | `list_vcenters` | which vCenters, reachable, version, clock |
 | `check_vcenters` | reachability, login time and open-session count per vCenter, for when the vCenter API itself is failing (SSL EOF, resets) — the sign of connection/session exhaustion |
 | `vcenter_sessions` | a vCenter's open sessions grouped by user, source IP and client, with idle counts and the oldest — finds the client leaking sessions behind the exhaustion |
+| `vcenter_history` | a vCenter's session/login events over a past window (login surge, failed logins, one source churning) — for an SSL EOF or exhaustion that has since cleared, which the live `check_vcenters` cannot see |
 | `scan` | abnormal VMs on some or all vCenters, grouped by what they share; hosts over the CPU threshold and slow storage right now |
 | `explain_group` | what a scan group's abnormal VMs share that the healthy ones beside them do not; CPU and storage over its boot window |
 | `find_old_environments` | environments older than N hours (the age of their oldest VM), optionally only under `projects`, `environments`, `projects/team-x` or any other path segments, oldest first, with their VMs' states |
@@ -201,6 +204,8 @@ internal index.
 | `run_in_guest` | **not read-only** — runs a command inside a guest OS (needs VMware Tools and guest credentials) and returns its output and exit code, for a diagnostic a read cannot answer |
 | `reboot_guest` | **not read-only** — asks the guest to reboot gracefully through VMware Tools (no data loss, needs Tools); try this before `hard_reset` to make a wedged VM write a fresh boot log |
 | `hard_reset` | **not read-only, destructive** — power-cycles the VM (`ResetVM_Task`, no Tools needed) to reboot a fully hung VM; the guest is not asked, so in-flight writes and in-guest evidence can be lost |
+| `check_ems` | **not read-only** (reads the BCD in-guest) — whether the serial console (EMS on Windows) can carry the guest's boot words: serial-port hardware, output seen, and the `bcdedit` EMS state; says why it is unavailable and how to enable it |
+| `investigate_windows_boot` | **not read-only** (reads the guest) — the Windows boot picture from the guest's own event log: last bugcheck (WER 1001, decoded), unclean shutdowns, service/driver timeouts, slow-boot components, crash dumps and repair/update logs |
 | `get_boot_timeline` | how far the last boot got, from `vmware.log`, plus the serial console |
 | `read_vm_log` | `vmware.log` / `vmware-N.log` lines, filtered on the server |
 | `read_serial_console` | Windows EMS or a Linux kernel console, when the VM has a serial port to a file; stop codes with the layer each points at |

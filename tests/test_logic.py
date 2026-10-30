@@ -15,10 +15,13 @@ from pyVmomi import vim, vmodl
 
 from vsphere_triage import (
     ages,
+    capabilities,
     checks,
+    connhistory,
     console,
     contention,
     diagnose,
+    emscheck,
     formatting,
     guestexec,
     resources,
@@ -27,6 +30,7 @@ from vsphere_triage import (
     storagehealth,
     timecheck,
     vmlog,
+    winboot,
 )
 from vsphere_triage.config import Settings, Thresholds, VCenter
 from vsphere_triage.inventory import (
@@ -1393,3 +1397,144 @@ def test_a_star_host_in_the_transfer_url_is_resolved_to_the_vcenter() -> None:
 
     assert resolved == "https://esx-7.lab:443/guestFile?id=5&token=x"
     assert unchanged == "https://host-9.lab/guestFile?id=5"
+
+
+# -- capabilities: naming the evidence we lack --------------------------------
+
+
+def _settings(**env: str) -> Settings:
+    base = {
+        "VSPHERE_VCENTERS": '[{"name": "vc-a", "host": "a"}]',
+        "VSPHERE_USERNAME": "u",
+        "VSPHERE_PASSWORD": "p",
+    }
+    return Settings.from_environment(base | env)
+
+
+def test_vrops_gap_is_named_only_when_vrops_is_not_configured() -> None:
+    assert capabilities.vrops_gap(_settings()) is not None
+    configured = _settings(
+        VSPHERE_VROPS_URL="https://vrops", VSPHERE_VROPS_USERNAME="u", VSPHERE_VROPS_PASSWORD="p"
+    )
+    assert capabilities.vrops_gap(configured) is None
+
+
+def test_serial_console_gap_is_tuned_by_guest_os() -> None:
+    assert capabilities.serial_console_gap(vm(serial_files=["[ds] vm/vm.ser"])) is None
+    windows = capabilities.serial_console_gap(vm(os_family="windows", serial_files=[]))
+    assert windows is not None
+    assert "EMS" in windows["how_to_enable"]
+    linux = capabilities.serial_console_gap(vm(os_family="linux", serial_files=[]))
+    assert "console=ttyS0" in linux["how_to_enable"]
+
+
+def test_guest_gap_distinguishes_no_tools_from_no_credentials() -> None:
+    no_creds = capabilities.guest_gap(_settings(), vm(tools_running="guestToolsRunning"))
+    assert no_creds is not None
+    assert "VSPHERE_GUEST_USERNAME" in no_creds["how_to_enable"]
+    with_creds = _settings(VSPHERE_GUEST_USERNAME="a", VSPHERE_GUEST_PASSWORD="b")
+    tools_down = capabilities.guest_gap(with_creds, vm(tools_running="guestToolsNotRunning"))
+    assert tools_down is not None
+    assert "Tools" in tools_down["how_to_enable"]
+    assert capabilities.guest_gap(with_creds, vm(tools_running="guestToolsRunning")) is None
+    assert capabilities.guest_gap(_settings(), vm(power_state="poweredOff")) is None
+
+
+# -- EMS / BCD parsing --------------------------------------------------------
+
+
+def test_bcd_output_reads_the_ems_flag_and_port() -> None:
+    payload = json.dumps(
+        {
+            "current": "Windows Boot Loader\n  identifier  {current}\n  ems         Yes\n",
+            "emssettings": "  emsport      1\n  emsbaudrate  115200\n",
+        }
+    )
+    parsed = emscheck.parse_bcd_output(payload)
+    assert parsed["ems_enabled"] is True
+    assert parsed["emsport"] == "1"
+    assert parsed["emsbaudrate"] == 115200
+
+
+def test_bcd_output_access_denied_is_unconfirmed_not_off() -> None:
+    parsed = emscheck.parse_bcd_output(json.dumps({"current": "ERROR: Access is denied.", "emssettings": ""}))
+    assert parsed["ems_enabled"] is None
+    assert parsed["access_denied"] is True
+
+
+def test_ems_verdict_covers_each_outcome() -> None:
+    seen = emscheck._verdict("windows", has_serial_to_file=True, ems_output_seen=True, bcd=None, gap=None)
+    assert seen["available"] is True
+    gap = capabilities.serial_console_gap(vm(os_family="windows", serial_files=[]))
+    none_port = emscheck._verdict(
+        "windows", has_serial_to_file=False, ems_output_seen=False, bcd=None, gap=gap
+    )
+    assert none_port["available"] is False
+    assert none_port["state"] == "no_serial_port"
+    ems_off = emscheck._verdict(
+        "windows", has_serial_to_file=True, ems_output_seen=False, bcd={"ems_enabled": False}, gap=None
+    )
+    assert ems_off["available"] is False
+    assert ems_off["state"] == "serial_port_but_ems_off"
+    unconfirmed = emscheck._verdict(
+        "windows", has_serial_to_file=True, ems_output_seen=False, bcd=None, gap=None
+    )
+    assert unconfirmed["available"] is None
+
+
+# -- Windows boot picture -----------------------------------------------------
+
+
+def test_windows_boot_picture_decodes_the_bugcheck_and_names_timeouts() -> None:
+    parsed = {
+        "last_boot": "2026-10-29T02:00:00Z",
+        "bugchecks": [{"time": "2026-10-29T01:55:00Z", "message": "The bugcheck was: 0x0000007a (0x..)."}],
+        "service_timeouts": [
+            {"time": "t", "id": 7011, "provider": "Service Control Manager", "message": "timeout"}
+        ],
+        "dirty_shutdown": [{"time": "t", "id": 6008, "message": "unexpected"}],
+        "boot_performance": [{"time": "t", "id": 101, "message": "app slow"}],
+        "newest_minidump": {"name": "x.dmp", "time": "t"},
+        "memory_dmp": True,
+        "ntbtlog": False,
+        "srttrail": None,
+        "panther_present": False,
+    }
+    summary = winboot.summarize_windows_boot(parsed)
+    codes = summary["bugchecks"][0]["stop_codes"]
+    assert codes
+    assert codes[0]["name"] == "KERNEL_DATA_INPAGE_ERROR"
+    assert any("bugcheck" in line for line in summary["picture"])
+    assert any("timeout" in line.lower() for line in summary["picture"])
+
+
+def test_windows_boot_picture_is_calm_when_nothing_is_wrong() -> None:
+    summary = winboot.summarize_windows_boot({"last_boot": "t"})
+    assert summary["picture"] == ["no boot faults found in the event log window read"]
+
+
+# -- vCenter session history --------------------------------------------------
+
+
+def test_session_history_flags_a_login_surge_from_one_source() -> None:
+    rows = [
+        {
+            "type": "UserLoginSessionEvent",
+            "time": NOW - timedelta(minutes=m),
+            "user": "svc",
+            "source": "10.0.0.9",
+        }
+        for m in range(0, 40, 2)
+    ]
+    rows.append({"type": "BadUsernameSessionEvent", "time": NOW, "user": "", "source": "10.0.0.9"})
+    summary = connhistory.summarize_session_events(rows, now=NOW, window_minutes=180)
+    assert summary["logins"] == 20
+    assert summary["failed_logins"] == 1
+    assert summary["top_sources"]["10.0.0.9"] == 20
+    assert any("churning" in finding for finding in summary["findings"])
+
+
+def test_session_history_says_so_when_there_is_nothing() -> None:
+    summary = connhistory.summarize_session_events([], now=NOW, window_minutes=60)
+    assert summary["total_events"] == 0
+    assert any("no session events" in finding for finding in summary["findings"])

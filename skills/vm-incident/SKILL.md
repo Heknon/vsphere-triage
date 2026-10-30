@@ -27,10 +27,13 @@ Read this file, then load only the file the step names. Every path ends in a
 **verdict** you write down (`core/verdict.md`), or in **stop and ask**, which
 means you write what is missing and ask a person.
 
-This skill does not act. Every tool it calls reads. It never powers, resets,
-answers a question, or changes a VM: that is the orchestrator's job and a
-person's decision. When the evidence says an action is needed, the verdict says
-which, and stops.
+This skill reads to diagnose; it does not fix. It never answers a VM question,
+reconfigures, migrates, or deletes — that is the orchestrator's job and a
+person's decision, and when the evidence says such an action is needed the
+verdict names it and stops. The one thing it will *do* is reboot a VM
+(`reboot_guest`, then `hard_reset`) — but only as a diagnostic step, to make a
+wedged guest write a fresh boot log, never as the fix, and the destructive
+`hard_reset` only when a graceful reboot cannot.
 
 ## The four layers, and the tools for each
 
@@ -77,6 +80,14 @@ be allowed the global list, and `check_vcenters` says so), the login time and
 the pattern of resets across callers are still the signal, and vROps' vCenter
 session metrics are the history.
 
+`check_vcenters` sees only the live state, so a failure that has since cleared —
+an SSL EOF at 2pm that you are investigating at 5pm — is invisible to it. For
+that, run **`vcenter_history`**: it reads the vCenter's own session/login events
+over a past window and looks for the shape of exhaustion (a login surge, failed
+logins, many logins from one source). It is the vCenter-native history; vROps,
+when configured, keeps the actual session-count curve, and the result says so
+when it is not.
+
 A VM diagnosis that keeps failing with a dropped-connection error is the same
 story from below: run `check_vcenters` before trusting any one VM's result.
 
@@ -87,9 +98,10 @@ fleet-wide. When `check_vcenters` shows the session count healthy but the errors
 persist, run **`check_host_time`**: it reports each host's NTP configuration and
 its clock skew from vCenter, and names the hosts that have drifted.
 
-## When a read cannot answer: run_in_guest
+## When a read cannot answer: acting on the VM
 
-Most tools read. Three do not, and they act on the VM — use them only when the
+Most tools read. A few act on the VM — `run_in_guest`, the two reboots, and the
+guest-reading `check_ems` / `investigate_windows_boot` — use them only when the
 read-only evidence leaves a real gap, and record what you did in the verdict.
 
 **`run_in_guest`** executes a command inside the guest OS through VMware Tools.
@@ -121,6 +133,45 @@ After either, re-read `get_boot_timeline` and `read_serial_console` for the
 fresh boot. Rebooting is a diagnostic step, not a fix: if the cause is a starved
 host or a saturated datastore, the VM will wedge again on the way back up.
 
+**Windows: build the boot picture.** `vmware.log` shows a boot from the outside,
+never the Windows kernel's own words. Those live in the event log, reachable
+only once the guest is up enough for VMware Tools. So: if the VM is off or hung,
+reboot it (`reboot_guest`, else `hard_reset`) and let it come up; then
+**`investigate_windows_boot`** reads, in one pass, the records Windows keeps of
+why a boot failed — the last bugcheck its *next* boot recorded (so a BSOD in a
+reboot loop is still named), unclean shutdowns, **service/driver start timeouts
+(which is what "the kernel timed out" usually is on Windows)**, the slow-boot
+components, and the crash dumps / Startup-Repair / update logs. The bugcheck code
+is decoded to the layer it points at. Read `core/windows-boot.md` for the flow.
+
+**Is the serial console even available?** When serial-console evidence is
+missing, do not just move on — run **`check_ems`** to say *why* it is missing and
+whether it can be fixed: no serial port in the VM's hardware, a port but EMS
+turned off in the guest's BCD (it reads `bcdedit` when Tools and credentials
+allow), or simply not emitted yet. Put the finding, and how to enable EMS, in
+the verdict, so the gap is closed for next time.
+
+## Name what you're missing
+
+A diagnosis is only as good as what it can read, so this is a standard across
+every rung: **when a stronger source exists but has not been given to you, say
+so** — name it, say what it would have added, and say how to turn it on. Never
+let silence pass for absence of a problem. The tools do half of this for you:
+`diagnose_vm`, `check_vcenters`, `vcenter_history` and the guest tools return an
+`evidence_gaps` list, and `check_ems` returns the serial-console verdict. Carry
+them into the verdict in plain words:
+
+- **vROps not configured** → there is no history; a spike or a failure that has
+  cleared cannot be seen. Ask for `VSPHERE_VROPS_URL` / `_USERNAME` / `_PASSWORD`.
+- **No serial console / EMS off** → the guest's own boot words are unreadable
+  while it is hung; name it and give the `check_ems` fix.
+- **No guest credentials, or Tools down** → nothing inside the guest can be
+  read (the Windows event log, the BCD, dmesg); ask for `VSPHERE_GUEST_*` or a
+  reboot to bring Tools back.
+
+The honest sentence is: *there is something better I could use, but it has not
+been given to me — here is what, and here is how.*
+
 ## The steps
 
 | Step | Load |
@@ -128,6 +179,7 @@ host or a saturated datastore, the VM will wedge again on the way back up.
 | The ladder, rung by rung, top to bottom | `core/ladder.md` |
 | What each cause looks like, and what rules it out | `core/causes.md` |
 | Whether a correlation is a cause | `core/correlation.md` |
+| Building a Windows boot picture (reboot if off, then read the event log) | `core/windows-boot.md` |
 | What you write at the end | `core/verdict.md` |
 
 ## Invariants
