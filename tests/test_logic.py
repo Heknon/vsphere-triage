@@ -3024,3 +3024,60 @@ def test_no_sensor_data_is_unknown_and_readings_are_scaled() -> None:
 
     assert _sensor_reading(SimpleNamespace(currentReading=4500, unitModifier=-2)) == 45.0
     assert _sensor_reading(SimpleNamespace(currentReading=None, unitModifier=0)) is None
+
+
+# -- review of main, round two ------------------------------------------------------------------
+
+
+def test_an_acting_tool_refuses_a_stale_moref_from_another_environment(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    folders = {
+        "g-a": folder("g-a", "envA", "g0", "/DC0/vm/envA", "vm"),
+        "g-b": folder("g-b", "envB", "g0", "/DC0/vm/envB", "vm"),
+    }
+    stale = vm(moref="vm-123", name="dc01", folder_moref="g-a", folder_path="/DC0/vm/envA")
+    monkeypatch.setattr(diagnose.Layout, "of", classmethod(lambda _cls, _s: SimpleNamespace(folders=folders)))
+    monkeypatch.setattr(diagnose, "read_vms", lambda *_a, **_k: [(stale, {})])
+    session = SimpleNamespace(reference=lambda *_a: None, vcenter=SimpleNamespace(name="vc-a"))
+
+    wrong = diagnose.locate(session, Settings(), env_id="envB", vm_name="dc01", moref="vm-123", strict=True)  # type: ignore[arg-type]
+    right = diagnose.locate(session, Settings(), env_id="envA", vm_name="dc01", moref="vm-123", strict=True)  # type: ignore[arg-type]
+
+    assert wrong["found"] is False
+    assert "not inside an environment folder named 'envB'" in wrong["reason"]
+    assert right["found"] is True
+
+
+def test_ha_monitoring_resets_and_failover_failures_are_classified() -> None:
+    from vsphere_triage import clusterevents  # noqa: PLC0415
+
+    def bucket(kind: str, text: str) -> str | None:
+        hit = clusterevents.classify_event(kind, text)
+        return hit[0] if hit else None
+
+    assert bucket("VmDasBeingResetEvent", "web-01 is reset by vSphere HA") == "ha_vm_monitoring_reset"
+    assert bucket("VmRestartedOnAlternateHostEvent", "web-01 restarted on esx-2") == "ha_vm_restart"
+    assert bucket("HostNoRedundantManagementNetworkEvent", "no management redundancy") == (
+        "host_no_redundant_management"
+    )
+    assert (
+        bucket("FailedRestartAfterIsolationEvent", "could not restart after isolation")
+        == "vm_failover_failed"
+    )
+
+
+def test_a_tiny_window_still_over_the_cap_is_said_to_be_cut() -> None:
+    stamps = [NOW - timedelta(milliseconds=n) for n in range(3000)][::-1]  # 3000 events in 3 s
+    session = _EventsSession(stamps)
+
+    _events, cut = VCenterSession.events_covering(session, begin=NOW - timedelta(seconds=1), end=NOW)  # type: ignore[arg-type]
+
+    assert cut is True
+
+
+def test_a_missing_minidump_folder_is_told_apart_from_no_dump() -> None:
+    from vsphere_triage import crashdump  # noqa: PLC0415
+
+    assert "does not exist" in crashdump.decode_dump({"found": False, "folder": False})["reason"]
+    assert "could not be opened" in crashdump.decode_dump({"found": False, "unreadable": "x.dmp"})["reason"]

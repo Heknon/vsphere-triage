@@ -707,8 +707,10 @@ class VCenterSession:
             start, stop = pending.pop()
             batch = self.events(entity=entity, begin=start, end=stop, types=types, recursion=recursion)
             queries += 1
-            if len(batch) >= QUERY_EVENTS_CAP and stop - start > timedelta(seconds=2):
-                if queries + 2 <= max_queries:
+            if len(batch) >= QUERY_EVENTS_CAP:
+                # Split only while the budget covers the reads already waiting too, and
+                # while the window is wide enough to split; otherwise it stays cut, said so.
+                if stop - start > timedelta(seconds=2) and queries + len(pending) + 2 <= max_queries:
                     middle = start + (stop - start) / 2
                     pending.extend([(start, middle), (middle, stop)])
                     continue

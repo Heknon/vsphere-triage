@@ -29,12 +29,35 @@ BUCKETS: tuple[tuple[str, str, re.Pattern[str]], ...] = (
         "vSphere HA restarted a VM after its host failed — a host problem, not a per-VM one",
         # vCenter 6.x-8 logs this as an EventEx, com.vmware.vc.ha.VmRestartedByHAEvent,
         # whose message reads "vSphere HA restarted virtual machine ...".
-        re.compile(r"(?i)(restarted by (vsphere )?ha|VmRestartedByHaEvent|ha restarted|das.*restart)"),
+        re.compile(
+            r"(?i)(restarted by (vsphere )?ha|VmRestartedByHaEvent|ha restarted|das.*restart|"
+            r"VmRestartedOnAlternateHost)"
+        ),
+    ),
+    (
+        "ha_vm_monitoring_reset",
+        "vSphere HA reset a VM whose guest heartbeat stopped (VM monitoring) — the guest hung",
+        re.compile(r"(?i)(VmDasBeingResetEvent|reset by (vsphere )?ha|ha.*vm.*monitoring.*reset)"),
+    ),
+    (
+        # Before host_isolation: "failed restart after isolation" is a failover failure.
+        "vm_failover_failed",
+        "a VM could not be restarted or powered on (HA failover may have failed)",
+        re.compile(
+            r"(?i)(FailedToPowerOn|failover.*fail|insufficient.*failover|not.*enough.*resources|"
+            r"FailedRestartAfterIsolation|vmrestartedbyha.*fail)"
+        ),
+    ),
+    (
+        # Before host_isolation: a missing redundant management link is a config warning.
+        "host_no_redundant_management",
+        "a host has no redundant management network (a configuration warning, not an outage)",
+        re.compile(r"(?i)(NoRedundantManagement|no.*redundan.*management)"),
     ),
     (
         "host_isolation",
         "a host was isolated from the management network (HA may have acted)",
-        re.compile(r"(?i)(isolat|HostIsolated|no.*management network|HostNoRedundantManagement)"),
+        re.compile(r"(?i)(isolat|HostIsolated)"),
     ),
     (
         # Before host_failure: HostConnectionLostEvent's own message reads "Host X is
@@ -47,14 +70,6 @@ BUCKETS: tuple[tuple[str, str, re.Pattern[str]], ...] = (
         "host_failure",
         "a host failed (vSphere HA declared it failed)",
         re.compile(r"(?i)(HostFailed|DasHostFailed|ha.*host.*fail)"),
-    ),
-    (
-        "vm_failover_failed",
-        "a VM could not be restarted or powered on (HA failover may have failed)",
-        re.compile(
-            r"(?i)(FailedToPowerOn|failover.*fail|insufficient.*failover|not.*enough.*resources|"
-            r"ha\.FailedRestartAfterIsolation|vmrestartedbyha.*fail)"
-        ),
     ),
     (
         "host_maintenance",
@@ -117,7 +132,14 @@ def summarize_cluster_events(
             f"{_iso(restart['last'])} — a host failure on {hosts}, not a per-VM problem; the restarted "
             "VMs rebooting is expected, so judge them from that restart, not as independent hangs"
         )
-    for name in ("host_failure", "host_isolation", "host_connection_lost", "vm_failover_failed"):
+    for name in (
+        "ha_vm_monitoring_reset",
+        "host_failure",
+        "host_isolation",
+        "host_connection_lost",
+        "vm_failover_failed",
+        "host_no_redundant_management",
+    ):
         entry = buckets.get(name)
         if entry and entry["count"]:
             hosts = ", ".join(sorted(entry["hosts"])[:5]) or "—"

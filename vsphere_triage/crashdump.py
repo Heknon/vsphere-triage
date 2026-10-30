@@ -47,7 +47,9 @@ def dump_probe_powershell() -> str:
         'catch{\'{"found":false,"denied":true}\';exit};'
         "if(-not $f){'{\"found\":false}';exit};"
         "$buf=New-Object byte[] 96;"
-        "$fs=[System.IO.File]::OpenRead($f.FullName);[void]$fs.Read($buf,0,96);$fs.Close();"
+        # A dump that cannot be opened (locked, denied) is said so, never read as zeros.
+        "try{$fs=[System.IO.File]::OpenRead($f.FullName);[void]$fs.Read($buf,0,96);$fs.Close()}"
+        'catch{\'{"found":false,"unreadable":"\'+$f.Name+\'"}\';exit};'
         "$sig=[System.Text.Encoding]::ASCII.GetString($buf,0,8);"
         "$code=[BitConverter]::ToUInt32($buf,0x38);"
         "$p=@([BitConverter]::ToUInt64($buf,0x40),[BitConverter]::ToUInt64($buf,0x48),"
@@ -70,6 +72,17 @@ def decode_dump(parsed: dict[str, Any]) -> dict[str, Any]:
                 r"C:\Windows\Minidump could not be read (it needs an elevated account); "
                 "not evidence of no dump"
             ),
+        }
+    if parsed.get("unreadable"):
+        return {
+            "found": False,
+            "reason": f"the newest minidump ({parsed['unreadable']}) could not be opened (locked or denied)",
+        }
+    if parsed.get("folder") is False:
+        return {
+            "found": False,
+            "reason": r"C:\Windows\Minidump does not exist: no small dump was ever written (check that "
+            r"crash dumps are configured, and C:\Windows\MEMORY.DMP)",
         }
     if not parsed.get("found"):
         return {"found": False, "reason": r"no minidump found in C:\Windows\Minidump"}
@@ -110,8 +123,14 @@ async def read_crash_dump(
     user = username or settings.guest_username
     secret = password or settings.guest_password
 
+    # Found first, in a read that may be retried; the guest command below never is.
+    pre_located = await pool.run(
+        name,
+        lambda session: locate(session, settings, env_id=env_id, vm_name=vm_name, moref=moref, strict=True),
+    )
+
     def work(session: VCenterSession) -> dict[str, Any]:
-        located = locate(session, settings, env_id=env_id, vm_name=vm_name, moref=moref, strict=True)
+        located = pre_located
         if not located["found"]:
             return {"found": False, "reason": located["reason"]}
         vm = located["vm"]

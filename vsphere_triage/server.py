@@ -448,7 +448,8 @@ def _register_fleet_tools(  # noqa: C901, PLR0915 - one closure per tool
                 summary["findings"] = [*summary.get("findings", []), CAP_NOTE.format(n=16)]
             return {"vcenter": session.vcenter.name, "live_sessions": session.session_count()} | summary
 
-        result = await fleet.run(name, run)
+        # Many QueryEvents reads on a busy vCenter: the sweep deadline, not one read's.
+        result = await fleet.sweep(name, run)
         gap = capabilities.vrops_gap(resolved)
         return result | {"evidence_gaps": [gap] if gap else []}
 
@@ -491,7 +492,7 @@ def _register_fleet_tools(  # noqa: C901, PLR0915 - one closure per tool
                 summary["findings"] = [*summary["findings"], CAP_NOTE.format(n=16)]
             return {"vcenter": session.vcenter.name, "events_read": len(rows), "events_cut": cut} | summary
 
-        results = await asyncio.gather(*(fleet.run(name, run) for name in names), return_exceptions=True)
+        results = await asyncio.gather(*(fleet.sweep(name, run) for name in names), return_exceptions=True)
         rows = [
             result if not isinstance(result, BaseException) else {"vcenter": name, "error": str(result)}
             for name, result in zip(names, results, strict=True)
@@ -540,7 +541,7 @@ def _register_fleet_tools(  # noqa: C901, PLR0915 - one closure per tool
                 summary["findings"] = [*summary["findings"], CAP_NOTE.format(n=16)]
             return {"vcenter": session.vcenter.name} | summary
 
-        return await fleet.run(name, run)
+        return await fleet.sweep(name, run)
 
     @tool()
     async def vcenter_sessions(*, vcenter: str) -> dict[str, Any]:
@@ -1833,6 +1834,18 @@ def _register_powerflex_tools(  # noqa: C901, PLR0915 - one closure per tool
             if identifier:
                 stats = await client.protection_domain_statistics(identifier)
                 pd_stats[identifier] = stats if isinstance(stats, dict) else {}
+        if not pds or not any(pd_stats.values()):
+            # Nothing to judge is not "nothing troubled".
+            return {
+                "troubled_protection_domains": {},
+                "affected_datastores": [],
+                "findings": [
+                    (
+                        "PowerFlex returned no protection domains or no statistics for them, so whether a "
+                        "protection domain is troubled could not be judged — not evidence the backend is fine"
+                    )
+                ],
+            }
         impact = powerflex.map_backend_impact(pds, pd_stats, pools, volumes)
         if not impact["volume_to_pd"]:
             return {

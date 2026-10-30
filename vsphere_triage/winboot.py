@@ -170,8 +170,14 @@ async def investigate_windows_boot(
     user = username or settings.guest_username
     secret = password or settings.guest_password
 
+    # Found first, in a read that may be retried; the guest command below never is.
+    pre_located = await pool.run(
+        name,
+        lambda session: locate(session, settings, env_id=env_id, vm_name=vm_name, moref=moref, strict=True),
+    )
+
     def work(session: VCenterSession) -> dict[str, Any]:  # noqa: PLR0911 - one guard per precondition
-        located = locate(session, settings, env_id=env_id, vm_name=vm_name, moref=moref, strict=True)
+        located = pre_located
         if not located["found"]:
             return {"found": False, "reason": located["reason"]}
         vm = located["vm"]

@@ -175,6 +175,19 @@ def read_vms(
     ]
 
 
+def _in_environment(layout: Layout, vm: VmFacts, env_id: str) -> bool:
+    """Whether a folder named exactly `env_id` holds the VM, directly or above it."""
+    wanted = env_id.strip().lower()
+    current = layout.folders.get(vm.folder_moref or "")
+    seen: set[str] = set()
+    while current is not None and current.moref not in seen:
+        if current.name.lower() == wanted:
+            return True
+        seen.add(current.moref)
+        current = layout.folders.get(current.parent_moref or "")
+    return False
+
+
 def locate(  # noqa: C901, PLR0911, PLR0912 - one lookup, each way it can fail beside it
     session: VCenterSession,
     settings: Settings,
@@ -211,6 +224,14 @@ def locate(  # noqa: C901, PLR0911, PLR0912 - one lookup, each way it can fail b
                     "whose name does not match — check the moref",
                 }
             vm.notes.append(f"asked for {vm_name!r} but {moref} is named {vm.name!r}")
+        if strict and env_id and not _in_environment(layout, vm, env_id):
+            # Names repeat across environments, so the name alone does not prove a
+            # stale moref is the VM meant: its folder chain must hold the environment.
+            return {
+                "found": False,
+                "reason": f"{moref} is not inside an environment folder named {env_id!r} (it is in "
+                f"{vm.folder_path or 'no known folder'}); refusing to act on it — check the moref",
+            }
         return {"found": True, "vm": vm, "row": row, "layout": layout}
     if not env_id or not vm_name:
         return {"found": False, "reason": "give either a moref, or both env_id and vm_name"}
