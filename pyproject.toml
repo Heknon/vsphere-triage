@@ -22,6 +22,7 @@ dependencies = [
     "pydantic-settings>=2.3,<3",
     "typer>=0.18,<1",
     "pillow>=10",
+    "regex>=2024.4.16",
 ]
 
 [project.optional-dependencies]

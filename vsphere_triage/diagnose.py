@@ -430,8 +430,14 @@ def read_host_storage_log(session: VCenterSession, host: HostFacts) -> dict[str,
 # -- judging ---------------------------------------------------------------------
 
 
-def environment_pattern(vm: VmFacts, peers: list[tuple[VmFacts, Verdict]]) -> dict[str, Any]:
-    """How the rest of the VM's environment is doing, and where its healthy VMs are."""
+def environment_pattern(
+    vm: VmFacts, peers: list[tuple[VmFacts, Verdict]], *, about_vm: bool = True
+) -> dict[str, Any]:
+    """How the rest of the VM's environment is doing, and where its healthy VMs are.
+
+    `about_vm=False` is the environment-wide view (diagnose_environment), where
+    `vm` only names the folder and no finding speaks of "this VM".
+    """
     # Healthy is the complement of abnormal, not a separate HEALTHY/BOOTING test:
     # a VM that is HEALTHY but carries an attention flag (long_running, an alarm)
     # is abnormal, and must not also be counted among the healthy, or one VM lands
@@ -482,9 +488,15 @@ def environment_pattern(vm: VmFacts, peers: list[tuple[VmFacts, Verdict]]) -> di
                     f"abnormal and healthy VMs share {dimension.replace('_', ' ')} {shared}, "
                     "which argues against it"
                 )
-    elif len(peers) > 1:
-        signals.append({"kind": "alone", "dimension": None, "values": []})
-        findings.append("this VM is the only abnormal one in its environment")
+    elif len(abnormal) == 1 and len(peers) > 1:
+        lone = abnormal[0][0]
+        if about_vm and lone.moref == vm.moref:
+            signals.append({"kind": "alone", "dimension": None, "values": []})
+            findings.append("this VM is the only abnormal one in its environment")
+        else:
+            # Someone else is the odd one out: say who, without an "alone" signal
+            # about a VM that is not the one being diagnosed.
+            findings.append(f"{lone.name} ({lone.moref}) is the only abnormal VM of {len(peers)} here")
     result["findings"] = findings
     result["signals"] = signals
     return result
@@ -1024,7 +1036,7 @@ def diagnose_environment(session: VCenterSession, settings: Settings, *, env_id:
             thresholds=thresholds,
         ),
     )
-    pattern = environment_pattern(vms[0], verdicts)
+    pattern = environment_pattern(vms[0], verdicts, about_vm=False)
     findings = list(pattern["findings"])
     over = [host for host in (cpu.get("hosts") or {}).values() if host.get("overcommitted")]
     findings.extend(

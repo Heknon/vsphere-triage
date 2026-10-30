@@ -26,6 +26,7 @@ from importlib.metadata import version as package_version
 from typing import TYPE_CHECKING, Any
 
 import httpx
+import regex
 from mcp.server import MCPServer
 from mcp.server.mcpserver.exceptions import ToolError
 from mcp.types import ToolAnnotations
@@ -54,7 +55,7 @@ from vsphere_triage.formatting import bounded
 from vsphere_triage.inventory import find_environment as environment_folders
 from vsphere_triage.readonly import ReadOnlyViolationError
 from vsphere_triage.vcenter import VCenterPool, VSphereError
-from vsphere_triage.vmlog import grep, parse_lines
+from vsphere_triage.vmlog import caller_pattern, grep, parse_lines
 from vsphere_triage.vrops import KINDS, SUGGESTED_STAT_KEYS, Vrops, VropsError
 
 if TYPE_CHECKING:
@@ -69,6 +70,7 @@ if TYPE_CHECKING:
 ANTICIPATED = (
     ValueError,
     re.error,
+    regex.error,
     VSphereError,
     VropsError,
     ReadOnlyViolationError,
@@ -894,7 +896,7 @@ def _register_piece_tools(  # noqa: C901 - one closure per tool
 
         """
         if pattern:
-            re.compile(pattern)
+            caller_pattern(pattern)
         limit = max(1, min(tail, resolved.max_log_lines))
 
         def work(session: VCenterSession, vm: Any, row: dict[str, Any]) -> dict[str, Any]:
@@ -1164,7 +1166,7 @@ def _register_infrastructure_tools(tool: Callable[..., Any], fleet: VCenterPool,
 
         """
         if pattern:
-            re.compile(pattern)
+            caller_pattern(pattern)
         name = fleet.resolve(vcenter)
 
         def run(session: VCenterSession) -> dict[str, Any]:

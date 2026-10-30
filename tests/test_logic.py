@@ -1999,3 +1999,57 @@ def test_the_plugin_runs_the_same_version_the_package_is() -> None:
     # so a plugin install never runs a server older or newer than its skill.
     assert plugin["version"] == version
     assert plugin["mcpServers"]["vsphere-triage"]["args"] == [f"vsphere-triage=={version}"]
+
+
+def test_a_catastrophic_caller_pattern_is_refused_without_freezing_the_loop() -> None:
+    lines = vmlog.parse_lines(
+        "\n".join(f"2026-10-29T02:00:{n % 60:02d}.000Z In(05) vmx - " + "a" * 34 + "!" for n in range(50))
+    )
+
+    async def scenario() -> tuple[int, BaseException | None]:
+        ticks = 0
+        failure: BaseException | None = None
+
+        async def ticker() -> None:
+            nonlocal ticks
+            while True:
+                await asyncio.sleep(0.05)
+                ticks += 1
+
+        beat = asyncio.ensure_future(ticker())
+        try:
+            await asyncio.to_thread(vmlog.grep, lines, "(a|aa)+$", limit=10)
+        except ValueError as error:
+            failure = error
+        beat.cancel()
+        return ticks, failure
+
+    ticks, failure = asyncio.run(scenario())
+
+    assert isinstance(failure, ValueError)
+    assert "simpler pattern" in str(failure)
+    assert ticks >= 10  # the loop kept answering while the pattern ran out its budget
+
+
+def test_a_healthy_environment_is_not_reported_as_having_a_lone_abnormal_vm() -> None:
+    up = {"tools_running": "guestToolsRunning", "heartbeat": "green"}
+    peers = [
+        (vm(moref=f"vm-{n}", **up), checks.classify(vm(moref=f"vm-{n}", **up), LIMITS)) for n in range(3)
+    ]
+
+    result = diagnose.environment_pattern(peers[0][0], peers, about_vm=False)
+
+    assert result["findings"] == []
+    assert result["signals"] == []
+
+
+def test_a_sibling_being_the_odd_one_out_is_not_said_of_the_diagnosed_vm() -> None:
+    up = {"tools_running": "guestToolsRunning", "heartbeat": "green"}
+    me = vm(moref="vm-1", **up)
+    stuck = vm(moref="vm-2", name="db-01")
+    peers = [(me, checks.classify(me, LIMITS)), (stuck, checks.classify(stuck, LIMITS))]
+
+    result = diagnose.environment_pattern(me, peers)
+
+    assert result["signals"] == []
+    assert result["findings"] == ["db-01 (vm-2) is the only abnormal VM of 2 here"]
