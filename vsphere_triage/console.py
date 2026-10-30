@@ -147,7 +147,7 @@ def difference(first: bytes, second: bytes) -> float:
 def ocr(data: bytes) -> tuple[str | None, str]:
     """The text on a screenshot, if an OCR engine is installed; why not, otherwise."""
     try:
-        import pytesseract  # noqa: PLC0415 - optional, and absent on most hosts
+        import pytesseract  # noqa: PLC0415 - optional, and absent on most hosts  # ty: ignore[unresolved-import]
     except ImportError:
         return None, "pytesseract is not installed"
     if shutil.which("tesseract") is None:

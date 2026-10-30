@@ -508,7 +508,7 @@ class VCenterSession:
             msg = "Session is not connected"
             raise VSphereError(msg)
         raw_stub = self._raw._stub  # noqa: SLF001 - the deliberate unguarded path for guest exec
-        manager = vim.GuestOperationsManager(self.content.guestOperationsManager._moId, raw_stub)  # noqa: SLF001
+        manager = vim.GuestOperationsManager(self.content.guestOperationsManager._moId, raw_stub)  # noqa: SLF001  # ty: ignore[unresolved-attribute] - pyVmomi builds vim.* types dynamically
         process_manager = manager.processManager
         file_manager = manager.fileManager
         vm = vim.VirtualMachine(moref, raw_stub)

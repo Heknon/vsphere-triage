@@ -250,7 +250,7 @@ def groups(scan: Scan, *, states: Sequence[str] = FLAGGED) -> dict[str, list[dic
                 }
             )
         # A value every VM shares (the only vCenter scanned) says nothing.
-        rows = [row for row in rows if row["population"] < len(considered)]
+        rows = [row for row in rows if row["population"] < len(considered)]  # ty: ignore[unsupported-operator] - dict-of-Any value
         rows.sort(key=lambda row: (row["strength"], row["abnormal"]), reverse=True)
         if rows:
             result[dimension] = rows[:GROUPS_PER_DIMENSION]
@@ -289,7 +289,7 @@ def summary(scan: Scan, *, states: Sequence[str] = FLAGGED, limit: int) -> dict[
         for host in vscan.hosts.values()
         if host.get("overcommitted") or host.get("near_capacity")
     ]
-    memory_pressed = sorted(
+    memory_pressed = sorted(  # ty: ignore[no-matching-overload] - dict-of-Any value sorted by a numeric field
         (
             {
                 "vcenter": name,

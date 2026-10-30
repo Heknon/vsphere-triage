@@ -240,10 +240,15 @@ fit a context window.
 uv run --extra dev python -m pytest -m "not integration"   # the fast unit suite (what CI runs)
 uv run --extra dev python -m pytest                         # everything, including the vcsim integration tests
 uv run --extra dev ruff check . && uv run --extra dev ruff format --check .
+uv run --extra dev ty check vsphere_triage                  # type check (Astral's ty)
 ```
 
-CI (`.github/workflows/ci.yml`) runs lint + the unit suite on every push, Linux
-only. The Docker-backed integration suite is not run per-commit — dispatch it by
+Lint is `ruff` with `select = ["ALL"]` (a short, documented ignore list in
+`pyproject.toml`); types are checked with `ty`, scoped to the package — the
+tests use deliberately loose fixture typing. Python 3.12+.
+
+CI (`.github/workflows/ci.yml`) runs lint, format, type check and the unit
+suite on every push, Linux only. The Docker-backed integration suite is not run per-commit — dispatch it by
 hand (Actions → CI → Run workflow → integration = true) or run it locally.
 
 The integration tests build two simulated vCenters in Docker with

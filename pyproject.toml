@@ -27,7 +27,7 @@ dependencies = [
 [project.optional-dependencies]
 # OCR of the console screen. Needs the tesseract binary on PATH as well.
 ocr = ["pytesseract>=0.3.10"]
-dev = ["pytest>=8", "ruff>=0.16.7,<0.17"]
+dev = ["pytest>=8", "ruff>=0.16.7,<0.17", "ty>=0.0.1a10"]
 
 [project.scripts]
 vsphere-triage = "vsphere_triage.cli:app"
@@ -77,3 +77,12 @@ known-third-party = ["mcp"]
 
 [tool.ruff.lint.per-file-ignores]
 "tests/**" = ["S101", "D100", "D101", "D102", "D103", "D104", "D107", "PLR2004", "SLF001", "INP001", "S105", "S106", "S603", "S607", "S310", "S311", "ARG001", "PLR0913", "FBT001", "FBT003", "C901", "PLR0915"]
+
+[tool.ty.environment]
+python-version = "3.12"
+
+[tool.ty.rules]
+# mcp's ToolAnnotations fields (readOnlyHint, destructiveHint, ...) are real;
+# ty reads its pydantic model as discarding them. A library-model limitation,
+# not our code — everything else stays strict, and the package checks clean.
+pydantic-discarded-extra-argument = "ignore"

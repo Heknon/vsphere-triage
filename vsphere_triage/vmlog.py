@@ -311,11 +311,11 @@ def boot_timeline(lines: list[LogLine], *, max_examples: int = 3) -> dict[str, A
     last_stage_time = next(item["first_seen"] for item in stages if item["stage"] == last)
     silent_after = None
     if last_time and last_stage_time:
-        silent_after = (last_time - last_stage_time).total_seconds()
+        silent_after = (last_time - last_stage_time).total_seconds()  # ty: ignore[unsupported-operator] - both are datetimes from parsed lines
     return {
         "boot_found": True,
         "boot_started": boot[0].time,
-        "stages": sorted(stages, key=lambda item: STAGE_ORDER[item["stage"]]),
+        "stages": sorted(stages, key=lambda item: STAGE_ORDER[item["stage"]]),  # ty: ignore[invalid-argument-type] - item["stage"] is a stage name
         "last_stage": last,
         "not_reached": missing,
         "last_log_line_time": last_time,

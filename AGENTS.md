@@ -8,11 +8,18 @@ otherwise.
 ## The per-commit gate
 
 `.github/workflows/ci.yml` runs on every push and pull request: one job that
-lints (`ruff check`), checks formatting (`ruff format --check`), and runs the
-**unit** suite (`pytest -m "not integration"`). That is the whole required
-gate. Do not add an OS matrix, extra Python versions, or more jobs to it to
-chase a single failure — a change that makes CI slower or costlier needs a
-reason beyond convenience.
+lints (`ruff check`, `select = ["ALL"]`), checks formatting
+(`ruff format --check`), type-checks the package (`ty check vsphere_triage`),
+and runs the **unit** suite (`pytest -m "not integration"`). That is the whole
+required gate. Do not add an OS matrix, extra Python versions, or more jobs to
+it to chase a single failure — a change that makes CI slower or costlier needs
+a reason beyond convenience.
+
+Type checking (`ty`) is scoped to the `vsphere_triage` package; the tests are
+not type-checked (fixtures use loose typing on purpose). pyVmomi ships no types
+and builds its `vim.*` classes dynamically, so a handful of lines at that
+boundary carry `# ty: ignore[...]` with a reason — suppress at the line, do not
+disable a rule globally, and keep `ty check vsphere_triage` at zero.
 
 ## The integration suite is not free, and not per-commit
 

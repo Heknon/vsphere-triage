@@ -187,7 +187,7 @@ def build_server(settings: Settings | None = None, pool: VCenterPool | None = No
     _register_infrastructure_tools(tool, fleet, resolved)
     if vrops is not None:
         _register_vrops_tools(tool, vrops)
-    server.vcenters = fleet  # type: ignore[attr-defined] - the tests read methods_seen
+    server.vcenters = fleet  # type: ignore[attr-defined]  # ty: ignore[unresolved-attribute] - attached for the tests to read methods_seen
     return server
 
 
@@ -221,7 +221,7 @@ def _registrar(server: MCPServer, resolved: Settings) -> Callable[[str | None], 
                 finally:
                     active["count"] -= 1
 
-            return server.tool(name=name or function.__name__, annotations=annotations)(wrapped)
+            return server.tool(name=name or function.__name__, annotations=annotations)(wrapped)  # ty: ignore[unresolved-attribute] - the wrapped callable has __name__ at runtime
 
         return register
 

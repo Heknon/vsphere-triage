@@ -40,6 +40,9 @@ jobs:
         run: uv run --extra dev ruff check .
       - name: Format
         run: uv run --extra dev ruff format --check .
+      - name: Type check
+        # Scoped to the package; the tests use deliberately loose fixture typing.
+        run: uv run --extra dev ty check vsphere_triage
       - name: Unit tests
         run: uv run --extra dev python -m pytest -m "not integration" -q
 

@@ -807,7 +807,7 @@ def read_folders(session: VCenterSession) -> dict[str, FolderFacts]:
         moref = parent._moId if parent is not None else None  # noqa: SLF001
         seen: set[str] = set()
         while moref in raw and moref not in seen:
-            seen.add(moref)
+            seen.add(moref)  # ty: ignore[invalid-argument-type] - `moref in raw` (str keys) proves it is str
             folder_row = raw[moref]
             grandparent = folder_row.get("parent")
             if grandparent is None:  # the root folder: stop, do not include it
@@ -838,7 +838,7 @@ def read_folders(session: VCenterSession) -> dict[str, FolderFacts]:
         parent_moref = parent._moId if parent is not None else None  # noqa: SLF001
         datacenter = datacenter_of_folder.get(moref)
         datacenter_path = datacenter_path_of_folder.get(moref)
-        parent_facts = build(parent_moref, depth + 1) if parent_moref in raw else None
+        parent_facts = build(parent_moref, depth + 1) if parent_moref in raw else None  # ty: ignore[invalid-argument-type]
         if datacenter is not None:
             path = f"/{datacenter}/{row['name']}"
         elif parent_facts is not None:
