@@ -110,7 +110,7 @@ Configure it entirely through `VSPHERE_`-prefixed environment variables — only
 | `VSPHERE_MAX_DOWNLOAD_BYTES` | 128 MiB | ceiling on one datastore file when vCenter ignores a Range request |
 | `VSPHERE_MAX_LOG_LINES` | `400` | most lines one result returns |
 | `VSPHERE_MAX_SCREENSHOT_BYTES` | 16 MiB | ceiling on one console screenshot |
-| `VSPHERE_MAX_SCANS_KEPT` | `8` | how many recent scans stay available for `explain_group` |
+| `VSPHERE_MAX_SCANS_KEPT` | `10` | how many recent scans stay available for `explain_group` (history depth, not a per-vCenter count) |
 | `VSPHERE_GUEST_USERNAME`, `VSPHERE_GUEST_PASSWORD` | none | **default guest-OS credentials for `run_in_guest`** — the one tool that is not read-only; omit to require them per call |
 | `VSPHERE_GUEST_EXEC_TIMEOUT_SECONDS` | `30` | how long `run_in_guest` waits for a command to finish |
 | `VSPHERE_GUEST_EXEC_MAX_OUTPUT_BYTES` | 1 MiB | most command output `run_in_guest` returns |

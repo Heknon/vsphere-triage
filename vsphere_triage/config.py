@@ -256,7 +256,12 @@ class Settings(BaseSettings):
     """The most log lines one result returns."""
 
     max_screenshot_bytes: PositiveInt = 16 * 1024 * 1024
-    max_scans_kept: PositiveInt = 8
+    max_scans_kept: PositiveInt = 10
+    """How many recent `scan` results are kept in memory for `explain_group` to drill into.
+
+    This is a history depth, not a per-vCenter count: one scan already covers
+    every vCenter, so this is how many past scans stay available to explain.
+    """
 
     guest_username: str | None = None
     guest_password: str | None = Field(default=None, repr=False)
