@@ -23,17 +23,54 @@
       "description": "Stored in the OS secure credential store",
       "sensitive": true
     },
-    "index_url": {
+    "env_parent_hints": {
       "type": "string",
-      "title": "Python package index",
-      "description": "Where uvx fetches vsphere-triage from. Leave as public PyPI for internet-connected installs; set to an internal PyPI mirror for air-gapped installs.",
-      "default": "https://pypi.org/simple"
+      "title": "Environment parent folders (optional)",
+      "description": "VSPHERE_ENV_PARENT_HINTS: folder names that group environments, searched first, e.g. environments,projects",
+      "default": ""
     },
     "ca_bundle": {
       "type": "string",
       "title": "CA bundle path (optional)",
       "description": "VSPHERE_CA_BUNDLE: a PEM bundle for an internal CA; leave blank to use the system trust store",
       "default": ""
+    },
+    "vrops_url": {
+      "type": "string",
+      "title": "vROps URL (optional)",
+      "description": "VSPHERE_VROPS_URL: Aria / VCF Operations base URL; leave blank to disable the vROps history tools",
+      "default": ""
+    },
+    "vrops_username": {
+      "type": "string",
+      "title": "vROps username (optional)",
+      "default": ""
+    },
+    "vrops_password": {
+      "type": "string",
+      "title": "vROps password (optional)",
+      "description": "Stored in the OS secure credential store",
+      "sensitive": true,
+      "default": ""
+    },
+    "guest_username": {
+      "type": "string",
+      "title": "Guest-OS username (optional)",
+      "description": "VSPHERE_GUEST_USERNAME: default credentials for run_in_guest (the one non-read-only tool); leave blank to require them per call",
+      "default": ""
+    },
+    "guest_password": {
+      "type": "string",
+      "title": "Guest-OS password (optional)",
+      "description": "Stored in the OS secure credential store",
+      "sensitive": true,
+      "default": ""
+    },
+    "index_url": {
+      "type": "string",
+      "title": "Python package index",
+      "description": "Where uvx fetches vsphere-triage from. Leave as public PyPI for internet-connected installs; set to an internal PyPI mirror for air-gapped installs.",
+      "default": "https://pypi.org/simple"
     }
   },
   "mcpServers": {
@@ -45,7 +82,13 @@
         "VSPHERE_VCENTERS": "${user_config.vcenters}",
         "VSPHERE_USERNAME": "${user_config.username}",
         "VSPHERE_PASSWORD": "${user_config.password}",
-        "VSPHERE_CA_BUNDLE": "${user_config.ca_bundle}"
+        "VSPHERE_ENV_PARENT_HINTS": "${user_config.env_parent_hints}",
+        "VSPHERE_CA_BUNDLE": "${user_config.ca_bundle}",
+        "VSPHERE_VROPS_URL": "${user_config.vrops_url}",
+        "VSPHERE_VROPS_USERNAME": "${user_config.vrops_username}",
+        "VSPHERE_VROPS_PASSWORD": "${user_config.vrops_password}",
+        "VSPHERE_GUEST_USERNAME": "${user_config.guest_username}",
+        "VSPHERE_GUEST_PASSWORD": "${user_config.guest_password}"
       }
     }
   }

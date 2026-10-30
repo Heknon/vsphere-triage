@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import io
 import json
+import ssl
 from datetime import UTC, datetime, timedelta
 
 import httpx
@@ -41,7 +42,7 @@ from vsphere_triage.inventory import (
     snapshot_usage,
 )
 from vsphere_triage.readonly import ALLOWED_METHODS, ReadOnlyStub, ReadOnlyViolationError, ensure_read_request
-from vsphere_triage.vcenter import PerfSeries, VCenterSession
+from vsphere_triage.vcenter import PerfSeries, VCenterSession, ssl_context
 from vsphere_triage.vrops import Vrops
 
 NOW = datetime(2026, 10, 29, 2, 30, tzinfo=UTC)
@@ -114,6 +115,21 @@ def test_settings_read_vcenters_and_thresholds_from_json() -> None:
 def test_settings_refuse_a_vcenter_without_credentials_by_variable_name() -> None:
     with pytest.raises(ValueError, match="VSPHERE_"):
         Settings.from_environment({"VSPHERE_VCENTERS": '[{"name": "vc-a", "host": "a"}]'})
+
+
+def test_an_empty_ca_bundle_falls_back_to_the_system_trust_store() -> None:
+    # A blank plugin field injects VSPHERE_CA_BUNDLE="", and
+    # ssl.create_default_context(cafile="") raises. An empty bundle must mean
+    # "use the system trust store", so building the context must not raise.
+    base = Settings.from_environment(
+        {
+            "VSPHERE_VCENTERS": '[{"name": "vc-a", "host": "a.example"}]',
+            "VSPHERE_USERNAME": "reader",
+            "VSPHERE_PASSWORD": "secret",
+        }
+    )
+    empty_bundle = base.model_copy(update={"ca_bundle": ""})
+    assert ssl_context(empty_bundle).verify_mode == ssl.CERT_REQUIRED
 
 
 def test_an_unknown_vcenter_lists_the_known_ones() -> None:

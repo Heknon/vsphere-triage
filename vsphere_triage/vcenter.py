@@ -91,7 +91,9 @@ def ssl_context(settings: Settings) -> ssl.SSLContext:
         context.check_hostname = False
         context.verify_mode = ssl.CERT_NONE
         return context
-    return ssl.create_default_context(cafile=settings.ca_bundle)
+    # `or None`: an empty VSPHERE_CA_BUNDLE (e.g. an unset plugin field passed
+    # as "") means "use the system trust store", not "load the file ''".
+    return ssl.create_default_context(cafile=settings.ca_bundle or None)
 
 
 def session_cookie(raw: str) -> str:

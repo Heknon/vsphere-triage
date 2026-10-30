@@ -162,10 +162,14 @@ plugin marketplace (`.claude-plugin/`). Add the marketplace and install:
 /plugin install vsphere-triage@vsphere-triage
 ```
 
-The install prompts for the vCenters JSON, username, password (kept in the OS
-secure store), and a **package index** — left at public PyPI for connected
-installs, or set to your internal mirror for air-gapped ones. The server then
-runs via `uvx` and auto-starts; the skill is invoked as
+The install prompts for the vCenters JSON, username and password (kept in the
+OS secure store), and optionally the environment parent-folder hints, a CA
+bundle, vROps URL/credentials, `run_in_guest` credentials, and the package
+index (public PyPI, or an internal mirror for air-gapped installs). Leave any
+optional field blank to disable it. Anything not prompted here — thresholds,
+timeouts, `VSPHERE_TLS_VERIFY`, and the rest of the `VSPHERE_*` table above —
+is read from the environment the server inherits, so you can set those the
+usual way. The server runs via `uvx` and auto-starts; the skill is invoked as
 `/vsphere-triage:vm-incident`. Nothing is published to npm — the plugin is
 served straight from the git repo, and the Python package from PyPI or your
 internal index.
