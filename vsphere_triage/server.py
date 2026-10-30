@@ -21,6 +21,8 @@ import time
 from contextlib import asynccontextmanager
 from datetime import UTC, datetime, timedelta
 from functools import wraps
+from importlib.metadata import PackageNotFoundError
+from importlib.metadata import version as package_version
 from typing import TYPE_CHECKING, Any
 
 import httpx
@@ -140,6 +142,14 @@ def _names(pool: VCenterPool, vcenters: list[str] | None) -> list[str]:
     return [pool.resolve(name) for name in vcenters]
 
 
+def _version() -> str:
+    """The installed package's version, so the server reports what is running."""
+    try:
+        return package_version("vsphere-triage")
+    except PackageNotFoundError:
+        return "0+unknown"
+
+
 def _parse_time(text: str) -> datetime:
     value = datetime.fromisoformat(text.strip())
     return value.replace(tzinfo=UTC) if value.tzinfo is None else value.astimezone(UTC)
@@ -149,8 +159,14 @@ def _since(text: str | None, default: datetime) -> datetime:
     return _parse_time(text) if text else default
 
 
-def build_server(settings: Settings | None = None, pool: VCenterPool | None = None) -> MCPServer:
-    """Wire every tool onto a server bound to the configured vCenters."""
+def build_server(
+    settings: Settings | None = None, pool: VCenterPool | None = None, *, guest_exec: bool = True
+) -> MCPServer:
+    """Wire every tool onto a server bound to the configured vCenters.
+
+    `guest_exec=False` leaves `run_in_guest` unregistered, so the server is
+    read-only end to end; the CLI does that for HTTP unless it is asked not to.
+    """
     resolved = settings or (pool.settings if pool else Settings.from_environment())
     # Every datastore read would otherwise log a line, into a stdio client's log pane.
     logging.getLogger("httpx").setLevel(logging.WARNING)
@@ -170,7 +186,7 @@ def build_server(settings: Settings | None = None, pool: VCenterPool | None = No
     server = MCPServer(
         name="vsphere-triage",
         title="vSphere triage (read-only)",
-        version="0.1.0",
+        version=_version(),
         instructions=INSTRUCTIONS,
         lifespan=lifespan,
     )
@@ -182,7 +198,7 @@ def build_server(settings: Settings | None = None, pool: VCenterPool | None = No
         return JSONResponse({"status": "ok"})
 
     _register_fleet_tools(tool, fleet, resolved, scans, has_vrops=vrops is not None)
-    _register_machine_tools(tool, fleet, resolved)
+    _register_machine_tools(tool, fleet, resolved, guest_exec=guest_exec)
     _register_piece_tools(tool, fleet, resolved)
     _register_infrastructure_tools(tool, fleet, resolved)
     if vrops is not None:
@@ -632,7 +648,7 @@ def _register_fleet_tools(  # noqa: C901, PLR0915 - one closure per tool
 
 
 def _register_machine_tools(  # noqa: C901 - one closure per tool
-    tool: Callable[..., Any], fleet: VCenterPool, resolved: Settings
+    tool: Callable[..., Any], fleet: VCenterPool, resolved: Settings, *, guest_exec: bool = True
 ) -> None:
     """Environments and machines: finding them, diagnosing them, and each piece on its own."""
     # -- environments and machines ----------------------------------------------
@@ -758,6 +774,9 @@ def _register_machine_tools(  # noqa: C901 - one closure per tool
         """
         name = fleet.resolve(vcenter)
         return await fleet.run(name, lambda session: diagnose_environment(session, resolved, env_id=env_id))
+
+    if not guest_exec:
+        return
 
     @tool("run_in_guest", annotations=GUEST_EXEC)
     async def run_in_guest_tool(

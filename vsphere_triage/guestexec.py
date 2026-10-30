@@ -40,13 +40,17 @@ def guest_temp_path(token: str, *, windows: bool) -> str:
 def guest_program_spec(command: str, out_path: str, *, windows: bool) -> tuple[str, str]:
     """The interpreter and arguments to run `command` and capture stdout+stderr to `out_path`.
 
+    The whole command is captured, not only its last part: on Linux the shell's
+    own output is redirected first (`exec >`), so `a; b`, `a || b` and `a && b`
+    all land in the file; on Windows the command is grouped in parentheses.
     The command is handed to the guest's shell as-is; a command containing the
-    shell's own quote character can break the wrapping, which is a known limit
-    of running an arbitrary string rather than an argv.
+    shell's own quote character (or, on Windows, an unbalanced parenthesis) can
+    break the wrapping, which is a known limit of running an arbitrary string
+    rather than an argv.
     """
     if windows:
-        return WINDOWS_SHELL, f'/c {command} > "{out_path}" 2>&1'
-    return LINUX_SHELL, f"-c \"{command} > '{out_path}' 2>&1\""
+        return WINDOWS_SHELL, f'/c ({command}) > "{out_path}" 2>&1'
+    return LINUX_SHELL, f"-c \"exec > '{out_path}' 2>&1; {command}\""
 
 
 def rewrite_transfer_url(url: str, host: str) -> str:
@@ -109,4 +113,11 @@ async def run_in_guest(  # noqa: PLR0913 - one guest command, its target and its
         )
         return {"found": True, "ran": True, "vm": vm.identity(), **result}
 
-    return await pool.run(name, work)
+    # Never repeated on a dropped session: the command may already have run. The
+    # deadline covers the command's own timeout on top of the reads around it.
+    return await pool.run(
+        name,
+        work,
+        retry=False,
+        timeout_seconds=settings.timeout_seconds + settings.guest_exec_timeout_seconds,
+    )

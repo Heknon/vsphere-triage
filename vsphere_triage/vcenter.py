@@ -529,6 +529,13 @@ class VCenterSession:
                 exit_code = info.exitCode
                 break
             time.sleep(0.5)
+        terminated = False
+        if exit_code is None:
+            # Stop it rather than leave it running unwatched, still writing to a
+            # file about to be read and deleted.
+            with contextlib.suppress(Exception):
+                process_manager.TerminateProcessInGuest(vm, auth, pid)
+                terminated = True
         output, truncated = "", False
         try:
             transfer = file_manager.InitiateFileTransferFromGuest(vm, auth, out_path)
@@ -544,6 +551,7 @@ class VCenterSession:
             "pid": pid,
             "exit_code": exit_code,
             "timed_out": exit_code is None,
+            "terminated_after_timeout": terminated,
             "output": output,
             "output_truncated": truncated,
         }
@@ -840,6 +848,15 @@ def _rows(objects: Iterable[Any]) -> list[dict[str, Any]]:
     return rows
 
 
+def _not_retried(name: str, why: str) -> VSphereError:
+    """The error for work that must not be repeated, when its session broke under it."""
+    msg = (
+        f"vCenter {name}: {why} during work that is not repeated automatically (a guest command); "
+        "it may or may not have run. The session has been re-opened; check before running it again"
+    )
+    return VSphereError(msg)
+
+
 def as_utc(value: datetime) -> datetime:
     """A vSphere timestamp as an aware UTC datetime."""
     if value.tzinfo is None:
@@ -871,26 +888,47 @@ class VCenterPool:
             self._limits[name] = asyncio.Semaphore(self.settings.max_concurrent_per_vcenter)
         return self._sessions[name]
 
-    async def run(self, name: str, work: Callable[[VCenterSession], T]) -> T:
-        """Run one blocking read against a vCenter, bounded, with one re-login or reconnect."""
+    async def run(
+        self,
+        name: str,
+        work: Callable[[VCenterSession], T],
+        *,
+        retry: bool = True,
+        timeout_seconds: float | None = None,
+    ) -> T:
+        """Run one blocking read against a vCenter, bounded, with one re-login or reconnect.
+
+        `retry=False` is for work that must not run twice (a guest command): a
+        dropped session is still re-opened for the next call, but the work is not
+        repeated, and the error says it may or may not have run.
+        """
         session = self.session(name)
+        deadline = timeout_seconds or self.settings.timeout_seconds
         async with self._limits[name]:
             await self._bounded(session.connect)
             generation = session.generation
             try:
-                return await self._bounded(lambda: work(session))
+                return await self._bounded(lambda: work(session), deadline)
             except vim.fault.NotAuthenticated:
                 # The session expired. Reconnect (a no-op if a sibling call already
                 # did, so we never log its new session out), then retry once.
                 await self._bounded(lambda: session.reconnect(generation))
-                return await self._bounded(lambda: work(session))
-            except (ssl.SSLError, ConnectionError, HTTPException):
+                if not retry:
+                    raise _not_retried(name, "the session expired") from None
+                return await self._bounded(lambda: work(session), deadline)
+            except (ssl.SSLError, ConnectionError, HTTPException) as dropped:
                 # A dropped or reset connection — under load often the vCenter at
                 # its connection or session limit. Reconnect and retry once; if it
                 # happens again, say so plainly rather than as a bare socket error.
+                if not retry:
+                    with contextlib.suppress(Exception):
+                        await self._bounded(lambda: session.reconnect(generation))
+                    raise _not_retried(
+                        name, f"the connection dropped ({type(dropped).__name__})"
+                    ) from dropped
                 try:
                     await self._bounded(lambda: session.reconnect(generation))
-                    return await self._bounded(lambda: work(session))
+                    return await self._bounded(lambda: work(session), deadline)
                 except (ssl.SSLError, ConnectionError, HTTPException) as again:
                     msg = (
                         f"vCenter {name} dropped the connection twice ({type(again).__name__}: {again}). "
@@ -899,11 +937,12 @@ class VCenterPool:
                     )
                     raise VSphereError(msg) from again
 
-    async def _bounded(self, work: Callable[[], T]) -> T:
+    async def _bounded(self, work: Callable[[], T], timeout_seconds: float | None = None) -> T:
+        deadline = timeout_seconds or self.settings.timeout_seconds
         try:
-            return await asyncio.wait_for(asyncio.to_thread(work), timeout=self.settings.timeout_seconds)
+            return await asyncio.wait_for(asyncio.to_thread(work), timeout=deadline)
         except TimeoutError as error:
-            msg = f"vCenter read exceeded VSPHERE_TIMEOUT_SECONDS ({self.settings.timeout_seconds:g}s)"
+            msg = f"vCenter read exceeded VSPHERE_TIMEOUT_SECONDS ({deadline:g}s)"
             raise VSphereError(msg) from error
 
     def methods_seen(self) -> set[str]:

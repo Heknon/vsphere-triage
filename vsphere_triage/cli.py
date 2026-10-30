@@ -52,8 +52,12 @@ def serve(
         msg = "VSPHERE_VCENTERS is empty: configure at least one vCenter"
         raise typer.BadParameter(msg)
     names = ", ".join(vcenter.name for vcenter in settings.vcenters)
-    typer.echo(f"vsphere-triage -> {names} ({transport.value}, read-only)", err=True)
-    server = build_server(settings)
+    # Over HTTP anyone who reaches the port is a caller, so the one tool that acts
+    # on a guest is left out unless explicitly asked for.
+    guest_exec = transport == Transport.stdio or settings.guest_exec_over_http
+    mode = "read-only, plus run_in_guest" if guest_exec else "read-only"
+    typer.echo(f"vsphere-triage -> {names} ({transport.value}, {mode})", err=True)
+    server = build_server(settings, guest_exec=guest_exec)
     if transport == Transport.stdio:
         server.run()
         return

@@ -118,6 +118,7 @@ Configure it entirely through `VSPHERE_`-prefixed environment variables — only
 | `VSPHERE_MAX_SCREENSHOT_BYTES` | 16 MiB | ceiling on one console screenshot |
 | `VSPHERE_MAX_SCANS_KEPT` | `10` | how many recent scans stay available for `explain_group` (history depth, not a per-vCenter count) |
 | `VSPHERE_GUEST_USERNAME`, `VSPHERE_GUEST_PASSWORD` | none | **default guest-OS credentials for `run_in_guest`** — the one tool that is not read-only; omit to require them per call |
+| `VSPHERE_GUEST_EXEC_OVER_HTTP` | `0` | also offer `run_in_guest` over the HTTP transport, which has no authentication of its own; stdio always offers it |
 | `VSPHERE_GUEST_EXEC_TIMEOUT_SECONDS` | `30` | how long `run_in_guest` waits for a command to finish |
 | `VSPHERE_GUEST_EXEC_MAX_OUTPUT_BYTES` | 1 MiB | most command output `run_in_guest` returns |
 | `VSPHERE_VROPS_URL`, `VSPHERE_VROPS_USERNAME`, `VSPHERE_VROPS_PASSWORD`, `VSPHERE_VROPS_AUTH_SOURCE` | none | **optional** vROps (Aria / VCF Operations); its 5 history tools appear only when the URL is set |
@@ -144,7 +145,10 @@ An MCP client config, over stdio:
 Or shared over HTTP, alongside your other MCP servers:
 `vsphere-triage --transport streamable-http --host 0.0.0.0 --port 8000 --allowed-host vsphere-triage.example`
 (`/healthz` for probes). Over HTTP every caller shares the configured
-credential, which is read-only in effect either way.
+credential, and the HTTP transport has no authentication of its own, so
+`run_in_guest` is **not offered over HTTP** unless `VSPHERE_GUEST_EXEC_OVER_HTTP=1`
+is set (do that only behind an authenticating proxy); every other tool only reads.
+Over stdio, the default, `run_in_guest` is always offered.
 
 A dedicated vCenter role is still worth creating where the account allows it,
 so the guarantee holds twice: read inventory, console screen read (confirm

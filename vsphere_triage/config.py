@@ -272,6 +272,15 @@ class Settings(BaseSettings):
     the guest must have Tools running. Leave unset to require them per call.
     """
 
+    guest_exec_over_http: bool = False
+    """Offer `run_in_guest` over the HTTP transport too.
+
+    Off by default: the HTTP transport has no authentication of its own, so
+    every caller who can reach it would run commands in guests as the
+    configured guest account. Over stdio (the default transport) the tool is
+    always offered. Turn on only behind an authenticating proxy.
+    """
+
     guest_exec_timeout_seconds: PositiveFloat = 30.0
     """How long `run_in_guest` waits for a command to finish before giving up on its exit code."""
 

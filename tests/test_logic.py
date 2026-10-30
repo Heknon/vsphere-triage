@@ -1356,14 +1356,14 @@ def test_the_windows_shell_wraps_the_command_and_captures_output() -> None:
     program, arguments = guestexec.guest_program_spec("ipconfig /all", r"C:\Temp\o.txt", windows=True)
 
     assert program.endswith("cmd.exe")
-    assert arguments == r'/c ipconfig /all > "C:\Temp\o.txt" 2>&1'
+    assert arguments == r'/c (ipconfig /all) > "C:\Temp\o.txt" 2>&1'
 
 
 def test_the_linux_shell_wraps_the_command_and_captures_output() -> None:
     program, arguments = guestexec.guest_program_spec("systemctl status", "/tmp/o.txt", windows=False)  # noqa: S108
 
     assert program == "/bin/sh"
-    assert arguments == "-c \"systemctl status > '/tmp/o.txt' 2>&1\""
+    assert arguments == "-c \"exec > '/tmp/o.txt' 2>&1; systemctl status\""
 
 
 def test_the_guest_temp_path_is_os_specific() -> None:
@@ -1377,3 +1377,98 @@ def test_a_star_host_in_the_transfer_url_is_resolved_to_the_vcenter() -> None:
 
     assert resolved == "https://esx-7.lab:443/guestFile?id=5&token=x"
     assert unchanged == "https://host-9.lab/guestFile?id=5"
+
+
+@pytest.mark.parametrize(
+    ("command", "expected"),
+    [
+        ("echo one; echo two", "one\ntwo\n"),
+        ("false || echo fallback", "fallback\n"),
+        ("echo out; echo err >&2", "out\nerr\n"),
+    ],
+)
+def test_the_linux_wrapping_captures_every_part_of_a_compound_command(
+    command: str, expected: str, tmp_path: object
+) -> None:
+    import shlex  # noqa: PLC0415
+    import subprocess  # noqa: PLC0415
+
+    out = f"{tmp_path}/o.txt"
+    program, arguments = guestexec.guest_program_spec(command, out, windows=False)
+    leaked = subprocess.run([program, *shlex.split(arguments)], capture_output=True, text=True, check=False)
+
+    assert leaked.stdout == ""
+    with open(out, encoding="utf-8") as handle:  # noqa: PTH123
+        assert handle.read() == expected
+
+
+def _pool_with_fake_session(monkeypatch: pytest.MonkeyPatch) -> tuple[object, VCenterSession]:
+    from vsphere_triage.vcenter import VCenterPool  # noqa: PLC0415
+
+    settings = Settings.from_environment(
+        {
+            "VSPHERE_VCENTERS": '[{"name": "vc-a", "host": "a"}]',
+            "VSPHERE_USERNAME": "u",
+            "VSPHERE_PASSWORD": "p",
+        }
+    )
+    pool = VCenterPool(settings)
+    session = pool.session("vc-a")
+
+    def fake_login() -> None:
+        session._content = object()
+        session.generation += 1
+
+    monkeypatch.setattr(session, "_login", fake_login)
+    return pool, session
+
+
+def test_work_that_must_not_repeat_is_not_rerun_after_a_session_expiry(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from vsphere_triage.vcenter import VSphereError  # noqa: PLC0415
+
+    pool, session = _pool_with_fake_session(monkeypatch)
+    runs = {"n": 0}
+
+    def work(_session: VCenterSession) -> str:
+        runs["n"] += 1
+        raise vim.fault.NotAuthenticated
+
+    with pytest.raises(VSphereError, match="may or may not have run"):
+        asyncio.run(pool.run("vc-a", work, retry=False))  # ty: ignore[unresolved-attribute]
+
+    assert runs["n"] == 1
+    assert session.generation == 2  # re-opened for the next call
+
+
+def test_reads_are_still_retried_once_after_a_session_expiry(monkeypatch: pytest.MonkeyPatch) -> None:
+    pool, _session = _pool_with_fake_session(monkeypatch)
+    runs = {"n": 0}
+
+    def work(_session: VCenterSession) -> str:
+        runs["n"] += 1
+        if runs["n"] == 1:
+            raise vim.fault.NotAuthenticated
+        return "read"
+
+    assert asyncio.run(pool.run("vc-a", work)) == "read"  # ty: ignore[unresolved-attribute]
+    assert runs["n"] == 2
+
+
+def test_guest_exec_can_be_left_out_of_the_server() -> None:
+    from vsphere_triage.server import build_server  # noqa: PLC0415
+
+    settings = Settings.from_environment(
+        {
+            "VSPHERE_VCENTERS": '[{"name": "vc-a", "host": "a"}]',
+            "VSPHERE_USERNAME": "u",
+            "VSPHERE_PASSWORD": "p",
+        }
+    )
+    with_exec = {tool.name for tool in asyncio.run(build_server(settings).list_tools())}
+    without = {tool.name for tool in asyncio.run(build_server(settings, guest_exec=False).list_tools())}
+
+    assert "run_in_guest" in with_exec
+    assert "run_in_guest" not in without
+    assert with_exec - without == {"run_in_guest"}
