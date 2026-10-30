@@ -5,12 +5,14 @@ goes through `ReadOnlyStub`, which refuses any method that is not on
 `ALLOWED_METHODS` before a byte is sent, and every HTTP request goes through
 `ensure_read_request`, which refuses anything but GET and HEAD.
 
-The one exception, enabled deliberately by the operator, is `run_in_guest`: it
-executes a command inside a guest OS for diagnostics, so it cannot be read-only.
-It does NOT go through `ReadOnlyStub` — it uses the session's raw stub on purpose
-(see `VCenterSession.run_in_guest`), and it is the only path in the whole server
-that can change anything. Everything else, proven by the sweep test below, only
-reads.
+The exceptions, enabled deliberately by the operator, are the tools that act on
+a VM for diagnostics and so cannot be read-only: `run_in_guest` (a command
+inside the guest OS) and the two power operations `reboot_guest` and
+`hard_reset` (rebooting a wedged VM to regenerate its boot logs). None of them
+goes through `ReadOnlyStub` — they use the session's raw stub on purpose (see
+`VCenterSession.run_in_guest`, `.reboot_guest`, `.hard_reset`), and they are the
+only paths in the whole server that can change anything. Everything else, proven
+by the sweep test below, only reads.
 
 What is on the list reads, or creates something that lives only in this
 session and changes nothing anyone else can see (a container view, a task

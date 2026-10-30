@@ -89,33 +89,48 @@ def stop(name: str) -> None:
 
 
 def save_model(builder: str, directory: Path) -> None:
-    """`govc object.save` the builder's inventory into `directory`."""
-    directory.parent.mkdir(parents=True, exist_ok=True)
-    directory.parent.chmod(0o777)
-    subprocess.run(
-        [
-            "docker",
-            "run",
-            "--rm",
-            "--network",
-            f"container:{builder}",
-            "-e",
-            "GOVC_URL=https://user:pass@127.0.0.1:8989/sdk",
-            "-e",
-            "GOVC_INSECURE=1",
-            "-v",
-            f"{directory.parent}:/out",
-            "--entrypoint",
-            "/govc",
-            GOVC_IMAGE,
-            "object.save",
-            "-d",
-            f"/out/{directory.name}",
-        ],
-        check=True,
-        capture_output=True,
-    )
-    subprocess.run(["chmod", "-R", "a+rwX", str(directory)], check=False)
+    """`govc object.save` the builder's inventory into `directory`.
+
+    govc runs as root *inside* the container and writes to a container path,
+    then the files are `docker cp`-ed out — which creates them owned by this
+    process, so build() can edit them on any runner. The earlier bind-mount
+    approaches failed on CI: as root the XML was root-owned and uneditable (and
+    could not be chmod-ed by a non-owner), and as `--user` govc itself failed for
+    want of a writable HOME.
+    """
+    directory.mkdir(parents=True, exist_ok=True)
+    container = f"{builder}-save"
+    subprocess.run(["docker", "rm", "-f", container], capture_output=True, check=False)
+    try:
+        subprocess.run(
+            [
+                "docker",
+                "run",
+                "--name",
+                container,
+                "--network",
+                f"container:{builder}",
+                "-e",
+                "GOVC_URL=https://user:pass@127.0.0.1:8989/sdk",
+                "-e",
+                "GOVC_INSECURE=1",
+                "--entrypoint",
+                "/govc",
+                GOVC_IMAGE,
+                "object.save",
+                "-d",
+                "/tmp/model",  # noqa: S108 - a path inside the throwaway container, copied out below
+            ],
+            check=True,
+            capture_output=True,
+        )
+        subprocess.run(
+            ["docker", "cp", f"{container}:/tmp/model/.", str(directory)],
+            check=True,
+            capture_output=True,
+        )
+    finally:
+        subprocess.run(["docker", "rm", "-f", container], capture_output=True, check=False)
 
 
 def wait(task: Any) -> Any:

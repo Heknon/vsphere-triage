@@ -96,8 +96,23 @@ DATASTORE_MOUNT_PATHS = (
     "summary.uncommitted",
     "summary.accessible",
     "summary.type",
+    "info",
     "host",
 )
+
+
+def datastore_backing_naas(info: Any) -> list[str]:
+    """The SCSI device ids (naa/eui) a VMFS datastore's extents sit on, for backend mapping.
+
+    A VMFS datastore's `info.vmfs.extent[].diskName` is the canonical name of each
+    LUN it spans — the handle that maps back to a PowerFlex volume. NFS/vSAN info
+    carries no such extent, so the list is empty for them.
+    """
+    vmfs = getattr(info, "vmfs", None)
+    extents = getattr(vmfs, "extent", None) or []
+    return [name for extent in extents if (name := getattr(extent, "diskName", None))]
+
+
 HOST_TIME_PATHS = (
     "name",
     "runtime.connectionState",
@@ -430,7 +445,7 @@ def serial_files(devices: Iterable[Any]) -> list[str]:
     return files
 
 
-def _device_category(device: Any) -> str:  # noqa: PLR0911 - one classification
+def _device_category(device: Any) -> str:  # noqa: C901, PLR0911 - one isinstance per device kind
     """Which kind of virtual device this is."""
     d = vim.vm.device
     if isinstance(device, d.VirtualEthernetCard):
@@ -451,6 +466,8 @@ def _device_category(device: Any) -> str:  # noqa: PLR0911 - one classification
         return "video"
     if isinstance(device, (d.VirtualKeyboard, d.VirtualPointingDevice)):
         return "input"
+    if isinstance(device, d.VirtualVMCIDevice):
+        return "vmci"
     return "other"
 
 
@@ -506,6 +523,20 @@ def describe_devices(
             "category": category,
             "backing": _backing_summary(device),
         }
+        if category == "vmci":
+            # VMCI is the transport VMware Tools and guest-RPC run over, so its
+            # state bears on "Tools down / guest unreachable from the host". We
+            # can read only its config here (presence, the datagram firewall,
+            # whether unrestricted guest<->host comms are allowed), never traffic.
+            entry["allow_unrestricted_communication"] = getattr(
+                device, "allowUnrestrictedCommunication", None
+            )
+            entry["filter_enabled"] = getattr(device, "filterEnable", None)
+            if entry["allow_unrestricted_communication"]:
+                findings.append(
+                    f"VMCI device {label!r} allows unrestricted guest<->host communication "
+                    "(a security note; it does not block boot)"
+                )
         if connectable is not None:
             entry["connected"] = connectable.connected
             entry["start_connected"] = connectable.startConnected
@@ -808,6 +839,7 @@ def read_datastore_mounts(session: VCenterSession) -> list[dict[str, Any]]:
                 "free_bytes": row.get("summary.freeSpace"),
                 "uncommitted_bytes": row.get("summary.uncommitted"),
                 "accessible": row.get("summary.accessible"),
+                "backing_naas": datastore_backing_naas(row.get("info")),
                 # None, not [], when the host list was not read: unknown, not "no hosts".
                 "mounts": mounts if "host" in row else None,
             }

@@ -5,7 +5,9 @@ from __future__ import annotations
 import asyncio
 import io
 import json
+import ssl
 from datetime import UTC, datetime, timedelta
+from types import SimpleNamespace
 
 import httpx
 import pytest
@@ -14,18 +16,28 @@ from pyVmomi import vim, vmodl
 
 from vsphere_triage import (
     ages,
+    capabilities,
     checks,
+    clusterevents,
+    connhistory,
     console,
     contention,
+    crashdump,
     diagnose,
+    emscheck,
     formatting,
     guestexec,
+    hostsensors,
+    linuxboot,
+    powerflex,
     resources,
     scan,
     snapshots,
     storagehealth,
+    taskhistory,
     timecheck,
     vmlog,
+    winboot,
 )
 from vsphere_triage.config import Settings, Thresholds, VCenter
 from vsphere_triage.inventory import (
@@ -34,6 +46,7 @@ from vsphere_triage.inventory import (
     Inventory,
     Question,
     VmFacts,
+    datastore_backing_naas,
     describe_devices,
     find_environment,
     os_family,
@@ -41,7 +54,7 @@ from vsphere_triage.inventory import (
     snapshot_usage,
 )
 from vsphere_triage.readonly import ALLOWED_METHODS, ReadOnlyStub, ReadOnlyViolationError, ensure_read_request
-from vsphere_triage.vcenter import PerfSeries, VCenterSession
+from vsphere_triage.vcenter import PerfSeries, VCenterSession, ssl_context
 from vsphere_triage.vrops import Vrops
 
 NOW = datetime(2026, 10, 29, 2, 30, tzinfo=UTC)
@@ -114,6 +127,21 @@ def test_settings_read_vcenters_and_thresholds_from_json() -> None:
 def test_settings_refuse_a_vcenter_without_credentials_by_variable_name() -> None:
     with pytest.raises(ValueError, match="VSPHERE_"):
         Settings.from_environment({"VSPHERE_VCENTERS": '[{"name": "vc-a", "host": "a"}]'})
+
+
+def test_an_empty_ca_bundle_falls_back_to_the_system_trust_store() -> None:
+    # A blank plugin field injects VSPHERE_CA_BUNDLE="", and
+    # ssl.create_default_context(cafile="") raises. An empty bundle must mean
+    # "use the system trust store", so building the context must not raise.
+    base = Settings.from_environment(
+        {
+            "VSPHERE_VCENTERS": '[{"name": "vc-a", "host": "a.example"}]',
+            "VSPHERE_USERNAME": "reader",
+            "VSPHERE_PASSWORD": "secret",
+        }
+    )
+    empty_bundle = base.model_copy(update={"ca_bundle": ""})
+    assert ssl_context(empty_bundle).verify_mode == ssl.CERT_REQUIRED
 
 
 def test_an_unknown_vcenter_lists_the_known_ones() -> None:
@@ -1508,12 +1536,15 @@ def test_guest_exec_can_be_left_out_of_the_server() -> None:
             "VSPHERE_PASSWORD": "p",
         }
     )
-    with_exec = {tool.name for tool in asyncio.run(build_server(settings).list_tools())}
-    without = {tool.name for tool in asyncio.run(build_server(settings, guest_exec=False).list_tools())}
+    every = asyncio.run(build_server(settings).list_tools())
+    kept = asyncio.run(build_server(settings, guest_exec=False).list_tools())
+    acting = {tool.name for tool in every if tool.annotations and tool.annotations.read_only_hint is False}
 
-    assert "run_in_guest" in with_exec
-    assert "run_in_guest" not in without
-    assert with_exec - without == {"run_in_guest"}
+    assert "run_in_guest" in acting
+    assert "hard_reset" in acting
+    # Exactly the tools that act on a VM are left out; every read-only tool stays.
+    assert {tool.name for tool in every} - {tool.name for tool in kept} == acting
+    assert all(tool.annotations is None or tool.annotations.read_only_hint is not False for tool in kept)
 
 
 # -- conclusions that used to point the wrong way ----------------------------------------------
@@ -2259,3 +2290,484 @@ def test_a_session_expiry_inside_a_diagnosis_piece_reaches_the_pool() -> None:
 
     with pytest.raises(vim.fault.NotAuthenticated):
         diagnose.piece("events", expire)
+
+
+# -- capabilities: naming the evidence we lack --------------------------------
+
+
+def _settings(**env: str) -> Settings:
+    base = {
+        "VSPHERE_VCENTERS": '[{"name": "vc-a", "host": "a"}]',
+        "VSPHERE_USERNAME": "u",
+        "VSPHERE_PASSWORD": "p",
+    }
+    return Settings.from_environment(base | env)
+
+
+def test_vrops_gap_is_named_only_when_vrops_is_not_configured() -> None:
+    assert capabilities.vrops_gap(_settings()) is not None
+    configured = _settings(
+        VSPHERE_VROPS_URL="https://vrops", VSPHERE_VROPS_USERNAME="u", VSPHERE_VROPS_PASSWORD="p"
+    )
+    assert capabilities.vrops_gap(configured) is None
+
+
+def test_serial_console_gap_is_tuned_by_guest_os() -> None:
+    assert capabilities.serial_console_gap(vm(serial_files=["[ds] vm/vm.ser"])) is None
+    windows = capabilities.serial_console_gap(vm(os_family="windows", serial_files=[]))
+    assert windows is not None
+    assert "EMS" in windows["how_to_enable"]
+    linux = capabilities.serial_console_gap(vm(os_family="linux", serial_files=[]))
+    assert "console=ttyS0" in linux["how_to_enable"]
+
+
+def test_guest_gap_distinguishes_no_tools_from_no_credentials() -> None:
+    no_creds = capabilities.guest_gap(_settings(), vm(tools_running="guestToolsRunning"))
+    assert no_creds is not None
+    assert "VSPHERE_GUEST_USERNAME" in no_creds["how_to_enable"]
+    with_creds = _settings(VSPHERE_GUEST_USERNAME="a", VSPHERE_GUEST_PASSWORD="b")
+    tools_down = capabilities.guest_gap(with_creds, vm(tools_running="guestToolsNotRunning"))
+    assert tools_down is not None
+    assert "Tools" in tools_down["how_to_enable"]
+    assert capabilities.guest_gap(with_creds, vm(tools_running="guestToolsRunning")) is None
+    assert capabilities.guest_gap(_settings(), vm(power_state="poweredOff")) is None
+
+
+# -- EMS / BCD parsing --------------------------------------------------------
+
+
+def test_bcd_output_reads_the_ems_flag_and_port() -> None:
+    payload = json.dumps(
+        {
+            "current": "Windows Boot Loader\n  identifier  {current}\n  ems         Yes\n",
+            "emssettings": "  emsport      1\n  emsbaudrate  115200\n",
+        }
+    )
+    parsed = emscheck.parse_bcd_output(payload)
+    assert parsed["ems_enabled"] is True
+    assert parsed["emsport"] == "1"
+    assert parsed["emsbaudrate"] == 115200
+
+
+def test_bcd_output_access_denied_is_unconfirmed_not_off() -> None:
+    parsed = emscheck.parse_bcd_output(json.dumps({"current": "ERROR: Access is denied.", "emssettings": ""}))
+    assert parsed["ems_enabled"] is None
+    assert parsed["access_denied"] is True
+
+
+def test_ems_verdict_covers_each_outcome() -> None:
+    seen = emscheck._verdict("windows", has_serial_to_file=True, ems_output_seen=True, bcd=None, gap=None)
+    assert seen["available"] is True
+    gap = capabilities.serial_console_gap(vm(os_family="windows", serial_files=[]))
+    none_port = emscheck._verdict(
+        "windows", has_serial_to_file=False, ems_output_seen=False, bcd=None, gap=gap
+    )
+    assert none_port["available"] is False
+    assert none_port["state"] == "no_serial_port"
+    ems_off = emscheck._verdict(
+        "windows", has_serial_to_file=True, ems_output_seen=False, bcd={"ems_enabled": False}, gap=None
+    )
+    assert ems_off["available"] is False
+    assert ems_off["state"] == "serial_port_but_ems_off"
+    unconfirmed = emscheck._verdict(
+        "windows", has_serial_to_file=True, ems_output_seen=False, bcd=None, gap=None
+    )
+    assert unconfirmed["available"] is None
+
+
+# -- Windows boot picture -----------------------------------------------------
+
+
+def test_windows_boot_picture_decodes_the_bugcheck_and_names_timeouts() -> None:
+    parsed = {
+        "last_boot": "2026-10-29T02:00:00Z",
+        "bugchecks": [{"time": "2026-10-29T01:55:00Z", "message": "The bugcheck was: 0x0000007a (0x..)."}],
+        "service_timeouts": [
+            {"time": "t", "id": 7011, "provider": "Service Control Manager", "message": "timeout"}
+        ],
+        "dirty_shutdown": [{"time": "t", "id": 6008, "message": "unexpected"}],
+        "boot_performance": [{"time": "t", "id": 101, "message": "app slow"}],
+        "newest_minidump": {"name": "x.dmp", "time": "t"},
+        "memory_dmp": True,
+        "ntbtlog": False,
+        "srttrail": None,
+        "panther_present": False,
+    }
+    summary = winboot.summarize_windows_boot(parsed)
+    codes = summary["bugchecks"][0]["stop_codes"]
+    assert codes
+    assert codes[0]["name"] == "KERNEL_DATA_INPAGE_ERROR"
+    assert any("bugcheck" in line for line in summary["picture"])
+    assert any("timeout" in line.lower() for line in summary["picture"])
+
+
+def test_windows_boot_picture_is_calm_when_nothing_is_wrong() -> None:
+    summary = winboot.summarize_windows_boot({"last_boot": "t"})
+    assert summary["picture"] == ["no boot faults found in the event log window read"]
+
+
+# -- vCenter session history --------------------------------------------------
+
+
+def test_session_history_flags_a_login_surge_from_one_source() -> None:
+    rows = [
+        {
+            "type": "UserLoginSessionEvent",
+            "time": NOW - timedelta(minutes=m),
+            "user": "svc",
+            "source": "10.0.0.9",
+        }
+        for m in range(0, 40, 2)
+    ]
+    rows.append({"type": "BadUsernameSessionEvent", "time": NOW, "user": "", "source": "10.0.0.9"})
+    summary = connhistory.summarize_session_events(rows, now=NOW, window_minutes=180)
+    assert summary["logins"] == 20
+    assert summary["failed_logins"] == 1
+    assert summary["top_sources"]["10.0.0.9"] == 20
+    assert any("churning" in finding for finding in summary["findings"])
+
+
+def test_session_history_says_so_when_there_is_nothing() -> None:
+    summary = connhistory.summarize_session_events([], now=NOW, window_minutes=60)
+    assert summary["total_events"] == 0
+    assert any("no session events" in finding for finding in summary["findings"])
+
+
+# -- cluster events: why a whole cluster moved -------------------------------
+
+
+def test_cluster_events_names_an_ha_restart_wave() -> None:
+    rows = [
+        {
+            "type": "VmRestartedByHaEvent",
+            "time": NOW - timedelta(minutes=m),
+            "message": "vSphere HA restarted this virtual machine",
+            "host": "esx-31",
+            "vm": f"vm-{m}",
+        }
+        for m in range(5)
+    ]
+    rows.append(
+        {
+            "type": "HostConnectionLostEvent",
+            "time": NOW - timedelta(minutes=6),
+            "message": "Host connection lost",
+            "host": "esx-31",
+            "vm": None,
+        }
+    )
+    summary = clusterevents.summarize_cluster_events(rows, now=NOW, window_minutes=120)
+    assert summary["buckets"]["ha_vm_restart"]["count"] == 5
+    assert "esx-31" in summary["buckets"]["ha_vm_restart"]["hosts"]
+    assert any("HA restarted" in finding for finding in summary["findings"])
+
+
+def test_cluster_events_classify_falls_through_for_noise() -> None:
+    assert clusterevents.classify_event("UserLoginSessionEvent", "logged in") is None
+    assert clusterevents.classify_event("DrsVmMigratedEvent", "migrated")[0] == "drs_migration"
+
+
+# -- task history: what was done ---------------------------------------------
+
+
+def test_task_categories_and_wave_detection() -> None:
+    assert taskhistory.categorize("VirtualMachine.relocate") == "migration"
+    assert taskhistory.categorize("VirtualMachine.reconfigure") == "reconfigure"
+    rows = [
+        {
+            "operation": "Datastore.relocate",
+            "target": f"vm-{i}",
+            "state": "success",
+            "time": NOW,
+            "user": "svc",
+        }
+        for i in range(12)
+    ]
+    rows.append(
+        {"operation": "VirtualMachine.clone", "target": "vm-x", "state": "error", "time": NOW, "user": "bob"}
+    )
+    summary = taskhistory.summarize_tasks(rows, now=NOW, window_minutes=120)
+    assert summary["by_family"]["migration"] == 12
+    assert len(summary["failures"]) == 1
+    assert any("migration" in finding for finding in summary["findings"])
+
+
+# -- Linux boot picture ------------------------------------------------------
+
+
+def test_linux_boot_picture_classifies_dmesg_and_names_slow_units() -> None:
+    output = (
+        "===LAST_BOOT===\n2026-10-29 02:00:00\n"
+        "===BLAME===\n45.123s cloud-init.service\n2.000s sshd.service\n"
+        "===CRITICAL===\ngraphical.target @48.0s\n"
+        "===DMESG===\n[  12.3] INFO: task jbd2:131 blocked for more than 120 seconds.\n"
+        "===JOURNAL===\n2026-10-29T02:00:10 kernel: EXT4-fs error (device sda1): ext4_find_entry\n"
+        "===END==="
+    )
+    summary = linuxboot.summarize_linux_boot(output)
+    kinds = {finding["kind"] for finding in summary["kernel_findings"]}
+    assert "hung_task" in kinds
+    assert "filesystem" in kinds
+    assert summary["slow_units"][0]["unit"] == "cloud-init.service"
+    assert summary["restricted"] is False
+
+
+def test_linux_boot_reports_a_restricted_read() -> None:
+    output = "===LAST_BOOT===\n2026\n===BLAME===\n===CRITICAL===\n===DMESG===\n===JOURNAL===\n===END==="
+    summary = linuxboot.summarize_linux_boot(output)
+    assert summary["restricted"] is True
+    assert any("restricted" in line for line in summary["picture"])
+
+
+# -- PowerFlex backend -------------------------------------------------------
+
+
+def test_powerflex_lun_and_naa_helpers() -> None:
+    assert powerflex.is_powerflex_lun("DellEMC", "ScaleIO") is True
+    assert powerflex.is_powerflex_lun("NETAPP", "LUN") is False
+    assert powerflex.volume_id_from_naa("naa.6e00abcd0123456789abcdef01234567") == "89abcdef01234567"
+    assert powerflex.volume_id_from_naa(None) is None
+
+
+def test_powerflex_health_flags_a_rebuild_and_a_down_sds() -> None:
+    sds = [
+        {
+            "name": "sds-1",
+            "sdsState": "Normal",
+            "mdmConnectionState": "Connected",
+            "membershipState": "Joined",
+        },
+        {"name": "sds-2", "sdsState": "Disconnected", "mdmConnectionState": "Disconnected"},
+    ]
+    devices = [{"id": "d1", "deviceState": "Normal", "errorState": "None"}]
+    stats = {"rebuildPendingCapacityInKb": 5000, "rebalancePendingCapacityInKb": 0}
+    summary = powerflex.summarize_health(sds, devices, stats)
+    assert summary["healthy"] is False
+    assert summary["rebuild_active"] is True
+    assert "sds-2" in summary["sds_down"]
+    assert any("rebuild" in finding for finding in summary["findings"])
+
+
+def test_powerflex_health_is_calm_when_all_is_well() -> None:
+    sds = [
+        {
+            "name": "sds-1",
+            "sdsState": "Normal",
+            "mdmConnectionState": "Connected",
+            "membershipState": "Joined",
+        }
+    ]
+    summary = powerflex.summarize_health(sds, [], {})
+    assert summary["healthy"] is True
+
+
+def test_powerflex_gap_named_only_when_unconfigured() -> None:
+    assert capabilities.powerflex_gap(_settings()) is not None
+    configured = _settings(
+        VSPHERE_POWERFLEX_URL="https://gw", VSPHERE_POWERFLEX_USERNAME="u", VSPHERE_POWERFLEX_PASSWORD="p"
+    )
+    assert capabilities.powerflex_gap(configured) is None
+
+
+# -- VMCI in the hardware view -----------------------------------------------
+
+
+def test_vmci_device_surfaces_its_config_and_flags_unrestricted() -> None:
+    device = vim.vm.device.VirtualVMCIDevice(allowUnrestrictedCommunication=True, filterEnable=False)
+    described, findings, _blocking = describe_devices([device])
+    assert described[0]["category"] == "vmci"
+    assert described[0]["allow_unrestricted_communication"] is True
+    assert any("unrestricted" in finding for finding in findings)
+
+
+def test_powerflex_bwc_rate_and_traffic_prefers_user_data() -> None:
+    assert powerflex.bwc_rate({"numOccured": 600, "numSeconds": 10, "totalWeightInKb": 20000}) == {
+        "iops": 60.0,
+        "kb_per_s": 2000.0,
+    }
+    assert powerflex.bwc_rate({"numSeconds": 0}) == {"iops": 0.0, "kb_per_s": 0.0}
+    stats = {
+        "userDataReadBwc": {"numOccured": 100, "numSeconds": 10, "totalWeightInKb": 4000},
+        "userDataWriteBwc": {"numOccured": 50, "numSeconds": 10, "totalWeightInKb": 2000},
+        "totalReadBwc": {"numOccured": 9999, "numSeconds": 10, "totalWeightInKb": 9999},
+    }
+    traffic = powerflex.traffic_of(stats)
+    assert traffic["read_iops"] == 10.0  # userData wins over totalReadBwc
+    assert traffic["total_iops"] == 15.0
+
+
+def test_powerflex_ranks_a_hot_protection_domain() -> None:
+    rows = [
+        {"name": "pd-busy", "id": "1", "state": "Active", "traffic": {"total_iops": 800.0}},
+        {"name": "pd-quiet", "id": "2", "state": "Active", "traffic": {"total_iops": 200.0}},
+    ]
+    ranked = powerflex.rank_protection_domains(rows)
+    assert ranked["ranked"][0]["name"] == "pd-busy"
+    assert ranked["total_iops"] == 1000.0
+    assert any("hot protection domain" in finding for finding in ranked["findings"])
+
+
+def test_powerflex_even_traffic_names_no_hotspot() -> None:
+    rows = [
+        {"name": "pd-a", "id": "1", "state": "Active", "traffic": {"total_iops": 300.0}},
+        {"name": "pd-b", "id": "2", "state": "Active", "traffic": {"total_iops": 300.0}},
+    ]
+    ranked = powerflex.rank_protection_domains(rows)
+    assert any("none dominates" in finding for finding in ranked["findings"])
+
+
+# -- PowerFlex -> vSphere reverse mapping ------------------------------------
+
+
+def test_datastore_backing_naas_reads_vmfs_extents() -> None:
+    info = SimpleNamespace(
+        vmfs=SimpleNamespace(
+            extent=[SimpleNamespace(diskName="naa.6abc"), SimpleNamespace(diskName="naa.6def")]
+        )
+    )
+    assert datastore_backing_naas(info) == ["naa.6abc", "naa.6def"]
+    assert datastore_backing_naas(SimpleNamespace(nas=object())) == []  # NFS: no vmfs extent
+
+
+def test_map_backend_impact_picks_volumes_on_troubled_pds() -> None:
+    pds = [{"id": "pd1", "name": "prod"}, {"id": "pd2", "name": "quiet"}]
+    pd_stats = {
+        "pd1": {"rebuildPendingCapacityInKb": 9000},  # degraded -> troubled
+        "pd2": {},
+    }
+    pools = [{"id": "sp1", "protectionDomainId": "pd1"}, {"id": "sp2", "protectionDomainId": "pd2"}]
+    volumes = [
+        {"id": "VOL-AAAA", "name": "ds-a", "storagePoolId": "sp1"},
+        {"id": "VOL-BBBB", "name": "ds-b", "storagePoolId": "sp2"},
+    ]
+    impact = powerflex.map_backend_impact(pds, pd_stats, pools, volumes)
+    assert impact["volume_to_pd"] == {"vol-aaaa": "prod"}
+    assert "prod" in impact["troubled_protection_domains"]
+
+
+def test_affected_vms_joins_volumes_to_datastores_to_suffering_vms() -> None:
+    volume_to_pd = {"vol-aaaa": "prod"}
+    datastores = [
+        {"vcenter": "vc-a", "moref": "ds-1", "name": "ds-a", "powerflex_volume_ids": ["vol-aaaa"]},
+        {"vcenter": "vc-a", "moref": "ds-2", "name": "ds-b", "powerflex_volume_ids": ["vol-zzzz"]},
+    ]
+    vms_by_datastore = {
+        "ds-1": [
+            {"name": "web-01", "moref": "vm-1", "vcenter": "vc-a", "state": "busy_not_up", "suffering": True},
+            {"name": "web-02", "moref": "vm-2", "vcenter": "vc-a", "state": "up", "suffering": False},
+        ]
+    }
+    result = powerflex.affected_vms(volume_to_pd, datastores, vms_by_datastore)
+    assert len(result["affected_datastores"]) == 1
+    hit = result["affected_datastores"][0]
+    assert hit["datastore"] == "ds-a"
+    assert hit["protection_domain"] == "prod"
+    assert hit["suffering_total"] == 1
+    assert result["suffering_total"] == 1
+
+
+def test_affected_vms_says_so_when_nothing_maps() -> None:
+    result = powerflex.affected_vms({"vol-x": "pd"}, [], {})
+    assert result["affected_datastores"] == []
+    assert any("no datastore" in finding for finding in result["findings"])
+
+
+def _powerflex_client(handler: object) -> object:
+    settings = _settings(
+        VSPHERE_POWERFLEX_URL="https://gw",
+        VSPHERE_POWERFLEX_USERNAME="u",
+        VSPHERE_POWERFLEX_PASSWORD="p",
+    )
+    return powerflex.PowerFlex(settings, transport=httpx.MockTransport(handler))
+
+
+def test_powerflex_client_is_get_only_and_reuses_its_token() -> None:
+    logins = {"count": 0}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        assert request.method == "GET"  # the read-only proof: the client never writes
+        path = request.url.path
+        if path == "/api/login":
+            logins["count"] += 1
+            return httpx.Response(200, text='"tok-123"')
+        if path == "/api/logout":
+            return httpx.Response(200, text='""')
+        bodies: dict[str, object] = {
+            "/api/types/Sds/instances": [
+                {"name": "sds-1", "sdsState": "Normal", "mdmConnectionState": "Connected"}
+            ],
+            "/api/types/ProtectionDomain/instances": [{"id": "pd1", "name": "prod"}],
+            "/api/types/StoragePool/instances": [{"id": "sp1", "protectionDomainId": "pd1"}],
+            "/api/types/Volume/instances": [{"id": "VOL1", "name": "ds-a", "storagePoolId": "sp1"}],
+        }
+        if path in bodies:
+            return httpx.Response(200, json=bodies[path])
+        if "Statistics" in path:
+            return httpx.Response(
+                200, json={"userDataReadBwc": {"numOccured": 100, "numSeconds": 10, "totalWeightInKb": 4000}}
+            )
+        return httpx.Response(404, json={})
+
+    client = _powerflex_client(handler)
+
+    async def drive() -> tuple:
+        sds = await client.sds()
+        pds = await client.protection_domains()
+        stats = await client.protection_domain_statistics("pd1")
+        await client.aclose()
+        return sds, pds, stats
+
+    sds, pds, stats = asyncio.run(drive())
+    assert sds[0]["name"] == "sds-1"
+    assert pds[0]["id"] == "pd1"
+    assert powerflex.traffic_of(stats)["read_iops"] == 10.0
+    assert logins["count"] == 1  # token acquired once, then reused across calls
+
+
+def test_powerflex_login_failure_is_reported() -> None:
+    client = _powerflex_client(lambda _request: httpx.Response(401, text="denied"))
+    with pytest.raises(powerflex.PowerFlexError):
+        asyncio.run(client.sds())
+
+
+# -- host hardware sensors ----------------------------------------------------
+
+
+def test_host_sensors_flag_red_and_yellow() -> None:
+    sensors = [
+        {"name": "PSU1", "type": "power", "health": "green"},
+        {"name": "PSU2", "type": "power", "health": "red"},
+        {"name": "DIMM3", "type": "memory", "health": "yellow"},
+    ]
+    verdict = hostsensors.classify_sensors(sensors)
+    assert verdict["healthy"] is False
+    assert verdict["red"][0]["name"] == "PSU2"
+    assert any("CRITICAL" in finding for finding in verdict["findings"])
+
+
+def test_host_sensors_no_data_is_said_not_assumed_healthy() -> None:
+    verdict = hostsensors.classify_sensors([])
+    assert verdict["healthy"] is True
+    assert any("no hardware sensor data" in finding for finding in verdict["findings"])
+
+
+# -- crash dump header decode -------------------------------------------------
+
+
+def test_crash_dump_decodes_the_bugcheck_and_parameters() -> None:
+    parsed = {
+        "found": True,
+        "name": "103025-1234.dmp",
+        "signature": "PAGEDU64",
+        "code": 0x7A,
+        "params": [0x1, 0xFFFFF8000000, 0xC000000E, 0x2000],
+    }
+    decoded = crashdump.decode_dump(parsed)
+    assert decoded["found"] is True
+    assert decoded["bugcheck"]["code"] == "0x0000007A"
+    assert decoded["bugcheck"]["name"] == "KERNEL_DATA_INPAGE_ERROR"
+    assert decoded["parameters"][0] == "0x0000000000000001"
+
+
+def test_crash_dump_absent_is_reported() -> None:
+    assert crashdump.decode_dump({"found": False})["found"] is False

@@ -20,10 +20,13 @@ vROps (Aria / VCF Operations) is an **optional** integration: configure
 than vCenter keeps). Everything else — the whole diagnosis — runs on vCenter
 alone, so the server is fully useful with no vROps at all.
 
-It is read-only with one deliberate exception: `run_in_guest` executes a
-command inside a guest OS for a diagnostic a read cannot answer. It is marked
-not-read-only and routed outside the read-only guard on purpose (see below);
-nothing else can change a VM.
+It is read-only with deliberate exceptions that act on a VM: `run_in_guest`
+executes a command inside a guest OS for a diagnostic a read cannot answer,
+`reboot_guest` / `hard_reset` reboot a wedged VM so it writes a fresh boot log,
+and `check_ems` / `investigate_windows_boot` read the guest's BCD and event log
+(so they too run a command in the guest). All are marked not-read-only and
+routed outside the read-only guard on purpose (see below); nothing else can
+change a VM.
 
 It answers two kinds of question:
 
@@ -35,7 +38,7 @@ It answers two kinds of question:
   linked-clone base disk, environment, ...) against their population, and
   `explain_group` says why a group is abnormal.
 
-## Read-only, by construction (with one marked exception)
+## Read-only, by construction (with marked exceptions)
 
 The accounts it may run with can write, so the guarantee is in the code, not
 the account:
@@ -54,16 +57,25 @@ the account:
   reset, answer, reconfigure, destroy and screenshot-to-datastore through a
   live session and expects each to be refused.
 
-**The one exception is `run_in_guest`**, enabled deliberately: it runs a
-command inside a guest OS through VMware Tools, so it cannot be read-only. It
-does **not** go through `ReadOnlyStub` — it uses the session's raw stub on
-purpose (`VCenterSession.run_in_guest`) and is the only path that can change a
-VM. It needs VMware Tools running in the guest and guest-OS credentials (per
-call, or `VSPHERE_GUEST_USERNAME` / `VSPHERE_GUEST_PASSWORD`), captures output
-via a temp file in the guest that it downloads and deletes, and a test proves
-that invoking it never adds a method to the read-only (guarded) surface.
-Everything else is read-only: nothing is created, changed, answered, powered or
-deleted, and the server runs nothing in the background.
+**The exceptions are the three tools that act on a VM**, enabled deliberately
+and all routed outside the guard on the session's raw stub, never through
+`ReadOnlyStub`; a test proves that invoking each one never adds a method to the
+read-only (guarded) surface:
+
+- **`run_in_guest`** runs a command inside a guest OS through VMware Tools, for a
+  diagnostic a read cannot answer. It needs Tools running and guest-OS
+  credentials (per call, or `VSPHERE_GUEST_USERNAME` / `VSPHERE_GUEST_PASSWORD`),
+  and captures output via a temp file in the guest that it downloads and deletes.
+- **`reboot_guest`** asks the guest to reboot gracefully through Tools — no data
+  loss, but needs Tools and a responsive guest. Try it first.
+- **`hard_reset`** power-cycles the VM (`ResetVM_Task`) with no Tools, so it can
+  reboot a fully hung VM — but it is destructive: the guest is never asked, so
+  in-flight writes and in-guest evidence (an unwritten crash dump, update
+  progress) can be lost. Both exist because a wedged VM often has to be rebooted
+  before it writes a fresh boot log; prefer the graceful one.
+
+Everything else is read-only: nothing is created, changed, answered or deleted,
+and the server runs nothing in the background.
 
 ## Concepts, not constants
 
@@ -119,10 +131,11 @@ Configure it entirely through `VSPHERE_`-prefixed environment variables — only
 | `VSPHERE_MAX_SCREENSHOT_BYTES` | 16 MiB | ceiling on one console screenshot |
 | `VSPHERE_MAX_SCANS_KEPT` | `10` | how many recent scans stay available for `explain_group` (history depth, not a per-vCenter count) |
 | `VSPHERE_GUEST_USERNAME`, `VSPHERE_GUEST_PASSWORD` | none | **default guest-OS credentials for `run_in_guest`** — the one tool that is not read-only; omit to require them per call |
-| `VSPHERE_GUEST_EXEC_OVER_HTTP` | `0` | also offer `run_in_guest` over the HTTP transport, which has no authentication of its own; stdio always offers it |
+| `VSPHERE_GUEST_EXEC_OVER_HTTP` | `0` | also offer the tools that act on a VM (guest commands, reboots, resets) over the HTTP transport, which has no authentication of its own; stdio always offers them |
 | `VSPHERE_GUEST_EXEC_TIMEOUT_SECONDS` | `30` | how long `run_in_guest` waits for a command to finish |
 | `VSPHERE_GUEST_EXEC_MAX_OUTPUT_BYTES` | 1 MiB | most command output `run_in_guest` returns |
 | `VSPHERE_VROPS_URL`, `VSPHERE_VROPS_USERNAME`, `VSPHERE_VROPS_PASSWORD`, `VSPHERE_VROPS_AUTH_SOURCE` | none | **optional** vROps (Aria / VCF Operations); its 5 history tools appear only when the URL is set |
+| `VSPHERE_POWERFLEX_URL`, `VSPHERE_POWERFLEX_USERNAME`, `VSPHERE_POWERFLEX_PASSWORD` | none | **optional** Dell PowerFlex (ScaleIO / VxFlex) Gateway; its backend-health tools appear only when the URL is set |
 
 An MCP client config, over stdio:
 
@@ -147,9 +160,9 @@ Or shared over HTTP, alongside your other MCP servers:
 `vsphere-triage --transport streamable-http --host 0.0.0.0 --port 8000 --allowed-host vsphere-triage.example`
 (`/healthz` for probes). Over HTTP every caller shares the configured
 credential, and the HTTP transport has no authentication of its own, so
-`run_in_guest` is **not offered over HTTP** unless `VSPHERE_GUEST_EXEC_OVER_HTTP=1`
-is set (do that only behind an authenticating proxy); every other tool only reads.
-Over stdio, the default, `run_in_guest` is always offered.
+the tools that act on a VM (`run_in_guest`, `reboot_guest`, `hard_reset`, `check_ems`, `investigate_windows_boot`, `investigate_linux_boot`, `read_crash_dump`) are **not offered over HTTP** unless
+`VSPHERE_GUEST_EXEC_OVER_HTTP=1` is set (do that only behind an authenticating
+proxy); every other tool only reads. Over stdio, the default, they are always offered.
 
 A dedicated vCenter role is still worth creating where the account allows it,
 so the guarantee holds twice: read inventory, console screen read (confirm
@@ -167,10 +180,14 @@ plugin marketplace (`.claude-plugin/`). Add the marketplace and install:
 /plugin install vsphere-triage@vsphere-triage
 ```
 
-The install prompts for the vCenters JSON, username, password (kept in the OS
-secure store), and a **package index** — left at public PyPI for connected
-installs, or set to your internal mirror for air-gapped ones. The server then
-runs via `uvx` and auto-starts; the skill is invoked as
+The install prompts for the vCenters JSON, username and password (kept in the
+OS secure store), and optionally the environment parent-folder hints, a CA
+bundle, vROps URL/credentials, `run_in_guest` credentials, and the package
+index (public PyPI, or an internal mirror for air-gapped installs). Leave any
+optional field blank to disable it. Anything not prompted here — thresholds,
+timeouts, `VSPHERE_TLS_VERIFY`, and the rest of the `VSPHERE_*` table above —
+is read from the environment the server inherits, so you can set those the
+usual way. The server runs via `uvx` and auto-starts; the skill is invoked as
 `/vsphere-triage:vm-incident`. Nothing is published to npm — the plugin is
 served straight from the git repo, and the Python package from PyPI or your
 internal index.
@@ -182,6 +199,9 @@ internal index.
 | `list_vcenters` | which vCenters, reachable, version, clock |
 | `check_vcenters` | reachability, login time and open-session count per vCenter, for when the vCenter API itself is failing (SSL EOF, resets) — the sign of connection/session exhaustion |
 | `vcenter_sessions` | a vCenter's open sessions grouped by user, source IP and client, with idle counts and the oldest — finds the client leaking sessions behind the exhaustion |
+| `vcenter_history` | a vCenter's session/login events over a past window (login surge, failed logins, one source churning) — for an SSL EOF or exhaustion that has since cleared, which the live `check_vcenters` cannot see |
+| `cluster_events` | cluster-level events over a window: vSphere HA restarts, host isolation/failure/connection-lost, DRS migration waves — names a mass-reboot cause above the VMs instead of inferring it |
+| `recent_tasks` | what was *done* on a vCenter in a window (migrations, reconfigures, snapshots, failures), grouped and wave-flagged — the "someone did X" cause that shows in no single VM |
 | `scan` | abnormal VMs on some or all vCenters, grouped by what they share; hosts over the CPU threshold and slow storage right now |
 | `explain_group` | what a scan group's abnormal VMs share that the healthy ones beside them do not; CPU and storage over its boot window |
 | `find_old_environments` | environments older than N hours (the age of their oldest VM), optionally only under `projects`, `environments`, `projects/team-x` or any other path segments, oldest first, with their VMs' states |
@@ -190,6 +210,16 @@ internal index.
 | `diagnose_vm` | one VM: machine, CPU, storage, environment, boot timeline, serial console (EMS), console; the likely cause with evidence for and against |
 | `diagnose_environment` | every VM of an environment, grouped, with CPU and storage |
 | `run_in_guest` | **not read-only** — runs a command inside a guest OS (needs VMware Tools and guest credentials) and returns its output and exit code, for a diagnostic a read cannot answer |
+| `reboot_guest` | **not read-only** — asks the guest to reboot gracefully through VMware Tools (no data loss, needs Tools); try this before `hard_reset` to make a wedged VM write a fresh boot log |
+| `hard_reset` | **not read-only, destructive** — power-cycles the VM (`ResetVM_Task`, no Tools needed) to reboot a fully hung VM; the guest is not asked, so in-flight writes and in-guest evidence can be lost |
+| `check_ems` | **not read-only** (reads the BCD in-guest) — whether the serial console (EMS on Windows) can carry the guest's boot words: serial-port hardware, output seen, and the `bcdedit` EMS state; says why it is unavailable and how to enable it |
+| `investigate_windows_boot` | **not read-only** (reads the guest) — the Windows boot picture from the guest's own event log: last bugcheck (WER 1001, decoded), unclean shutdowns, service/driver timeouts, slow-boot components, crash dumps and repair/update logs |
+| `investigate_linux_boot` | **not read-only** (reads the guest) — the Linux boot picture: dmesg (panics, soft-lockups, hung tasks, device timeouts, filesystem errors), systemd-analyze blame/critical-chain, journalctl -b, mapped to the layer each points at |
+| `read_crash_dump` | **not read-only** (reads the guest) — decodes the newest Windows minidump's header: the bugcheck code (to its layer) and the 4 parameters the event log omits; no WinDbg/symbols, so it does not name the faulting driver |
+| `powerflex_health` | **optional** (PowerFlex configured) — Dell PowerFlex backend health: SDS/device state and any rebuild/rebalance in progress, the usual cause of a PowerFlex-backed datastore going slow |
+| `powerflex_protection_domains` | **optional** — protection domains ranked by traffic (read/write IOPS + throughput), flagging a hot PD carrying a disproportionate share — the busy-PD pattern behind datastores on it going slow |
+| `powerflex_find_volume` | **optional** — map a slow datastore to its PowerFlex volume by name, id, or ESXi device id (naa/eui) |
+| `powerflex_affected_vms` | **optional** — the top-down flow: find troubled/hot protection domains, map their volumes back to vSphere datastores, and report the VMs on them split into suffering and healthy |
 | `get_boot_timeline` | how far the last boot got, from `vmware.log`, plus the serial console |
 | `read_vm_log` | `vmware.log` / `vmware-N.log` lines, filtered on the server |
 | `read_serial_console` | Windows EMS or a Linux kernel console, when the VM has a serial port to a file; stop codes with the layer each points at |
@@ -202,7 +232,7 @@ internal index.
 | `find_resource_limits` | VMs throttled or constrained by a configured CPU/memory limit or reservation — a CPU limit mimics host starvation, a memory limit forces balloon/swap; templates marked, since a linked clone inherits the template's limit |
 | `check_host_time` | each ESXi host's NTP configuration and clock skew from vCenter — drift breaks TLS and Kerberos/AD auth, a root of the SSL/handshake errors separate from session exhaustion |
 | `check_datastores` | every datastore's fill, thin over-provisioning and per-host reachability (APD/PDL); datastores holding a template's base disk are marked, since they take every clone down with them |
-| `get_host_health` | a host's CPU demand against capacity, its storage, its VMs |
+| `get_host_health` | a host's CPU demand against capacity, its storage, its **hardware sensors** (PSU/fan/temperature/memory — a failing host stalls its VMs), and its VMs |
 | `get_datastore_health` | a datastore's latency and IOPS from every host mounting it, its VMs |
 | `read_host_log` | `vmkernel` / `hostd` / `vpxa` lines, filtered |
 | `vrops_*` | find a resource, list its stat keys, read stats, compare a window with previous days, alerts |

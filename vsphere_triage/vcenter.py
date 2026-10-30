@@ -95,7 +95,9 @@ def ssl_context(settings: Settings) -> ssl.SSLContext:
         context.check_hostname = False
         context.verify_mode = ssl.CERT_NONE
         return context
-    return ssl.create_default_context(cafile=settings.ca_bundle)
+    # `or None`: an empty VSPHERE_CA_BUNDLE (e.g. an unset plugin field passed
+    # as "") means "use the system trust store", not "load the file ''".
+    return ssl.create_default_context(cafile=settings.ca_bundle or None)
 
 
 def session_cookie(raw: str) -> str:
@@ -515,6 +517,43 @@ class VCenterSession:
         """One host's own clock, read through its dateTimeSystem (QueryDateTime, read-only)."""
         system = self.reference("HostDateTimeSystem", datetime_system_moref)
         return as_utc(system.QueryDateTime())
+
+    def _raw_virtual_machine(self, moref: str) -> Any:
+        """A VirtualMachine bound to the raw (unguarded) stub, for the write operations.
+
+        The read-only stub refuses every mutating method, so the deliberately
+        allowed write tools — guest exec and the two power operations — reach the
+        VM through the raw SOAP stub on purpose, exactly as `run_in_guest` does.
+        """
+        _ = self.content
+        if self._raw is None:
+            msg = "Session is not connected"
+            raise VSphereError(msg)
+        raw_stub = self._raw._stub  # noqa: SLF001 - the deliberate unguarded path for the write tools
+        return vim.VirtualMachine(moref, raw_stub)
+
+    def reboot_guest(self, moref: str) -> dict[str, Any]:
+        """Ask the guest OS to reboot gracefully through VMware Tools. NOT read-only.
+
+        `RebootGuest` hands the request to Tools, which shuts the OS down cleanly
+        and lets it boot again — no data loss, but it needs Tools running and a
+        guest that is still responsive enough to act on it. It returns nothing on
+        success; a hung guest that never reboots is why `hard_reset` exists.
+        """
+        self._raw_virtual_machine(moref).RebootGuest()
+        return {"issued": "RebootGuest", "graceful": True}
+
+    def hard_reset(self, moref: str) -> dict[str, Any]:
+        """Power-cycle the VM immediately through `ResetVM_Task`. NOT read-only, and destructive.
+
+        This is the virtual reset button: the guest is not asked and gets no
+        chance to flush, so in-flight writes can be lost and in-guest evidence
+        (an unwritten crash dump, update progress) can be destroyed. It needs no
+        Tools, so it is the only way to reboot a fully hung VM. Returns the task
+        reference; it does not wait for the boot.
+        """
+        task = self._raw_virtual_machine(moref).ResetVM_Task()
+        return {"issued": "ResetVM_Task", "graceful": False, "task": task._moId}  # noqa: SLF001 - the task's id for the caller
 
     def run_in_guest(
         self,

@@ -18,6 +18,7 @@ The command-shaping is pure and tested here; the SOAP dance is
 
 from __future__ import annotations
 
+import base64
 from typing import TYPE_CHECKING, Any
 
 from vsphere_triage.diagnose import locate
@@ -51,6 +52,31 @@ def guest_program_spec(command: str, out_path: str, *, windows: bool) -> tuple[s
     if windows:
         return WINDOWS_SHELL, f'/c ({command}) > "{out_path}" 2>&1'
     return LINUX_SHELL, f"-c \"exec > '{out_path}' 2>&1; {command}\""
+
+
+def encode_powershell(script: str) -> str:
+    """A cmd.exe-safe command that runs `script` in PowerShell.
+
+    PowerShell's `-EncodedCommand` takes base64 of UTF-16LE, so the whole script
+    — braces, quotes, newlines and all — travels as one token with nothing for
+    the guest's shell to mis-parse. This is how the Windows investigations (EMS
+    BCD state, the boot picture) run multi-statement scripts through the
+    single-string guest-exec channel without quote breakage.
+    """
+    encoded = base64.b64encode(script.encode("utf-16-le")).decode("ascii")
+    return f"powershell -NoProfile -NonInteractive -EncodedCommand {encoded}"
+
+
+def encode_shell(script: str) -> str:
+    """A shell-safe command that runs a multi-line `script` under /bin/sh.
+
+    The script is base64-encoded and piped through `base64 -d | sh`, so the whole
+    thing — pipes, quotes, greps — travels as one token with nothing for the
+    guest's shell wrapper to mis-parse, the Linux counterpart of
+    `encode_powershell`.
+    """
+    encoded = base64.b64encode(script.encode()).decode("ascii")
+    return f"echo {encoded}|base64 -d|sh"
 
 
 def rewrite_transfer_url(url: str, host: str) -> str:

@@ -21,7 +21,7 @@ if TYPE_CHECKING:
     from vsphere_triage.config import Settings
     from vsphere_triage.vcenter import VCenterPool, VCenterSession
 
-CATEGORIES = ("ethernet", "disk", "cdrom", "serial", "sound", "usb", "controller", "video", "input")
+CATEGORIES = ("ethernet", "disk", "cdrom", "serial", "sound", "usb", "controller", "video", "input", "vmci")
 
 
 def _has_device(row: dict[str, Any], device: str) -> bool:

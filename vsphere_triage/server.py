@@ -34,9 +34,28 @@ from PIL import Image
 from pyVmomi import vim, vmodl
 from starlette.responses import JSONResponse
 
-from vsphere_triage import ages, guestexec, hardware, resources, snapshots, storagehealth, timecheck
+from vsphere_triage import (
+    ages,
+    capabilities,
+    clusterevents,
+    connhistory,
+    crashdump,
+    emscheck,
+    guestexec,
+    hardware,
+    hostsensors,
+    linuxboot,
+    power,
+    powerflex,
+    resources,
+    snapshots,
+    storagehealth,
+    taskhistory,
+    timecheck,
+    winboot,
+)
 from vsphere_triage import scan as scanning
-from vsphere_triage.checks import classify, count_states
+from vsphere_triage.checks import ABNORMAL, classify, count_states
 from vsphere_triage.config import NotFoundError, Settings
 from vsphere_triage.contention import hosts_cpu, storage
 from vsphere_triage.diagnose import (
@@ -53,6 +72,8 @@ from vsphere_triage.diagnose import (
 )
 from vsphere_triage.formatting import bounded
 from vsphere_triage.inventory import find_environment as environment_folders
+from vsphere_triage.inventory import read_datastore_mounts, read_inventory
+from vsphere_triage.powerflex import PowerFlexError
 from vsphere_triage.readonly import ReadOnlyViolationError
 from vsphere_triage.vcenter import VCenterPool, VSphereError
 from vsphere_triage.vmlog import caller_pattern, grep, parse_lines
@@ -75,6 +96,7 @@ ANTICIPATED = (
     regex.error,
     VSphereError,
     VropsError,
+    PowerFlexError,
     ReadOnlyViolationError,
     vmodl.MethodFault,
     httpx.HTTPError,
@@ -83,8 +105,9 @@ ANTICIPATED = (
 )
 
 READ_ONLY = ToolAnnotations(readOnlyHint=True, destructiveHint=False, idempotentHint=True, openWorldHint=True)
-# run_in_guest is the one tool that acts on a VM; it is not read-only and says so.
-GUEST_EXEC = ToolAnnotations(
+# The tools that act on a VM rather than only reading it — guest exec and the
+# two power operations. They are not read-only, and say so to a client.
+NOT_READ_ONLY = ToolAnnotations(
     readOnlyHint=False, destructiveHint=True, idempotentHint=False, openWorldHint=True
 )
 MAX_LIMIT = 500
@@ -95,10 +118,11 @@ that are stuck — on first boot, after a reboot, or hung at any point — slow 
 come up, losing VMware Tools, blocked on a question, starved, or wedged by a
 virtual device; and for when the vCenter API itself is the problem (SSL EOF
 errors, resets, timeouts, often connection or session exhaustion). Every tool
-reads only, with one deliberate exception: run_in_guest executes a command
-inside a guest OS (it needs VMware Tools running and guest credentials) for a
-diagnostic a read cannot answer. It is marked not-read-only; nothing else can
-change a VM.
+reads only, with three deliberate exceptions that act on a VM: run_in_guest
+executes a command inside a guest OS (needs VMware Tools and guest credentials)
+for a diagnostic a read cannot answer, and reboot_guest / hard_reset reboot a
+wedged VM so it writes a fresh boot log. They are marked not-read-only; prefer a
+graceful reboot_guest over a destructive hard_reset, and nothing else changes a VM.
 
 When the symptom is SSL EOF / reset / timeout against a vCenter that many
 clients hit (this server included), start with check_vcenters: a high session
@@ -137,6 +161,11 @@ Reading the answers:
   carry the guest's words when present; their absence is normal.
 - Every result says what it could not read. Missing data is not evidence that
   nothing happened.
+- A wedged VM may have to be rebooted before it writes a fresh boot log, serial
+  console and (on Windows) its next-boot bugcheck. Try reboot_guest first
+  (graceful, needs Tools); fall back to hard_reset (destructive, no Tools) only
+  when Tools is down or the graceful reboot never came back. Then re-read
+  get_boot_timeline and read_serial_console.
 """
 
 
@@ -201,6 +230,7 @@ def build_server(
     fleet = pool or VCenterPool(resolved)
     scans = scanning.ScanStore(resolved.max_scans_kept)
     vrops = Vrops(resolved) if resolved.vrops_url else None
+    powerflex_client = powerflex.PowerFlex(resolved) if resolved.powerflex_url else None
 
     @asynccontextmanager
     async def lifespan(_server: MCPServer) -> AsyncGenerator[dict[str, Any]]:
@@ -210,6 +240,8 @@ def build_server(
             fleet.close()
             if vrops is not None:
                 await vrops.aclose()
+            if powerflex_client is not None:
+                await powerflex_client.aclose()
 
     server = MCPServer(
         name="vsphere-triage",
@@ -231,6 +263,8 @@ def build_server(
     _register_infrastructure_tools(tool, fleet, resolved)
     if vrops is not None:
         _register_vrops_tools(tool, vrops)
+    if powerflex_client is not None:
+        _register_powerflex_tools(tool, powerflex_client, fleet, resolved)
     server.vcenters = fleet  # type: ignore[attr-defined]  # ty: ignore[unresolved-attribute] - attached for the tests to read methods_seen
     return server
 
@@ -244,8 +278,8 @@ def _registrar(server: MCPServer, resolved: Settings) -> Callable[[str | None], 
     ) -> Callable[[Callable[..., Awaitable[dict[str, Any]]]], Any]:
         """Register a tool: admitted, bounded, a lookup miss answered rather than raised.
 
-        Read-only by default; `annotations=GUEST_EXEC` marks the one tool that acts
-        on a VM, so a client sees it is not read-only.
+        Read-only by default; `annotations=NOT_READ_ONLY` marks a tool that acts
+        on a VM (guest exec, the power operations), so a client sees it is not read-only.
         """
 
         def register(function: Callable[..., Awaitable[dict[str, Any]]]) -> Any:
@@ -351,7 +385,138 @@ def _register_fleet_tools(  # noqa: C901, PLR0915 - one closure per tool
                     f"took {result['login_seconds']}s (at {_clock(result['login_at'])}), "
                     f"round trip now {result['round_trip_seconds']}s"
                 )
-        return {"vcenters": rows, "findings": findings or ["all configured vCenters reachable"]}
+        gap = capabilities.vrops_gap(resolved)
+        return {
+            "vcenters": rows,
+            "findings": findings or ["all configured vCenters reachable"],
+            "note": (
+                "this is the live state only; for a failure that has since cleared (an SSL EOF hours "
+                "ago) read vcenter_history for the session-event window"
+                + ("" if gap else ", or the vrops_* tools for the session-count curve")
+            ),
+            "evidence_gaps": [gap] if gap else [],
+        }
+
+    @tool()
+    async def vcenter_history(*, vcenter: str, minutes: int = 180) -> dict[str, Any]:
+        """A vCenter's session/login events over a past window, for a failure that has cleared.
+
+        check_vcenters sees only the live state, so an SSL EOF or session spike
+        from earlier is invisible to it. This reads the vCenter's own session
+        events over the last `minutes` and looks for the shape of session or
+        connection exhaustion — a surge of logins, failed logins, or many
+        logins from one source (a client leaking sessions). It is the
+        vCenter-native history; vROps keeps the actual session-count curve, and
+        the result names it when it is not configured.
+
+        Args:
+            vcenter: the vCenter to read.
+            minutes: how far back to read (default 180).
+
+        """
+        name = fleet.resolve(vcenter)
+
+        def run(session: VCenterSession) -> dict[str, Any]:
+            now = session.now()
+            events = session.events(
+                begin=now - timedelta(minutes=minutes), end=now, types=connhistory.SESSION_EVENT_TYPES
+            )
+            rows = [
+                {
+                    "type": type(event).__name__,
+                    "time": getattr(event, "createdTime", None),
+                    "user": getattr(event, "userName", None),
+                    "source": getattr(event, "ipAddress", None),
+                }
+                for event in events
+            ]
+            summary = connhistory.summarize_session_events(rows, now=now, window_minutes=minutes)
+            return {"vcenter": session.vcenter.name, "live_sessions": session.session_count()} | summary
+
+        result = await fleet.run(name, run)
+        gap = capabilities.vrops_gap(resolved)
+        return result | {"evidence_gaps": [gap] if gap else []}
+
+    @tool()
+    async def cluster_events(*, vcenters: list[str] | None = None, minutes: int = 120) -> dict[str, Any]:
+        """Cluster-level events over a window: HA restarts, host failures, DRS migrations.
+
+        When many VMs reboot or go unreachable together, the cause is usually
+        above them — a vSphere HA restart after a host failed or was isolated, a
+        host dropping out of vCenter, or a DRS migration wave. This reads those
+        events (not per-VM) and names the shape, so a mass incident is explained
+        once rather than diagnosed VM by VM. Run it early when the symptom spans
+        a cluster.
+
+        Args:
+            vcenters: vCenter names; all when empty.
+            minutes: how far back to read (default 120).
+
+        """
+        names = _names(fleet, vcenters)
+
+        def run(session: VCenterSession) -> dict[str, Any]:
+            now = session.now()
+            events = session.events(begin=now - timedelta(minutes=minutes), end=now)
+            rows = [
+                {
+                    "type": type(event).__name__,
+                    "time": getattr(event, "createdTime", None),
+                    "message": getattr(event, "fullFormattedMessage", "") or "",
+                    "host": getattr(getattr(event, "host", None), "name", None),
+                    "vm": getattr(getattr(event, "vm", None), "name", None),
+                }
+                for event in events
+            ]
+            return {"vcenter": session.vcenter.name} | clusterevents.summarize_cluster_events(
+                rows, now=now, window_minutes=minutes
+            )
+
+        results = await asyncio.gather(*(fleet.run(name, run) for name in names), return_exceptions=True)
+        rows = [
+            result if not isinstance(result, BaseException) else {"error": str(result)} for result in results
+        ]
+        return {"vcenters": rows}
+
+    @tool()
+    async def recent_tasks(*, vcenter: str, minutes: int = 120) -> dict[str, Any]:
+        """What was *done* on a vCenter in a window: migrations, reconfigures, snapshots, failures.
+
+        Events say what happened; tasks say what someone or an automation did. A
+        storage-vMotion sweep onto one datastore, a mass reconfigure, a snapshot
+        consolidation — each can stall the VMs caught in it and shows in no single
+        VM's counters. This groups the task stream and flags waves and failures.
+
+        Args:
+            vcenter: the vCenter to read.
+            minutes: how far back to read (default 120).
+
+        """
+        name = fleet.resolve(vcenter)
+
+        def run(session: VCenterSession) -> dict[str, Any]:
+            now = session.now()
+            events = session.events(begin=now - timedelta(minutes=minutes), end=now, types=("TaskEvent",))
+            rows = []
+            for event in events:
+                info = getattr(event, "info", None)
+                if info is None:
+                    continue
+                reason = getattr(info, "reason", None)
+                rows.append(
+                    {
+                        "operation": getattr(info, "descriptionId", None) or getattr(info, "name", "") or "",
+                        "target": getattr(info, "entityName", None),
+                        "state": str(getattr(info, "state", "")),
+                        "time": getattr(event, "createdTime", None),
+                        "user": getattr(reason, "userName", None) or getattr(event, "userName", None),
+                    }
+                )
+            return {"vcenter": session.vcenter.name} | taskhistory.summarize_tasks(
+                rows, now=now, window_minutes=minutes
+            )
+
+        return await fleet.run(name, run)
 
     @tool()
     async def vcenter_sessions(*, vcenter: str) -> dict[str, Any]:
@@ -656,9 +821,13 @@ def _register_fleet_tools(  # noqa: C901, PLR0915 - one closure per tool
 
         """
         names = _names(fleet, vcenters)
-        return await storagehealth.check_datastores(
+        result = await storagehealth.check_datastores(
             fleet, resolved, names, only_problems=only_problems, limit=max(1, min(limit, MAX_LIMIT))
         )
+        # PowerFlex is the backend behind these datastores; name it as the source
+        # that would say whether a rebuild is the cause, when it is not configured.
+        gap = capabilities.powerflex_gap(resolved)
+        return result | {"evidence_gaps": [gap] if gap else []}
 
     @tool()
     async def diagnose_window(
@@ -686,7 +855,7 @@ def _register_fleet_tools(  # noqa: C901, PLR0915 - one closure per tool
         return await scanning.diagnose_window(fleet, resolved, names, begin, end)
 
 
-def _register_machine_tools(  # noqa: C901 - one closure per tool
+def _register_machine_tools(  # noqa: C901, PLR0915 - one closure per tool
     tool: Callable[..., Any], fleet: VCenterPool, resolved: Settings, *, guest_exec: bool = True
 ) -> None:
     """Environments and machines: finding them, diagnosing them, and each piece on its own."""
@@ -814,10 +983,12 @@ def _register_machine_tools(  # noqa: C901 - one closure per tool
         name = fleet.resolve(vcenter)
         return await fleet.run(name, lambda session: diagnose_environment(session, resolved, env_id=env_id))
 
+    # Every tool from here on acts on a VM (guest commands, reboots, resets): left out
+    # entirely when guest_exec is off, as the CLI does over unauthenticated HTTP.
     if not guest_exec:
         return
 
-    @tool("run_in_guest", annotations=GUEST_EXEC)
+    @tool("run_in_guest", annotations=NOT_READ_ONLY)
     async def run_in_guest_tool(
         *,
         vcenter: str,
@@ -863,6 +1034,248 @@ def _register_machine_tools(  # noqa: C901 - one closure per tool
             env_id=env_id,
             vm_name=vm_name,
             command=command,
+            username=username,
+            password=password,
+        )
+
+    @tool("reboot_guest", annotations=NOT_READ_ONLY)
+    async def reboot_guest_tool(
+        *,
+        vcenter: str,
+        moref: str | None = None,
+        env_id: str | None = None,
+        vm_name: str | None = None,
+    ) -> dict[str, Any]:
+        """Ask the guest OS to reboot gracefully through VMware Tools. NOT read-only.
+
+        TRY THIS BEFORE hard_reset. It hands the request to VMware Tools, which
+        shuts the OS down cleanly and lets it boot again — no data loss. It needs
+        Tools running and a guest responsive enough to obey, so it will not reboot
+        a fully hung VM; for that, fall back to hard_reset.
+
+        Why reboot at all: a wedged VM often has to be rebooted before it produces
+        a fresh boot log, serial console, and (on Windows) the bugcheck its next
+        boot records. After it comes back, read get_boot_timeline / read_serial_console.
+
+        Find the VM by moref, or by env_id plus vm_name (never by name alone).
+
+        Args:
+            vcenter: the VM's vCenter.
+            moref: the VM's moref, or give env_id and vm_name.
+            env_id: the environment id, with vm_name.
+            vm_name: the machine's name inside its environment.
+
+        """
+        name = fleet.resolve(vcenter)
+        return await power.reboot_guest(fleet, resolved, name, moref=moref, env_id=env_id, vm_name=vm_name)
+
+    @tool("hard_reset", annotations=NOT_READ_ONLY)
+    async def hard_reset_tool(
+        *,
+        vcenter: str,
+        moref: str | None = None,
+        env_id: str | None = None,
+        vm_name: str | None = None,
+    ) -> dict[str, Any]:
+        """Power-cycle the VM immediately, without asking the guest. NOT read-only, and DESTRUCTIVE.
+
+        This is the virtual reset button. The guest is never asked and gets no
+        chance to flush, so IN-FLIGHT WRITES CAN BE LOST and in-guest evidence can
+        be destroyed — an unwritten crash dump, "Working on updates" progress, the
+        current hung state itself. It needs no VMware Tools, so it is the only way
+        to reboot a fully hung VM.
+
+        Use reboot_guest first; reach for this only when Tools is down or a
+        graceful reboot was issued and the VM never came back. After it resets,
+        read get_boot_timeline / read_serial_console for the fresh boot.
+
+        Find the VM by moref, or by env_id plus vm_name (never by name alone).
+
+        Args:
+            vcenter: the VM's vCenter.
+            moref: the VM's moref, or give env_id and vm_name.
+            env_id: the environment id, with vm_name.
+            vm_name: the machine's name inside its environment.
+
+        """
+        name = fleet.resolve(vcenter)
+        return await power.hard_reset(fleet, resolved, name, moref=moref, env_id=env_id, vm_name=vm_name)
+
+    @tool("check_ems", annotations=NOT_READ_ONLY)
+    async def check_ems_tool(
+        *,
+        vcenter: str,
+        moref: str | None = None,
+        env_id: str | None = None,
+        vm_name: str | None = None,
+        username: str | None = None,
+        password: str | None = None,
+    ) -> dict[str, Any]:
+        """Report whether this VM's serial console (EMS on Windows) can carry the guest's boot words.
+
+        Answers the capability in full: whether a virtual serial port writes to a
+        file (hardware, no guest needed), whether EMS/console output has actually
+        landed there, and — on Windows when VMware Tools and guest credentials
+        are available — whether EMS is turned on in the guest's BCD
+        (`bcdedit /enum {current}`/`{emssettings}`, read-only). The verdict says
+        whether the boot words are readable and, when not, why (no serial port /
+        EMS off / unconfirmed) and how to enable it. Use it when serial-console
+        evidence is missing, so you can tell the user the hole exists and how to
+        close it. Reading the BCD runs a read-only command in the guest, so this
+        is marked not-read-only.
+
+        Find the VM by moref, or by env_id plus vm_name.
+
+        Args:
+            vcenter: the VM's vCenter.
+            moref: the VM's moref, or give env_id and vm_name.
+            env_id: the environment id, with vm_name.
+            vm_name: the machine's name inside its environment.
+            username: guest-OS account for the BCD read; the configured default when omitted.
+            password: that account's password; the configured default when omitted.
+
+        """
+        name = fleet.resolve(vcenter)
+        return await emscheck.check_ems(
+            fleet,
+            resolved,
+            name,
+            moref=moref,
+            env_id=env_id,
+            vm_name=vm_name,
+            username=username,
+            password=password,
+        )
+
+    @tool("investigate_windows_boot", annotations=NOT_READ_ONLY)
+    async def investigate_windows_boot_tool(
+        *,
+        vcenter: str,
+        moref: str | None = None,
+        env_id: str | None = None,
+        vm_name: str | None = None,
+        username: str | None = None,
+        password: str | None = None,
+    ) -> dict[str, Any]:
+        """Build the picture of a Windows boot from the guest's own event log and crash records.
+
+        Reads, in one pass through the guest (VMware Tools + credentials needed):
+        the last bugcheck the next boot recorded (WER 1001), unclean shutdowns
+        (Kernel-Power 41 / EventLog 6008), service/driver start timeouts (SCM
+        7009/7011 — often what "the kernel timed out" really is), the slow-boot
+        components named by Diagnostics-Performance (100-103), and the presence
+        of crash dumps, ntbtlog, SrtTrail and the update Panther log. Bugcheck
+        codes are decoded to the layer they point at. The queries are read-only
+        (Get-WinEvent / Get-Content), run as a guest command, so it is marked
+        not-read-only.
+
+        If the VM is powered off, reboot it first (reboot_guest, else hard_reset)
+        and let it come up — the running event log is what this reads. The result
+        says so rather than failing silently.
+
+        Args:
+            vcenter: the VM's vCenter.
+            moref: the VM's moref, or give env_id and vm_name.
+            env_id: the environment id, with vm_name.
+            vm_name: the machine's name inside its environment.
+            username: guest-OS account; the configured default when omitted.
+            password: that account's password; the configured default when omitted.
+
+        """
+        name = fleet.resolve(vcenter)
+        return await winboot.investigate_windows_boot(
+            fleet,
+            resolved,
+            name,
+            moref=moref,
+            env_id=env_id,
+            vm_name=vm_name,
+            username=username,
+            password=password,
+        )
+
+    @tool("investigate_linux_boot", annotations=NOT_READ_ONLY)
+    async def investigate_linux_boot_tool(
+        *,
+        vcenter: str,
+        moref: str | None = None,
+        env_id: str | None = None,
+        vm_name: str | None = None,
+        username: str | None = None,
+        password: str | None = None,
+    ) -> dict[str, Any]:
+        """Build the picture of a Linux boot from the guest's own kernel and systemd logs.
+
+        The Linux counterpart of investigate_windows_boot. Reads, in one pass
+        through the guest (VMware Tools + credentials needed): dmesg (panics,
+        soft-lockups, hung tasks, device I/O timeouts, filesystem errors, a drop
+        to the emergency shell), systemd-analyze blame / critical-chain (what
+        made the boot slow), and journalctl -b warnings. Kernel findings are
+        mapped to the layer they point at. dmesg/journal may be root-only, so a
+        non-privileged run can come back thin; that is reported.
+
+        If the VM is powered off, reboot it first (reboot_guest, else
+        hard_reset) and let it come up. Queries are read-only, run as a guest
+        command, so it is marked not-read-only.
+
+        Args:
+            vcenter: the VM's vCenter.
+            moref: the VM's moref, or give env_id and vm_name.
+            env_id: the environment id, with vm_name.
+            vm_name: the machine's name inside its environment.
+            username: guest-OS account; the configured default when omitted.
+            password: that account's password; the configured default when omitted.
+
+        """
+        name = fleet.resolve(vcenter)
+        return await linuxboot.investigate_linux_boot(
+            fleet,
+            resolved,
+            name,
+            moref=moref,
+            env_id=env_id,
+            vm_name=vm_name,
+            username=username,
+            password=password,
+        )
+
+    @tool("read_crash_dump", annotations=NOT_READ_ONLY)
+    async def read_crash_dump_tool(
+        *,
+        vcenter: str,
+        moref: str | None = None,
+        env_id: str | None = None,
+        vm_name: str | None = None,
+        username: str | None = None,
+        password: str | None = None,
+    ) -> dict[str, Any]:
+        r"""Decode the newest Windows minidump's bugcheck code and its 4 parameters.
+
+        Reads only the dump header (no WinDbg, no symbols, air-gap safe) from the
+        newest file in C:\\Windows\\Minidump, giving the stop code decoded to its
+        layer plus the four parameters the event log usually omits. It does NOT
+        name the faulting driver — that needs WinDbg `!analyze -v` with symbols.
+        Use it after investigate_windows_boot flags a bugcheck, for the extra
+        parameters. Needs Tools and guest credentials; runs a read-only command
+        in the guest, so it is marked not-read-only.
+
+        Args:
+            vcenter: the VM's vCenter.
+            moref: the VM's moref, or give env_id and vm_name.
+            env_id: the environment id, with vm_name.
+            vm_name: the machine's name inside its environment.
+            username: guest-OS account; the configured default when omitted.
+            password: that account's password; the configured default when omitted.
+
+        """
+        name = fleet.resolve(vcenter)
+        return await crashdump.read_crash_dump(
+            fleet,
+            resolved,
+            name,
+            moref=moref,
+            env_id=env_id,
+            vm_name=vm_name,
             username=username,
             password=password,
         )
@@ -1125,6 +1538,7 @@ def _register_infrastructure_tools(tool: Callable[..., Any], fleet: VCenterPool,
                 "maintenance": found.maintenance,
                 "cpu": cpu.get(found.moref),
                 "cpu_counters_unavailable": unknown,
+                "hardware": hostsensors.classify_sensors(_read_host_sensors(session, found.moref)),
                 "storage": disk,
                 "vms": len(vms),
                 "vm_states": count_states(verdicts),
@@ -1364,6 +1778,205 @@ def _register_vrops_tools(tool: Callable[..., Any], vrops: Vrops) -> None:
         since = datetime.now(UTC) - _ago(hours=hours, least=timedelta(minutes=6))
         alerts = await vrops.alerts(resource_id, since)
         return {"count": len(alerts), "alerts": alerts[:100]}
+
+
+def _register_powerflex_tools(  # noqa: C901, PLR0915 - one closure per tool
+    tool: Callable[..., Any], client: powerflex.PowerFlex, fleet: VCenterPool, resolved: Settings
+) -> None:
+    """The PowerFlex backend tools, registered only when PowerFlex is configured."""
+
+    @tool("powerflex_affected_vms")
+    async def powerflex_affected_vms(*, vcenters: list[str] | None = None) -> dict[str, Any]:
+        """Start from PowerFlex: find troubled protection domains, then the VMs suffering on them.
+
+        The top-down flow. Reads PowerFlex to find protection domains that are
+        rebuilding/degraded or hot (more than half the backend IOPS), maps the
+        volumes on them back to the vSphere datastores that sit on those volumes
+        (by the datastore's backing device id), and reports the VMs on those
+        datastores — split into suffering and healthy. Answers "a PD is busy or
+        rebuilding; which of my VMs is that actually hurting?".
+
+        Args:
+            vcenters: vCenter names to check for affected VMs; all when empty.
+
+        """
+        pds = await client.protection_domains()
+        pools = await client.storage_pools()
+        volumes = await client.volumes()
+        pd_stats: dict[str, dict[str, Any]] = {}
+        for domain in pds:
+            identifier = domain.get("id")
+            if identifier:
+                stats = await client.protection_domain_statistics(identifier)
+                pd_stats[identifier] = stats if isinstance(stats, dict) else {}
+        impact = powerflex.map_backend_impact(pds, pd_stats, pools, volumes)
+        if not impact["volume_to_pd"]:
+            return {
+                "troubled_protection_domains": impact["troubled_protection_domains"],
+                "affected_datastores": [],
+                "findings": ["no protection domain is troubled (or no volumes sit on one)"],
+            }
+
+        def read(session: VCenterSession) -> tuple[list[dict[str, Any]], dict[str, list[dict[str, Any]]]]:
+            datastores = [
+                {
+                    "vcenter": session.vcenter.name,
+                    "moref": store["moref"],
+                    "name": store.get("name"),
+                    "powerflex_volume_ids": [
+                        vid
+                        for naa in store.get("backing_naas") or []
+                        if (vid := powerflex.volume_id_from_naa(naa))
+                    ],
+                }
+                for store in read_datastore_mounts(session)
+            ]
+            vms_by_datastore: dict[str, list[dict[str, Any]]] = {}
+            inventory = read_inventory(session, with_devices=False)
+            for vm in inventory.vms:
+                verdict = classify(vm, resolved.thresholds)
+                row = {
+                    "name": vm.name,
+                    "moref": vm.moref,
+                    "vcenter": vm.vcenter,
+                    "state": verdict.state,
+                    "suffering": verdict.state in ABNORMAL,
+                }
+                for datastore_moref in vm.datastore_morefs:
+                    vms_by_datastore.setdefault(datastore_moref, []).append(row)
+            return datastores, vms_by_datastore
+
+        names = _names(fleet, vcenters)
+        results = await asyncio.gather(*(fleet.run(name, read) for name in names), return_exceptions=True)
+        datastores: list[dict[str, Any]] = []
+        vms_by_datastore: dict[str, list[dict[str, Any]]] = {}
+        errors: dict[str, str] = {}
+        for name, result in zip(names, results, strict=True):
+            if isinstance(result, BaseException):
+                errors[name] = str(result)
+                continue
+            store_rows, vm_map = result
+            datastores.extend(store_rows)
+            vms_by_datastore.update(vm_map)
+        join = powerflex.affected_vms(impact["volume_to_pd"], datastores, vms_by_datastore)
+        return {
+            "troubled_protection_domains": impact["troubled_protection_domains"],
+            **join,
+            "errors": errors,
+        }
+
+    @tool("powerflex_health")
+    async def powerflex_health() -> dict[str, Any]:
+        """PowerFlex backend health: SDS/device state and any rebuild/rebalance in progress.
+
+        The backend behind your datastores. A rebuild after a failed drive or
+        node (SDS) is the usual reason a PowerFlex-backed datastore goes slow and
+        VMs on it stall — and it is invisible from vSphere, which only sees the
+        latency. Run this when the datastore detector shows latency with no
+        vSphere-side cause.
+        """
+        sds = await client.sds()
+        devices = await client.devices()
+        systems = await client.systems()
+        stats: dict[str, Any] = {}
+        for system in systems:
+            identifier = system.get("id")
+            if identifier:
+                merged = await client.system_statistics(identifier)
+                if isinstance(merged, dict):
+                    stats |= merged
+        return {
+            "systems": [{"id": system.get("id"), "name": system.get("name")} for system in systems],
+        } | powerflex.summarize_health(sds, devices, stats)
+
+    @tool("powerflex_protection_domains")
+    async def powerflex_protection_domains() -> dict[str, Any]:
+        """PowerFlex protection domains ranked by traffic — find the hot one.
+
+        A protection domain carrying a disproportionate share of backend IOPS is
+        the hotspot whose datastores and volumes feel load first. Run this when a
+        PowerFlex-backed datastore is slow and you suspect a busy PD rather than a
+        failure: it reads each PD's read/write bandwidth counters, derives IOPS
+        and throughput, and flags a PD at half or more of the total. Then map the
+        slow datastore to its volume (powerflex_find_volume) and confirm it lives
+        on that PD.
+        """
+        domains = await client.protection_domains()
+        rows = []
+        for domain in domains:
+            identifier = domain.get("id")
+            stats = await client.protection_domain_statistics(identifier) if identifier else {}
+            rows.append(
+                {
+                    "name": domain.get("name") or identifier,
+                    "id": identifier,
+                    "state": domain.get("protectionDomainState"),
+                    "traffic": powerflex.traffic_of(stats if isinstance(stats, dict) else {}),
+                }
+            )
+        return powerflex.rank_protection_domains(rows)
+
+    @tool("powerflex_find_volume")
+    async def powerflex_find_volume(*, query: str) -> dict[str, Any]:
+        """Find a PowerFlex volume by name, id, or an ESXi device id (naa.*/eui.*).
+
+        Maps a slow datastore to its backend volume: pass the datastore's device
+        id and this decodes the candidate volume id and matches it against the
+        Gateway's volume list (or match by volume name directly).
+
+        Args:
+            query: a volume name, a PowerFlex volume id, or an ESXi naa/eui device id.
+
+        """
+        volumes = await client.volumes()
+        candidate = powerflex.volume_id_from_naa(query) or query.strip().lower()
+        matches = [
+            volume
+            for volume in volumes
+            if candidate in str(volume.get("id", "")).lower()
+            or query.strip().lower() in str(volume.get("name", "")).lower()
+        ]
+        return {
+            "query": query,
+            "decoded_volume_id": powerflex.volume_id_from_naa(query),
+            "matches": [
+                {"id": volume.get("id"), "name": volume.get("name"), "size_kb": volume.get("sizeInKb")}
+                for volume in matches[:20]
+            ],
+            "match_count": len(matches),
+        }
+
+
+def _read_host_sensors(session: VCenterSession, host_moref: str) -> list[dict[str, Any]]:
+    """A host's hardware sensors, flattened to {name, type, health, reading}. Read-only."""
+    paths = (
+        "runtime.healthSystemRuntime.systemHealthInfo.numericSensorInfo",
+        "runtime.healthSystemRuntime.hardwareStatusInfo",
+    )
+    rows = session.retrieve(vim.HostSystem, paths, objects=[session.reference("HostSystem", host_moref)])
+    if not rows:
+        return []
+    sensors: list[dict[str, Any]] = [
+        {
+            "name": getattr(sensor, "name", None),
+            "type": getattr(sensor, "sensorType", None),
+            "health": getattr(getattr(sensor, "healthState", None), "key", None),
+            "reading": getattr(sensor, "currentReading", None),
+        }
+        for sensor in rows[0].get("runtime.healthSystemRuntime.systemHealthInfo.numericSensorInfo") or []
+    ]
+    hardware_status = rows[0].get("runtime.healthSystemRuntime.hardwareStatusInfo")
+    for group in ("memoryStatusInfo", "cpuStatusInfo", "storageStatusInfo"):
+        sensors.extend(
+            {
+                "name": getattr(item, "name", None),
+                "type": group.removesuffix("StatusInfo"),
+                "health": getattr(getattr(item, "status", None), "key", None),
+                "reading": None,
+            }
+            for item in getattr(hardware_status, group, None) or []
+        )
+    return sensors
 
 
 def _pick[T](items: Any, wanted: str, keys: Callable[[T], tuple[str, str]]) -> T:

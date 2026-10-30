@@ -458,6 +458,13 @@ def test_every_call_the_tools_made_is_on_the_read_list(
         "read_serial_console",
         "get_vm_console",
         "get_vm_events",
+        # check_ems and investigate_windows_boot only reach the raw (guest) stub
+        # when Tools is up and credentials are given; with neither here they stay
+        # on the guarded surface, which is what this sweep checks.
+        "check_ems",
+        "investigate_windows_boot",
+        "investigate_linux_boot",
+        "read_crash_dump",
     ):
         call(server, tool, {"vcenter": "vc-a", "moref": moref})
     call(server, "get_host_health", {"vcenter": "vc-a", "host": "DC0_C0_H0"})
@@ -470,6 +477,9 @@ def test_every_call_the_tools_made_is_on_the_read_list(
     call(server, "check_host_time", {"vcenters": ["vc-a"]})
     call(server, "check_datastores", {"vcenters": ["vc-a"]})
     call(server, "check_vcenters")
+    call(server, "vcenter_history", {"vcenter": "vc-a", "minutes": 60})
+    call(server, "cluster_events", {"vcenters": ["vc-a"], "minutes": 60})
+    call(server, "recent_tasks", {"vcenter": "vc-a", "minutes": 60})
     call(server, "vcenter_sessions", {"vcenter": "vc-a"})
 
     seen = server.vcenters.methods_seen()
@@ -518,6 +528,37 @@ def test_guest_exec_never_dirties_the_read_only_surface(
         args = {"vcenter": "vc-a", "moref": moref, "command": "echo a", "username": "u", "password": "p"}
         with contextlib.suppress(ToolError):
             asyncio.run(built.call_tool("run_in_guest", args))
+        seen = built.vcenters.methods_seen()
+        assert seen <= ALLOWED_METHODS, seen - ALLOWED_METHODS
+    finally:
+        built.vcenters.close()
+
+
+def test_reboot_guest_refuses_a_guest_without_tools(
+    server: MCPServer, worlds: tuple[scenario.World, ...]
+) -> None:
+    # web-01 is powered on but Tools is not running: a graceful reboot is impossible,
+    # and it is refused in words before any power method is sent.
+    moref = worlds[0].moref("environments/env-1001", "web-01")
+
+    result = call(server, "reboot_guest", {"vcenter": "vc-a", "moref": moref})
+
+    assert result["rebooted"] is False
+    assert "Tools is not running" in result["reason"]
+
+
+def test_power_tools_never_dirty_the_read_only_surface(
+    settings: Settings, worlds: tuple[scenario.World, ...], plan: object
+) -> None:
+    # Both power operations go through the raw stub, like guest exec, so whatever
+    # the simulator does with them the guarded (read-only) surface stays untouched.
+    _ = plan
+    built = build_server(settings)
+    try:
+        moref = worlds[0].moref("environments/env-1003", "ok-01")
+        for tool in ("reboot_guest", "hard_reset"):
+            with contextlib.suppress(ToolError):
+                asyncio.run(built.call_tool(tool, {"vcenter": "vc-a", "moref": moref}))
         seen = built.vcenters.methods_seen()
         assert seen <= ALLOWED_METHODS, seen - ALLOWED_METHODS
     finally:
