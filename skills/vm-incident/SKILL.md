@@ -1,287 +1,220 @@
 ---
 name: vm-incident
-description: Diagnose why a test environment's machines are stuck or unreachable across a vSphere fleet, from the symptom to a named cause, with the evidence for and against. Use when your monitoring or orchestrator reports VMware Tools errors, a machine is stuck on boot or after a reboot, hung mid-run, slow to come up, an environment will not come up, a test hangs waiting for its environment, a machine is blocked on a VM question or wedged by a virtual device (a disconnected adapter, a stuck ISO), or someone asks to find stuck, hung or leftover VMs across the vCenters and understand why. Also when the vCenter API itself is failing - SSL EOF errors, connection resets or timeouts, often connection or session exhaustion. Covers the recurring causes - ESXi CPU overcommit and storage-array saturation - and tells a VM that is booting slowly from one that is hung. It reads, with three deliberate exceptions it names - running a diagnostic command in the guest, and rebooting a wedged VM (gracefully, or a destructive hard reset) to regenerate its boot logs. Written so the answer comes from a ladder and a cause table, not from judgment.
+description: Diagnose why VMs on a vSphere fleet are stuck or unreachable and name the cause with evidence for and against. Use when monitoring or an orchestrator reports a VMware Tools error, a VM is stuck on first boot or after a reboot, hangs mid-run, is slow to come up, waits on a VM question, or is blocked by a virtual device (a disconnected NIC, a mounted ISO); when an environment will not come up or a test hangs waiting for it; when someone asks to find stuck, hung or leftover VMs across the vCenters; or when the vCenter API itself fails with SSL EOF errors, connection resets or timeouts. Covers ESXi CPU overcommit, storage saturation, HA restarts, host failures and guest crashes, and separates a VM that is booting slowly from one that is hung. Mostly reads; it can run a diagnostic command in a guest and reboot a wedged VM to get a fresh boot record.
 ---
 
 # VM incident
 
-An environment's machines are stuck — not booting, not coming back after a
-reboot, hung mid-run, or unreachable — or the vCenters themselves are refusing
-connections. This skill is the fixed route from that symptom to a cause you can
-name, with the evidence for it and the evidence against. You follow a ladder
-and read a table; you do not diagnose from principles.
+This skill takes you from a symptom (a VMware Tools error, a stuck VM, a
+failing vCenter) to a named cause with the evidence for and against it. You
+follow the ladder in `core/ladder.md`, look up what you find in
+`core/causes.md`, and end with the verdict in `core/verdict.md`. If the
+evidence does not support a cause, you write what is missing and ask a person
+(**stop and ask**).
 
-"Stuck" is not only "stuck after a reboot": a machine that never finished its
-first boot, one that hangs hours into a run, one slow to come up, one blocked
-on a VM question, and one wedged by a disconnected adapter or a stuck ISO are
-all this skill's work. So is a vCenter that is throwing SSL EOF errors or
-resetting connections — see "When the vCenter is the problem" below.
+Read this file first. Load the other files when a step names them.
 
-The machines are short-lived (minutes to a day), their names are reused by the
-next environment, and they are spread by load across the fleet's vCenters. So the
-first rule is the one that everything else rests on: **carry the identity, not
-the name.** A VM is its vCenter and its moref. A name means something only
-inside its environment folder.
+## Identity: vCenter and moref
 
-Read this file, then load only the file the step names. Every path ends in a
-**verdict** you write down (`core/verdict.md`), or in **stop and ask**, which
-means you write what is missing and ask a person.
+VMs here are short-lived (minutes to a day), and the next environment reuses
+their names. A VM is identified by its **vCenter and moref** (`vc-04` /
+`vm-2231`). A VM name only identifies a VM inside its environment folder.
+Carry the vCenter and moref from the first tool call to the last.
 
-This skill reads to diagnose; it does not fix. It never answers a VM question,
-reconfigures, migrates, or deletes — that is the orchestrator's job and a
-person's decision, and when the evidence says such an action is needed the
-verdict names it and stops. The one thing it will *do* is reboot a VM
-(`reboot_guest`, then `hard_reset`) — but only as a diagnostic step, to make a
-wedged guest write a fresh boot log, never as the fix, and the destructive
-`hard_reset` only when a graceful reboot cannot.
+## Where the evidence is
 
-## The four layers, and the tools for each
-
-| Layer | Holds | Reached by |
+| Source | What it holds | How you reach it |
 | --- | --- | --- |
-| **Your orchestrator / monitoring** | the failing tests, the environment id, the machine names, the reboot time, the VMware Tools error | its own tools or logs |
-| **The creator/runner** | what it asked the vCenter and when, its errors, how long it waited for the machine | your log store |
-| **vCenter** (the fleet) | live VM state, console, `vmware.log`, events, host and datastore counters | the `vsphere-triage` server (read-only) |
-| **vROps** (optional) | days of host, cluster and datastore history; alerts | `vsphere-triage`'s `vrops_*` tools |
-| **PowerFlex** (optional) | the storage backend behind the datastores: SDS/device health, rebuild/rebalance | `vsphere-triage`'s `powerflex_*` tools |
+| Your orchestrator or monitoring | the failing tests, the environment id, the machine names, the reboot time, the Tools error | its own tools or logs |
+| The VM creator/runner logs | what it asked vCenter to do and when, its errors, how long it waited for the VM | your log store |
+| vCenter | live VM state, console, `vmware.log`, serial console, events, host and datastore counters | the `vsphere-triage` server |
+| vROps (optional) | days of host, cluster and datastore history; alerts | the `vrops_*` tools |
+| PowerFlex (optional) | the storage backend: SDS and device health, rebuild and rebalance, per-protection-domain traffic | the `powerflex_*` tools |
 
-If the `vsphere-triage` tools are not present, stop and ask: this skill cannot
-reach vCenter without them. If your orchestrator's tools or log store are not
-present, say which rungs of the ladder you cannot climb, and work the ones you
-can.
+Without the `vsphere-triage` tools you cannot reach vCenter: stop and ask.
+Without the orchestrator or log store, say which ladder rungs you cannot
+climb and work the rest.
 
-## The two ways in
+## Where to start
 
-| You have | Start at |
+| You have | Start with |
 | --- | --- |
-| A VMware Tools error from your monitoring (it names the vCenter, the env id, the machine) | `core/ladder.md`, rung 3: `diagnose_vm` |
-| A question about the fleet ("anything stuck on these vCenters?") | `core/ladder.md`, rung 3: `scan`, then `explain_group` |
-| An incident from earlier, the environment now gone | `core/ladder.md`, rung 3: `diagnose_window` |
-| "Which environments have lived too long?" | `find_old_environments`; this is a cleanup question, not an incident — read `core/ladder.md` only if the old ones are also stuck |
+| A Tools error naming the vCenter, environment id and machine | `diagnose_vm` (ladder rung 3) |
+| A question about the fleet ("anything stuck on vc-04?") | `scan`, then `explain_group` (rung 3) |
+| An incident that is over, VMs possibly destroyed | `diagnose_window` (rung 3) |
+| Many VMs rebooted or went unreachable at once | `cluster_events` and `recent_tasks` first (below) |
+| SSL EOF errors, resets or timeouts from vCenter itself | `check_vcenters` (below) |
+| "Which environments have lived too long?" | `find_old_environments`; this is cleanup, not an incident |
 
-Climb the whole ladder from where you enter. Do not start at the bottom: a
-VM's counters mean nothing without the time and the symptom from the top.
+Climb the ladder from where you start; do not skip to the counters. A VM's
+CPU and storage numbers mean nothing without the time and the symptom from
+the rungs above.
 
-## When the vCenter is the problem, not a VM
+## When the vCenter itself fails
 
-Sometimes the symptom is the vCenter API itself: SSL EOF errors, connection
-resets, or timeouts, hitting every client that talks to the vCenter, this
-server included. That is not a stuck VM — it is usually the vCenter at its
-connection or session limit, and no amount of looking at one machine explains it.
+SSL EOF errors, connection resets or timeouts that hit every client of a
+vCenter (this server included) usually mean the vCenter is at its connection
+or session limit.
 
-Start with **`check_vcenters`** for the counts, then **`vcenter_sessions`** on
-the vCenter that is throwing errors: it groups the open sessions by user, source
-IP and client and flags the one leaking them (many sessions from one client,
-many idle past the timeout). A high or climbing count is the symptom; the
-grouping names the culprit. The verdict
-then names the vCenter and its session pressure, and the action — shedding
-sessions, raising the limit — is for the bare-metal team, not something this
-server does. If the session count is not visible (the read-only account may not
-be allowed the global list, and `check_vcenters` says so), the login time and
-the pattern of resets across callers are still the signal, and vROps' vCenter
-session metrics are the history.
+1. `check_vcenters`: the open-session count, this server's last login time
+   and a round-trip time per vCenter.
+2. `vcenter_sessions` on the failing vCenter: sessions grouped by user,
+   source IP and client, with idle counts. One client holding most sessions,
+   or many idle ones from one source, is the usual leak.
+3. If the failure has passed, `vcenter_history` over that window: login
+   surges, failed logins and the busiest sources, in 10-minute buckets.
+4. If sessions look normal but SSL or handshake errors continue,
+   `check_host_time`: a host clock skewed from vCenter breaks TLS, and past
+   about 300 s it breaks Kerberos/AD authentication.
 
-`check_vcenters` sees only the live state, so a failure that has since cleared —
-an SSL EOF at 2pm that you are investigating at 5pm — is invisible to it. For
-that, run **`vcenter_history`**: it reads the vCenter's own session/login events
-over a past window and looks for the shape of exhaustion (a login surge, failed
-logins, many logins from one source). It is the vCenter-native history; vROps,
-when configured, keeps the actual session-count curve, and the result says so
-when it is not.
+If the account cannot see the global session list, `check_vcenters` says so;
+use the login time and the pattern of failures across callers instead. The
+fix (shedding sessions, raising the limit, fixing NTP) is for a person; the
+verdict names it.
 
-A VM diagnosis that keeps failing with a dropped-connection error is the same
-story from below: run `check_vcenters` before trusting any one VM's result.
+A `diagnose_vm` that keeps failing with dropped connections is the same
+problem seen from one VM: run `check_vcenters` before trusting its result.
 
-SSL / handshake errors have a second root that is not exhaustion: a host whose
-**clock has drifted**. Skew breaks TLS, and past about 300 s it breaks
-Kerberos/Active Directory auth outright, so it reads as the same SSL errors
-fleet-wide. When `check_vcenters` shows the session count healthy but the errors
-persist, run **`check_host_time`**: it reports each host's NTP configuration and
-its clock skew from vCenter, and names the hosts that have drifted.
+## When many VMs failed together
 
-## When a whole cluster moved at once
+Check what happened above the VMs before diagnosing them one by one:
 
-Before diagnosing many VMs one by one, ask what happened *above* them. Two
-cluster-level reads name a shared cause that no single VM shows:
+- `cluster_events`: vSphere HA restarts and VM-monitoring resets, failed
+  hosts, isolated hosts, lost host connections, failed failovers and
+  migration waves over a window. It names the failed host and the hosts the
+  VMs were restarted onto. VMs that HA restarted after a host failure were
+  rebooted on purpose: judge them from that restart, not as separate hangs.
+- `recent_tasks`: what someone or an automation did in the window, e.g. a
+  storage vMotion wave onto one datastore, a mass reconfigure, a snapshot
+  consolidation.
+- `get_host_health` on a shared host: its CPU, storage and hardware sensors.
+  A failed power supply, fan or DIMM stalls every VM on the host and shows in
+  none of their guest evidence.
 
-- **`cluster_events`** — vSphere HA restarts, host isolation/failure/connection
-  loss, and DRS migration waves over a window. If HA restarted a batch of VMs
-  after a host failed, those VMs rebooting is *expected*: judge them from that
-  restart, not as independent hangs. This is the first thing to run when the
-  symptom spans a cluster.
-- **`recent_tasks`** — what was *done* in the window: a storage-vMotion sweep
-  onto one datastore, a mass reconfigure, a snapshot consolidation. A cause
-  someone or an automation introduced shows here and nowhere in a VM's counters.
+## Tools that act on a VM
 
-A sick host is a shared cause too: **`get_host_health`** now reports the host's
-own hardware sensors (PSU, fan, temperature, memory) alongside its CPU and
-storage. A red sensor — a failing power supply, an overheating CPU — stalls
-every VM on that host, and shows in none of their guest-level evidence.
+Seven tools change a VM or run code in it: `run_in_guest`, `reboot_guest`,
+`hard_reset`, `check_ems`, `investigate_windows_boot`,
+`investigate_linux_boot` and `read_crash_dump`. Use them only when the
+read-only evidence leaves a gap that matters to the verdict, and record in the
+verdict what you ran. They need VMware Tools running in the guest (except
+`hard_reset`) and, for the guest-command ones, guest credentials.
 
-## When a read cannot answer: acting on the VM
+**`run_in_guest`** runs one command in the guest OS and returns its output and
+exit code. Use it for a question only the guest can answer: is it responsive,
+what does a service or a file say. Keep the command a diagnostic that changes
+nothing. A responsive guest on a starved host is still starved, so this never
+replaces the host and storage checks.
 
-Most tools read. A few act on the VM — `run_in_guest`, the two reboots, and the
-guest-reading `check_ems` / `investigate_windows_boot` — use them only when the
-read-only evidence leaves a real gap, and record what you did in the verdict.
+**Rebooting to get a fresh boot record.** A wedged VM often has to reboot
+before it writes a new `vmware.log` boot timeline, serial-console output and,
+on Windows, the bugcheck its next boot records. In this order:
 
-**`run_in_guest`** executes a command inside the guest OS through VMware Tools.
-Reach for it only when a command would close a gap a read cannot — "is the guest
-actually responsive, or just painting a static console?", reading a file or a
-service state from inside — and the guest has Tools running (without Tools there
-is no guest-ops channel; fall back to the console, serial and boot log). It
-needs guest credentials and runs exactly the command given, so prefer a read
-first and keep the command a diagnostic, not a change. It is not a substitute
-for the shared-cause checks: a responsive guest on a starved host is still starved.
+1. `reboot_guest`: a clean restart through Tools. Needs Tools running.
+2. `hard_reset`: a power-cycle without asking the guest. It works on a fully
+   hung VM, but in-flight writes, an unwritten crash dump and the hung state
+   itself are lost. Use it only when Tools is down or `reboot_guest` did not
+   bring the VM back. If the current state is evidence (a pending question, a
+   dump being written), capture the console, serial console and events first.
 
-**Rebooting to regenerate logs.** A wedged VM often has to be rebooted before it
-writes a fresh `vmware.log` boot timeline, serial console, and (on Windows) the
-bugcheck its next boot records to the event log. Two tools, **in this order**:
+Both power tools need the VM's name with its moref, and refuse a VM that is
+powered off; a powered-off VM is powered on by your orchestrator or in
+vCenter. After the reboot, read `get_boot_timeline` and `read_serial_console`
+again. A reboot is a diagnostic step, not a fix: on a starved host or a
+saturated datastore the VM will stall again on the way up.
 
-1. **`reboot_guest`** — asks the guest to reboot cleanly through Tools. No data
-   loss, but it needs Tools running and a guest responsive enough to obey. Try
-   this first.
-2. **`hard_reset`** — the virtual reset button; needs no Tools, so it is the only
-   way to reboot a fully hung VM. But it is **destructive**: the guest is never
-   asked, so in-flight writes can be lost and in-guest evidence can be destroyed
-   — an unwritten crash dump, "Working on updates" progress, the hung state
-   itself. Reach for it only when Tools is down or a `reboot_guest` never came
-   back. Before you hard-reset a VM whose live state is itself the evidence
-   (blocked on a question, mid-crash with a dump still writing), capture that
-   evidence first (console, serial, events) — the reset erases it.
+**Reading the guest's own boot records.** Once the VM is up with Tools
+running:
 
-After either, re-read `get_boot_timeline` and `read_serial_console` for the
-fresh boot. Rebooting is a diagnostic step, not a fix: if the cause is a starved
-host or a saturated datastore, the VM will wedge again on the way back up.
+- Windows: `investigate_windows_boot` reads the event log (the last bugcheck,
+  unclean shutdowns, service and driver start timeouts, slow-boot components,
+  crash dumps, Startup Repair and update logs). `core/windows-boot.md` has the
+  steps. If it finds a bugcheck, `read_crash_dump` decodes the newest
+  minidump's header for the four bugcheck parameters.
+- Linux: `investigate_linux_boot` reads `dmesg`, `systemd-analyze` and the
+  journal for the current and the previous boot. After a reboot the hang is in
+  the previous boot, which is only kept when the journal is persistent; the
+  result says when it was not available.
 
-**Windows: build the boot picture.** `vmware.log` shows a boot from the outside,
-never the Windows kernel's own words. Those live in the event log, reachable
-only once the guest is up enough for VMware Tools. So: if the VM is hung,
-reboot it (`reboot_guest`, else `hard_reset`); if it is powered off, power it on
-from the orchestrator or vCenter (this server has no power-on tool); let it come up; then
-**`investigate_windows_boot`** reads, in one pass, the records Windows keeps of
-why a boot failed — the last bugcheck its *next* boot recorded (so a BSOD in a
-reboot loop is still named), unclean shutdowns, **service/driver start timeouts
-(which is what "the kernel timed out" usually is on Windows)**, the slow-boot
-components, and the crash dumps / Startup-Repair / update logs. The bugcheck code
-is decoded to the layer it points at. Read `core/windows-boot.md` for the flow.
-For a Linux guest, **`investigate_linux_boot`** is the same move — dmesg,
-`systemd-analyze blame`/`critical-chain`, and `journalctl -b`, after the same
-reboot-if-off step. When a Windows bugcheck is found, **`read_crash_dump`**
-decodes the newest minidump's header for the four bugcheck parameters the event
-log omits (it does not name the faulting driver — that needs WinDbg).
+**When the serial console has no output**, run `check_ems`. It says whether
+the VM has a serial port writing to a file, whether output has appeared, and
+on Windows whether EMS is enabled in the BCD, and how to enable it. Put that in
+the verdict so the next incident has the serial console.
 
-**Is the serial console even available?** When serial-console evidence is
-missing, do not just move on — run **`check_ems`** to say *why* it is missing and
-whether it can be fixed: no serial port in the VM's hardware, a port but EMS
-turned off in the guest's BCD (it reads `bcdedit` when Tools and credentials
-allow), or simply not emitted yet. Put the finding, and how to enable EMS, in
-the verdict, so the gap is closed for next time.
+## Name the missing sources
 
-## Name what you're missing
+When a better source exists but is not configured or not reachable, say so in
+the verdict: what it is, what it would have shown, and how to enable it.
+`diagnose_vm`, `check_vcenters`, `vcenter_history` and the guest tools return
+an `evidence_gaps` list to carry over. The common ones:
 
-A diagnosis is only as good as what it can read, so this is a standard across
-every rung: **when a stronger source exists but has not been given to you, say
-so** — name it, say what it would have added, and say how to turn it on. Never
-let silence pass for absence of a problem. The tools do half of this for you:
-`diagnose_vm`, `check_vcenters`, `vcenter_history` and the guest tools return an
-`evidence_gaps` list, and `check_ems` returns the serial-console verdict. Carry
-them into the verdict in plain words:
+| Missing | What you cannot see | How to enable |
+| --- | --- | --- |
+| vROps | history: whether a spike is new or nightly, a failure that has cleared | `VSPHERE_VROPS_URL`, `_USERNAME`, `_PASSWORD` |
+| Serial console / EMS | the guest's own boot messages while it is hung | the `check_ems` result |
+| Guest credentials, or Tools down | the event log, the BCD, `dmesg` and the journal | `VSPHERE_GUEST_USERNAME` / `_PASSWORD`; a reboot may bring Tools back |
+| PowerFlex | a backend rebuild or a hot protection domain behind a slow PowerFlex datastore | `VSPHERE_POWERFLEX_URL`, `_USERNAME`, `_PASSWORD` |
 
-- **vROps not configured** → there is no history; a spike or a failure that has
-  cleared cannot be seen. Ask for `VSPHERE_VROPS_URL` / `_USERNAME` / `_PASSWORD`.
-- **No serial console / EMS off** → the guest's own boot words are unreadable
-  while it is hung; name it and give the `check_ems` fix.
-- **No guest credentials, or Tools down** → nothing inside the guest can be
-  read (the Windows event log, the BCD, dmesg); ask for `VSPHERE_GUEST_*` or a
-  reboot to bring Tools back.
-- **PowerFlex not configured** → a PowerFlex-backed datastore can read as slow
-  in vSphere while the real cause is only visible in the backend; `check_datastores`
-  names this gap. Ask for `VSPHERE_POWERFLEX_*`, then read `powerflex_health`
-  (failure/rebuild) and `powerflex_protection_domains` (a hot PD carrying a
-  disproportionate share of IOPS — the busy-PD pattern); map the slow datastore
-  to its volume with `powerflex_find_volume` and confirm which PD it is on.
+With PowerFlex configured, read `powerflex_health` (failures, rebuild,
+rebalance) and `powerflex_protection_domains` (a domain carrying most of the
+IOPS), and map a slow datastore to its volume with `powerflex_find_volume`.
+When you already know a protection domain is in trouble, `powerflex_affected_vms`
+lists the datastores on its volumes and the VMs on them, split into suffering
+and not.
 
-When PowerFlex *is* the starting point — a PD you already know is rebuilding or
-busy — run it the other way with **`powerflex_affected_vms`**: it finds the
-troubled/hot PDs, maps their volumes back to the vSphere datastores on them (by
-the datastore's backing device id, which `check_datastores` now reports), and
-lists the VMs there split into suffering and healthy. That turns "this PD is
-hot" straight into "these are the VMs it is hurting".
+## Files
 
-The honest sentence is: *there is something better I could use, but it has not
-been given to me — here is what, and here is how.*
-
-## The steps
-
-| Step | Load |
+| Step | File |
 | --- | --- |
-| The ladder, rung by rung, top to bottom | `core/ladder.md` |
-| What each cause looks like, and what rules it out | `core/causes.md` |
-| Whether a correlation is a cause | `core/correlation.md` |
-| Building a Windows boot picture (reboot if off, then read the event log) | `core/windows-boot.md` |
-| What you write at the end | `core/verdict.md` |
+| The ladder, rung by rung | `core/ladder.md` |
+| Each state and cause, and what rules it out | `core/causes.md` |
+| Checking that a correlation is a cause | `core/correlation.md` |
+| The Windows boot investigation | `core/windows-boot.md` |
+| The verdict format | `core/verdict.md` |
+| Terms | `glossary.md` |
+| Worked examples | `examples/cpu-overcommit.md`, `examples/storage-boot-storm.md` |
 
-## Invariants
+## Rules
 
-1. **Identity is `(vcenter, moref)`.** Carry it from the first tool call to
-   the last. Never look a machine up by name outside its environment folder;
-   the next environment reused the name. A follow-up on a VM that no longer
-   exists says *destroyed* — that is an answer, not a retry with a different VM.
-
-2. **Population before individual.** Before explaining one stuck VM, find how
-   many are stuck like it and what they share (`explain_group`, or the
-   environment view inside `diagnose_vm`). One stuck VM is an anecdote; 29 of 33
-   on one datastore in six minutes is a cause.
-
-3. **Shared cause before guest cause.** Read the host and the storage before
-   blaming the guest. Both recurring causes here are shared infrastructure:
-   ESXi CPU overcommit and storage-array saturation.
-
-4. **A healthy neighbour is evidence.** Before blaming a host, datastore or
-   base disk, check whether the *healthy* VMs beside the stuck ones share it.
-   If they do, it argues against that cause. `diagnose_vm` and `explain_group`
-   report this; read it.
-
-5. **Starved is not hung.** A VM busy on CPU with a changing console is booting
-   slowly, not hung; the Tools error is then a timeout in the orchestrator, not
-   a dead VM. `core/causes.md` has the split. Say which in the verdict.
-
-6. **A shared timestamp is not a cause.** Name the evidence for each claim, the
-   competing explanation, and the one check that would separate them
+1. **Identify VMs by vCenter and moref.** Never look a VM up by name outside
+   its environment folder. A VM that no longer exists is reported as
+   *destroyed*; that is the answer, not a reason to try another VM.
+2. **Count before you explain.** Before explaining one stuck VM, find how many
+   are stuck like it and what they share (`explain_group`, or the environment
+   section of `diagnose_vm`). 29 of 33 VMs on one datastore within six minutes
+   is a cause; one VM is not enough to say.
+3. **Check shared infrastructure before the guest.** Read the host and the
+   storage before blaming the guest. The two most common causes here are ESXi
+   CPU overcommit and storage saturation.
+4. **Check the healthy neighbours.** Before blaming a host, datastore or base
+   disk, check whether healthy VMs share it. If they do, that argues against
+   it. `diagnose_vm` and `explain_group` report this.
+5. **Starved is not hung.** A VM using CPU with a changing console is booting
+   slowly; the Tools error is then the orchestrator's timeout. `core/causes.md`
+   shows how to tell. Say which one in the verdict.
+6. **A shared timestamp is not a cause.** For each claim, give the evidence,
+   the competing explanation and the one check that separates them
    (`core/correlation.md`).
+7. **Missing data is a gap, not a clean result.** "No events in the window",
+   "counters not kept", "console endpoint 404", "vROps not configured",
+   `healthy: null` and "VM destroyed" all mean the tool could not see. Record
+   them under Gaps.
+8. **Clocks differ.** The orchestrator, the log store, each ESXi host, vCenter
+   and vROps keep their own clocks. Results are in UTC with their source
+   named. When two clocks disagree by more than the window you are
+   correlating, say so.
+9. **Act only to diagnose.** Never answer a VM question, power a VM on or off,
+   reconfigure, migrate or delete. Use `reboot_guest` / `hard_reset` only to
+   get a fresh boot record, as described above, never as the fix. Any other
+   action the evidence calls for goes in the verdict for a person.
 
-7. **Missing data is not "nothing happened".** A tool that says "no events in
-   window", "counters not kept at this statistics level", "console endpoint
-   404", "vROps not configured" or "VM destroyed" has told you what it could
-   not see. Record it as a gap; do not read it as a clean result.
+## Finishing
 
-8. **Clocks differ.** Your orchestrator, your log store, each ESXi host, vCenter
-   and vROps keep their own clocks, and every result is in UTC with its source's
-   clock named. A
-   correlation across layers is only as good as the alignment; when two clocks
-   disagree by more than the window, say so.
+Write the headings in `core/verdict.md`, each with `none` when empty: symptom,
+identity, cause with evidence for and against, causes ruled out, gaps, and the
+next check or the action for a person. Do not name a cause the data does not
+support.
 
-9. **Act only as a diagnostic step, and only with the tools made for it.**
-   Never answer a VM question, never power a VM on or off, and never use a
-   reset to *fix* anything. `reboot_guest` / `hard_reset` are allowed for one
-   purpose only, described above: to make a wedged VM produce a fresh boot
-   record when the read-only evidence leaves a real gap. Any other change the
-   evidence calls for, the verdict names and hands to a person.
-
-## What you say when you finish
-
-The headings in `core/verdict.md`, each with `none` when empty: the symptom,
-the identity, the likely cause with its evidence for and against, the competing
-causes ruled out, the gaps in what you could read, and the next check or the
-action for a person. Nothing more; no cause the data does not support.
-
-## The environment these facts rest on
-
-The `vsphere-triage` tool names, result shapes and thresholds in this skill are
-those of the server in this repository (the README is the reference).
-The recurring causes — host CPU demand past 100%, datastore/array latency
-in the hundreds of milliseconds — are the two this skill is tuned for;
-`core/causes.md` carries the rest. When a tool's result shape here and the
-server disagree, the server is right and this skill is stale: say so.
-
-`glossary.md` fixes the words. Use them and no synonyms.
+The tool names, result fields and thresholds here are those of the server in
+this repository; its README is the reference. If a result differs from what
+this skill describes, the server is right; say the skill is out of date.

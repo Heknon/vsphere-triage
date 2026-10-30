@@ -1,8 +1,8 @@
 # Worked example: the Tools error was a timeout on a starved VM
 
-Copy the order of the rungs and the shape of the verdict. This is the CPU case:
-the VM was not broken, it was booting slowly on an overloaded host, and the
-Tools error was a timeout.
+Follow the order of the rungs and the shape of the verdict. In this case the VM
+was not broken: it was booting slowly on an overloaded host, and the Tools
+error was the orchestrator's timeout.
 
 ## The ask
 
@@ -31,8 +31,7 @@ Tools error was a timeout.
      118% demand, overcommitted. `storage`: latency normal.
    - `conclusion.causes[0]`: CPU starvation, high confidence; "the VM is busy,
      so it is more likely booting slowly than hung".
-   - `console` (one capture, the sim has none on a real vCenter take two): on a
-     real run, changing.
+   - `console`: two captures 10 s apart; the screen changed between them.
 
 4. **vROps.** `vrops_find_resource("esx-31", "HostSystem")`, then
    `vrops_compare_window` on `cpu|demandPct` for 02:00–02:30 against 7 days:
@@ -65,5 +64,5 @@ Tools error was a timeout.
 > for a person: the overcommit on esx-31/32 (placement, or what else runs
 > there), or raise the orchestrator's reboot timeout above the boot time these hosts give.
 
-Notice what the verdict does not say: it does not say web-01 is broken. The
-fix is a host's load or a timeout, and it is for a person.
+The verdict does not say web-01 is broken. The fix is the host's load or the
+timeout, and it is for a person.

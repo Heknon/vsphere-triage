@@ -1,7 +1,8 @@
 # Worked example: the shared datastore, found from the fleet
 
-The storage case, entered from a fleet question rather than one error. It shows
-population-before-individual and the linked-clone base disk.
+The storage case, starting from a fleet question rather than one error. It
+shows counting the stuck VMs before explaining one (rule 2) and the
+linked-clone base disk.
 
 ## The ask
 
@@ -64,11 +65,11 @@ population-before-individual and the linked-clone base disk.
 > a cause *during the spike*.
 > **Ruled out** CPU: host demand normal in the window. Bad template: the stall
 > is storage-timed, not boot-stage-specific.
-> **Gaps** PowerFlex pool internals not read (adapter not configured) — which
-> volume or rebuild drove the IOPS is unknown from vCenter alone.
+> **Gaps** PowerFlex not configured, so which volume or rebuild drove the IOPS
+> is unknown from vCenter alone; set `VSPHERE_POWERFLEX_URL`, `_USERNAME` and
+> `_PASSWORD` and run `powerflex_health` and `powerflex_protection_domains`.
 > **Next** does the win10 base boot fine on another datastore right now? And
 > for storage: what runs against that PowerFlex pool at 02:10 nightly. Action:
 > none in vCenter; move the reboot off the spike, or the load off the pool.
 
-One ticket, one fix, 12 environments: that is what population-before-individual
-buys.
+Counting first turned 12 environments' worth of tickets into one fix.

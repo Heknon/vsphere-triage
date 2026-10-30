@@ -25,6 +25,17 @@ wiring it to the system that creates your VMs.
 
 ## Quick start
 
+The server is a Python package; there is no separate binary to download.
+Installing it from PyPI puts a `vsphere-triage` command on your `PATH`, and
+the MCP client starts that command over stdio. What you need on the machine:
+
+- [uv](https://docs.astral.sh/uv/getting-started/installation/) (recommended):
+  `uvx` downloads the package and, if needed, a Python 3.12+ interpreter, and
+  caches both. The Claude Code plugin uses `uvx`, so it needs uv on the `PATH`.
+- or Python 3.12+ with `pipx` or `pip`.
+- `tesseract` on the `PATH`, only for OCR of the console screen (the `[ocr]`
+  extra); without it, console analysis still works but reads no text.
+
 ```sh
 uvx vsphere-triage                 # run from PyPI without installing
 uv tool install vsphere-triage     # or install the command
@@ -55,7 +66,10 @@ The minimum configuration is the vCenter list and a login:
 }
 ```
 
-The server speaks MCP over stdio by default. Python 3.12 or later.
+The server speaks MCP over stdio by default. With `uvx`, use
+`"command": "uvx", "args": ["vsphere-triage"]` (pin a version with
+`"vsphere-triage==0.2.0"`); with a `uv tool` or `pipx` install, use
+`"command": "vsphere-triage"` as above.
 
 ## Two ways to start
 
