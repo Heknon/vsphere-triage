@@ -526,6 +526,11 @@ def test_a_scan_for_other_states_does_not_call_them_abnormal() -> None:
     assert result["findings"][0].startswith("3 healthy of 20")
     assert all("abnormal" not in finding for finding in result["findings"][:2])
     assert result["findings"][1].endswith("are healthy (5x the fleet rate)")
+    # Past the limit, the rest are still named, one line each.
+    narrow = scan.summary(scan_of(fleet), limit=2)
+    assert len(narrow["abnormal_vms"]) == 2
+    assert len(narrow["more_abnormal_vms"]) == narrow["abnormal_vms_truncated"] == 15
+    assert narrow["more_abnormal_vms"][0].startswith("vc-a/vm-")
     # The rows carry their meaning once, above them, and no unset values.
     row = result["abnormal_vms"][0]["verdict"]
     assert "meaning" not in row

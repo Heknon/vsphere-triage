@@ -45,4 +45,18 @@ Round 1 found and round 2 checked:
 - `scan` sent about 48k characters for a 24-VM vCenter. Its rows no longer repeat
   the state and flag legend, and the default `limit` is 10, which halves it.
 - The scenario's storage storm had slow datastores but healthy VM disks; the
-  stuck clones' own disks now read slow too.
+  stuck clones' own disks now read slow too, and every VM's CPU series now
+  matches what vcsim says it is using (it was a flat 200 MHz for all).
+- A model wanting every abnormal VM re-ran `scan` with a high `limit`; the VMs
+  past the limit are now named in `more_abnormal_vms`, one line each.
+
+| scenario | round 1 | round 2 |
+|---|---|---|
+| storage-storm | wrong cause, 16 calls, 163k chars | right, 7 calls, 86k |
+| cpu-starvation | right, 6 calls, 129k | right, 5 calls, 69k |
+| fleet | right, 15 calls, 191k | right, 5 calls, 125k |
+| boot-loop | hedged (server led with a NIC), 3 calls | right, 2 calls |
+| stop-code | right, 1 call | right, 1 call |
+| question | right, 1 call | right, 1 call |
+
+No run, in any round, called a tool that acts on a VM.

@@ -87,6 +87,8 @@ INFRASTRUCTURE_WINDOW = timedelta(minutes=15)
 MIN_GROUP = 2
 GROUPS_PER_DIMENSION = 5
 REPRESENTATIVES = 3
+# How many abnormal VMs past `limit` a scan still names, one line each.
+MORE_LISTED = 200
 # What a scan reports by default: every abnormal state, and the flags.
 FLAGGED = (*ABNORMAL, *ATTENTION_FLAGS)
 # What counts as abnormal in rates and groups: the states, and the flags that
@@ -590,6 +592,12 @@ def summary(scan: Scan, *, states: Sequence[str] = FLAGGED, limit: int) -> dict[
             for vm, verdict in rows[:limit]
         ],
         "abnormal_vms_truncated": max(0, len(rows) - limit),
+        # The rest in one line each, so a reader can name them all without a second scan.
+        "more_abnormal_vms": [
+            f"{vm.vcenter}/{vm.moref} {vm.name} in {vm.folder}: {verdict.state}"
+            + (f" ({', '.join(verdict.flags)})" if verdict.flags else "")
+            for vm, verdict in rows[limit : limit + MORE_LISTED]
+        ],
         "next": (
             "explain_group(scan_id, dimension, value) on the strongest group; "
             "diagnose_vm on its representatives"

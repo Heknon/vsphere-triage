@@ -619,7 +619,8 @@ def _register_fleet_tools(  # noqa: C901, PLR0915 - one closure per tool
         linked-clone base disk and OS, each against its population. Also reports
         hosts over the CPU threshold and slow storage right now. Read findings and
         strongest_groups first: the group is usually the answer, and explain_group
-        lists its members; the per-VM rows are a sample of the abnormal VMs.
+        lists its members. The first `limit` abnormal VMs come in full;
+        more_abnormal_vms names the rest, one line each.
 
         Args:
             vcenters: vCenter names (any spelling they are known by); all when empty.
@@ -645,6 +646,11 @@ def _register_fleet_tools(  # noqa: C901, PLR0915 - one closure per tool
         while len(summary["abnormal_vms"]) > 1 and size(jsonable(summary)) > MAX_RESPONSE_CHARACTERS:
             summary["abnormal_vms"] = summary["abnormal_vms"][: len(summary["abnormal_vms"]) // 2]
         summary["abnormal_vms_truncated"] += len(rows) - len(summary["abnormal_vms"])
+        dropped = [
+            f"{row['vcenter']}/{row['moref']} {row['name']} in {row['folder']}: {row['verdict']['state']}"
+            for row in rows[len(summary["abnormal_vms"]) :]
+        ]
+        summary["more_abnormal_vms"] = dropped + summary["more_abnormal_vms"]
         return summary
 
     @tool()

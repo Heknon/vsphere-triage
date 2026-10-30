@@ -74,6 +74,10 @@ class Plan:
 
     def __init__(self, a: scenario.World) -> None:
         self.values: dict[tuple[str, str, str], dict[str, float]] = {}
+        # Each VM's CPU over the window is what vcsim reports it using now, so the
+        # series and the instant reading agree (a starved VM busy, a hung one idle).
+        for machine in a.machines.values():
+            self.set(a, machine.moref, "cpu.usagemhz.average", {"": float(machine.cpu_mhz)})
         # The CPU incident: one host at 120% demand; its stuck VMs wait 30% of the time.
         self.set(a, a.hosts["DC0_C1_H0"], "cpu.demand.average", {"": 1.2 * HOST_CAPACITY})
         self.set(a, a.hosts["DC0_C1_H0"], "cpu.usagemhz.average", {"": 0.99 * HOST_CAPACITY})
