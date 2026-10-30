@@ -7,7 +7,11 @@ from dataclasses import asdict, is_dataclass
 from datetime import UTC, datetime
 from typing import Any
 
-MAX_RESPONSE_CHARACTERS = 120_000
+# Measured as the client receives it (the MCP SDK sends the JSON indented), and
+# kept under the default tool-output limit of common clients (Claude Code: 25,000
+# tokens; this JSON runs about 2.5 to 3 characters a token), so a large result
+# arrives cut down rather than refused by the client.
+MAX_RESPONSE_CHARACTERS = 60_000
 # How far a list is cut, in turn, when a response is too large.
 LIST_CUTS = (200, 80, 30, 10, 3)
 
@@ -42,19 +46,24 @@ def _cut(value: Any, keep: int) -> Any:
     return value
 
 
+def size(value: Any) -> int:
+    """How many characters `value` takes as the client receives it."""
+    return len(json.dumps(value, indent=2))
+
+
 def bounded(result: dict[str, Any]) -> dict[str, Any]:
     """The result, JSON-ready, with long lists cut until it fits; said when cut."""
     ready = jsonable(result)
-    if len(json.dumps(ready)) <= MAX_RESPONSE_CHARACTERS:
+    if size(ready) <= MAX_RESPONSE_CHARACTERS:
         return ready
     for keep in LIST_CUTS:
         cut = _cut(ready, keep)
-        if len(json.dumps(cut)) <= MAX_RESPONSE_CHARACTERS:
+        if size(cut) <= MAX_RESPONSE_CHARACTERS:
             cut["truncated"] = f"lists cut to {keep} items to fit the response budget"
             return cut
     # Even the findings are cut, so the last resort cannot itself break the budget.
     findings = _cut(ready.get("findings") or ready.get("finding"), LIST_CUTS[-1])
     fallback = {"truncated": "the result was too large to return even cut down", "findings": findings}
-    if len(json.dumps(fallback)) > MAX_RESPONSE_CHARACTERS:
+    if size(fallback) > MAX_RESPONSE_CHARACTERS:
         fallback["findings"] = None
     return fallback

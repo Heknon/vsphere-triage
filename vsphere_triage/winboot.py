@@ -30,12 +30,13 @@ is `investigate_windows_boot`.
 
 from __future__ import annotations
 
+import re
 from datetime import UTC, datetime, timedelta
 from typing import TYPE_CHECKING, Any
 
 from vsphere_triage import capabilities, vmlog
 from vsphere_triage.diagnose import locate
-from vsphere_triage.guestexec import encode_powershell, probe_failed
+from vsphere_triage.guestexec import PS_QUIET, PS_UTF8_OUTPUT, encode_powershell, probe_failed
 
 if TYPE_CHECKING:
     from vsphere_triage.config import Settings
@@ -54,7 +55,7 @@ def boot_probe_powershell() -> str:
     download stays small.
     """
     return (
-        "$ErrorActionPreference='SilentlyContinue';"
+        f"{PS_QUIET}{PS_UTF8_OUTPUT}"
         "function ev($h){ try { Get-WinEvent -FilterHashtable $h -MaxEvents "
         f"{PER_KIND} |"
         " ForEach-Object { @{ time=$_.TimeCreated.ToUniversalTime().ToString('o');"
@@ -63,7 +64,12 @@ def boot_probe_powershell() -> str:
         # cutting it by the original length throws on any message with a double space
         # or CRLF (WER 1001 has both), and the catch would drop the whole event kind.
         " message=$($m=([string]$_.Message -replace '\\s+',' ');"
-        " $m.Substring(0,[Math]::Min(300,$m.Length))) } } }"
+        " $m.Substring(0,[Math]::Min(300,$m.Length)));"
+        # The event's own data, which does not depend on the display language: for
+        # WER 1001, Properties[0] is "0x0000009f (0x..., ...)" on every locale, where
+        # the message text ("The bugcheck was: ...") is translated.
+        " data=$($d=(@($_.Properties | ForEach-Object { [string]$_.Value }) -join ' | ');"
+        " $d.Substring(0,[Math]::Min(300,$d.Length))) } } }"
         " catch { @() } }"
         "$o=[ordered]@{};"
         "$o.last_boot=(Get-CimInstance Win32_OperatingSystem).LastBootUpTime.ToUniversalTime().ToString('o');"
@@ -75,27 +81,35 @@ def boot_probe_powershell() -> str:
         "ProviderName='Service Control Manager';Id=7000,7009,7011,7026});"
         "$o.boot_performance=@(ev @{"
         "LogName='Microsoft-Windows-Diagnostics-Performance/Operational';Id=100,101,102,103});"
-        "$md='C:\\Windows\\Minidump';"
+        "$md=($env:SystemRoot+'\\Minidump');"
         "$o.newest_minidump=(Get-ChildItem $md -Filter *.dmp | Sort-Object LastWriteTime -Descending |"
         " Select-Object -First 1 | ForEach-Object { @{ name=$_.Name;"
         " time=$_.LastWriteTime.ToUniversalTime().ToString('o') } });"
-        "$o.memory_dmp=(Test-Path 'C:\\Windows\\MEMORY.DMP');"
-        "$o.ntbtlog=(Test-Path 'C:\\Windows\\ntbtlog.txt');"
-        "$srt='C:\\Windows\\System32\\LogFiles\\Srt\\SrtTrail.txt';"
+        "$o.memory_dmp=(Test-Path ($env:SystemRoot+'\\MEMORY.DMP'));"
+        "$o.ntbtlog=(Test-Path ($env:SystemRoot+'\\ntbtlog.txt'));"
+        "$srt=($env:SystemRoot+'\\System32\\LogFiles\\Srt\\SrtTrail.txt');"
         # $( ): `if` is a statement, so inside plain ( ) it is an error that
         # SilentlyContinue hid, and SrtTrail was never reported.
         "$o.srttrail=$(if (Test-Path $srt) { (Get-Content $srt -Tail 40 | Out-String) } else { $null });"
-        "$pan='C:\\Windows\\Panther\\setupact.log';"
+        "$pan=($env:SystemRoot+'\\Panther\\setupact.log');"
         "$o.panther_present=(Test-Path $pan);"
         "$o | ConvertTo-Json -Depth 5 -Compress"
     )
+
+
+_BARE_STOP_CODE = re.compile(r"(?i)\b(0x[0-9a-f]{8})\s*\(\s*0x")
 
 
 def _decode_bugchecks(rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
     """Pull the stop code out of each WER 1001 message and name the layer it points at."""
     decoded = []
     for row in rows:
-        codes = vmlog.stop_codes(str(row.get("message", "")))
+        text = f"{row.get('message', '')} {row.get('data', '')}"
+        codes = vmlog.stop_codes(text)
+        if not codes:
+            # A localized message the English patterns miss: the stop code is still
+            # the 8-hex-digit code right before its parameter list, "0x0000009f (0x...".
+            codes = vmlog.stop_codes(" ".join(f"*** STOP: {code}" for code in _BARE_STOP_CODE.findall(text)))
         decoded.append(
             {
                 "time": row.get("time"),

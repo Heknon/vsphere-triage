@@ -8,17 +8,86 @@ voltage) and the memory/CPU/storage status groups, each carrying a health state
 critical, any yellow is a warning, and no sensor data at all (a host that does
 not report, or a simulator) is said rather than taken for healthy.
 
-Pure and tested; the read is in `get_host_health`.
+`read_sensors` reads them for many hosts in one property read, for a scan and
+for `get_host_health`; the classification is pure and tested.
 """
 
 from __future__ import annotations
 
-from typing import Any
+from typing import TYPE_CHECKING, Any
+
+from pyVmomi import vim
+
+if TYPE_CHECKING:
+    from collections.abc import Sequence
+
+    from vsphere_triage.vcenter import VCenterSession
+
+SENSOR_BATCH = 20
+SENSOR_PATHS = (
+    "runtime.healthSystemRuntime.systemHealthInfo.numericSensorInfo",
+    "runtime.healthSystemRuntime.hardwareStatusInfo",
+)
+
+
+def _reading(sensor: Any) -> float | None:
+    """A numeric sensor's reading in its base units, applying its unitModifier."""
+    raw = getattr(sensor, "currentReading", None)
+    if not isinstance(raw, (int, float)) or isinstance(raw, bool):
+        return None
+    modifier = getattr(sensor, "unitModifier", 0) or 0
+    return round(raw * (10**modifier), 3) if isinstance(modifier, int) else float(raw)
+
+
+def flatten(row: dict[str, Any]) -> list[dict[str, Any]]:
+    """One host row's sensors and hardware status groups as {name, type, health, reading, unit}."""
+    sensors: list[dict[str, Any]] = [
+        {
+            "name": getattr(sensor, "name", None),
+            "type": getattr(sensor, "sensorType", None),
+            "health": getattr(getattr(sensor, "healthState", None), "key", None),
+            # currentReading is scaled by 10^unitModifier: 4500 with modifier -2 is 45.0.
+            "reading": _reading(sensor),
+            "unit": getattr(sensor, "baseUnits", None) or None,
+        }
+        for sensor in row.get(SENSOR_PATHS[0]) or []
+    ]
+    hardware_status = row.get(SENSOR_PATHS[1])
+    for group in ("memoryStatusInfo", "cpuStatusInfo", "storageStatusInfo"):
+        sensors.extend(
+            {
+                "name": getattr(item, "name", None),
+                "type": group.removesuffix("StatusInfo"),
+                "health": getattr(getattr(item, "status", None), "key", None),
+                "reading": None,
+            }
+            for item in getattr(hardware_status, group, None) or []
+        )
+    return sensors
+
+
+def read_sensors(session: VCenterSession, host_morefs: Sequence[str]) -> dict[str, list[dict[str, Any]]]:
+    """The hardware sensors of each host, by moref. Read-only."""
+    found: dict[str, list[dict[str, Any]]] = {}
+    # In batches: a host can carry hundreds of sensors, and one read of a whole
+    # large vCenter's would be tens of megabytes of XML at once.
+    for start in range(0, len(host_morefs), SENSOR_BATCH):
+        batch = host_morefs[start : start + SENSOR_BATCH]
+        rows = session.retrieve(
+            vim.HostSystem, SENSOR_PATHS, objects=[session.reference("HostSystem", moref) for moref in batch]
+        )
+        found.update({row["moref"]: flatten(row) for row in rows})
+    return found
+
 
 # unknown is not a failure signal — many sensors report it when idle — so only
 # red and yellow count against health.
 _RED = "red"
 _YELLOW = "yellow"
+
+
+def _software(sensor: dict[str, Any]) -> bool:
+    return "software" in f"{sensor.get('type') or ''} {sensor.get('name') or ''}".lower()
 
 
 def classify_sensors(sensors: list[dict[str, Any]]) -> dict[str, Any]:
@@ -37,7 +106,13 @@ def classify_sensors(sensors: list[dict[str, Any]]) -> dict[str, Any]:
     if yellow:
         names = ", ".join(sorted({str(sensor.get("name")) for sensor in yellow})[:10])
         findings.append(f"{len(yellow)} hardware sensor(s) warning (yellow): {names}")
-    green = [sensor for sensor in sensors if str(sensor.get("health", "")).lower() == "green"]
+    # "Software Components" is listed green on hosts with no hardware provider at
+    # all: it says nothing about the hardware, so it proves no health.
+    green = [
+        sensor
+        for sensor in sensors
+        if str(sensor.get("health", "")).lower() == "green" and not _software(sensor)
+    ]
     if sensors and not green and not red and not yellow:
         findings.append(
             f"none of the host's {len(sensors)} hardware sensor(s) reports a state (all unknown): its CIM "

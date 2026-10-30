@@ -5,9 +5,11 @@ from __future__ import annotations
 import asyncio
 import io
 import json
+import re
 import ssl
 from datetime import UTC, datetime, timedelta
 from types import SimpleNamespace
+from typing import TYPE_CHECKING
 
 import httpx
 import pytest
@@ -56,6 +58,9 @@ from vsphere_triage.inventory import (
 from vsphere_triage.readonly import ALLOWED_METHODS, ReadOnlyStub, ReadOnlyViolationError, ensure_read_request
 from vsphere_triage.vcenter import PerfSeries, VCenterSession, ssl_context
 from vsphere_triage.vrops import Vrops
+
+if TYPE_CHECKING:
+    import pathlib
 
 NOW = datetime(2026, 10, 29, 2, 30, tzinfo=UTC)
 LIMITS = Thresholds()
@@ -696,7 +701,7 @@ def test_nothing_on_the_read_list_writes() -> None:
         "Update",
     )
     # Session-scoped views and collectors: created and destroyed within this session, changing nothing.
-    allowed_sessions = {"CreateContainerView", "DestroyView"}
+    allowed_sessions = {"CreateContainerView", "DestroyView", "CreateCollectorForTasks", "DestroyCollector"}
 
     for name in ALLOWED_METHODS - allowed_sessions:
         assert not any(word in name for word in writes), name
@@ -722,7 +727,7 @@ def test_a_large_result_is_cut_and_says_so() -> None:
     result = formatting.bounded({"findings": ["a"], "rows": [{"text": "x" * 500} for _ in range(2000)]})
 
     assert "truncated" in result
-    assert len(json.dumps(result)) <= formatting.MAX_RESPONSE_CHARACTERS
+    assert formatting.size(result) <= formatting.MAX_RESPONSE_CHARACTERS
     assert result["findings"] == ["a"]
 
 
@@ -821,12 +826,13 @@ def test_a_vm_without_tools_is_not_abnormal_but_is_explained() -> None:
     ("fields", "flag", "attention"),
     [
         ({"tools_running": "guestToolsRunning", "heartbeat": "yellow"}, checks.HEARTBEAT_INTERMITTENT, True),
-        ({"swapped_mb": 10}, checks.MEMORY_RECLAIMED, True),
-        ({"ballooned_mb": 10}, checks.MEMORY_RECLAIMED, True),
-        ({"host_memory_percent": 97.0}, checks.HOST_MEMORY_PRESSURE, True),
-        ({"alarms": [{"alarm": "VM CPU", "status": "red"}]}, checks.VCENTER_ALARM, True),
+        # Context flags: reported, but a VM with only these is not abnormal.
+        ({"swapped_mb": 10}, checks.MEMORY_RECLAIMED, False),
+        ({"ballooned_mb": 10}, checks.MEMORY_RECLAIMED, False),
+        ({"host_memory_percent": 97.0}, checks.HOST_MEMORY_PRESSURE, False),
+        ({"alarms": [{"alarm": "VM CPU", "status": "red"}]}, checks.VCENTER_ALARM, False),
         ({"host_connection_state": "notResponding"}, checks.HOST_NOT_CONNECTED, True),
-        ({"created": NOW - timedelta(hours=30), "read_at": NOW}, checks.LONG_RUNNING, True),
+        ({"created": NOW - timedelta(hours=30), "read_at": NOW}, checks.LONG_RUNNING, False),
         ({"host_maintenance": True}, checks.HOST_IN_MAINTENANCE, False),
         ({"tools_version_status": "guestToolsTooOld"}, checks.TOOLS_OUTDATED, False),
     ],
@@ -1131,7 +1137,8 @@ def test_snapshot_usage_sums_delta_and_memory_state() -> None:
             _File(2, "diskExtent", 40 * gb),  # base disk — not counted
             _File(3, "diskExtent", 30 * gb),  # snapshot delta — counted
             _File(4, "diskExtent", 20 * gb),  # a second snapshot delta — counted
-            _File(5, "snapshotData", 8 * gb),  # .vmsn memory state — counted
+            _File(5, "snapshotData", 1 * gb),  # .vmsn state — counted
+            _File(6, "snapshotMemory", 7 * gb),  # .vmem memory — counted
         ],
         disks=[_Disk(200, [_Unit(2), _Unit(3), _Unit(4)])],  # base + two deltas: chain depth 2
     )
@@ -1433,7 +1440,44 @@ def test_the_linux_shell_wraps_the_command_and_captures_output() -> None:
     program, arguments = guestexec.guest_program_spec("systemctl status", "/tmp/o.txt", windows=False)  # noqa: S108
 
     assert program == "/bin/sh"
-    assert arguments == "-c \"exec > '/tmp/o.txt' 2>&1; systemctl status\""
+    assert arguments.startswith("-c \"exec > '/tmp/o.txt' 2>&1; command -v base64")
+    assert "systemctl" not in arguments
+
+
+def test_a_linux_command_survives_the_shell_tools_starts_it_through(tmp_path: pathlib.Path) -> None:
+    import shutil  # noqa: PLC0415
+    import subprocess  # noqa: PLC0415
+
+    if shutil.which("sh") is None or shutil.which("base64") is None:
+        pytest.skip("needs sh and base64")
+    out = tmp_path / "o.txt"
+    command = "echo 'a b c' | awk '{print $2}'; echo \"`echo tick`\" \\done"
+    program, arguments = guestexec.guest_program_spec(command, str(out), windows=False)
+
+    # open-vm-tools runs `"<program>" <arguments>` through /bin/sh -c.
+    subprocess.run(["/bin/sh", "-c", f'"{program}" {arguments}'], check=True)
+
+    assert out.read_text().splitlines() == ["b", "tick done"]
+
+
+@pytest.mark.parametrize("shell", ["sh", "bash"])
+def test_a_linux_command_that_reads_stdin_does_not_swallow_the_rest(
+    tmp_path: pathlib.Path, shell: str
+) -> None:
+    import shutil  # noqa: PLC0415
+    import subprocess  # noqa: PLC0415
+
+    if shutil.which(shell) is None or shutil.which("base64") is None:
+        pytest.skip(f"needs {shell} and base64")
+    out = tmp_path / "o.txt"
+    program, arguments = guestexec.guest_program_spec(
+        "read x; echo got=$x\necho second", str(out), windows=False
+    )
+
+    done = subprocess.run([shell, "-c", f'"{program}" {arguments}'], check=False)
+
+    assert out.read_text().splitlines() == ["got=", "second"]
+    assert done.returncode == 0
 
 
 def test_the_guest_temp_path_is_os_specific() -> None:
@@ -1465,7 +1509,10 @@ def test_the_linux_wrapping_captures_every_part_of_a_compound_command(
 
     out = f"{tmp_path}/o.txt"
     program, arguments = guestexec.guest_program_spec(command, out, windows=False)
-    leaked = subprocess.run([program, *shlex.split(arguments)], capture_output=True, text=True, check=False)
+    # As open-vm-tools starts it: the program line through /bin/sh -c.
+    leaked = subprocess.run(
+        ["/bin/sh", "-c", f"{shlex.quote(program)} {arguments}"], capture_output=True, text=True, check=False
+    )
 
     assert leaked.stdout == ""
     with open(out, encoding="utf-8") as handle:  # noqa: PTH123
@@ -1878,7 +1925,7 @@ def test_the_last_resort_cut_still_fits_the_budget() -> None:
 
     result = formatting.bounded(huge)
 
-    assert len(json.dumps(result)) <= formatting.MAX_RESPONSE_CHARACTERS
+    assert formatting.size(result) <= formatting.MAX_RESPONSE_CHARACTERS
 
 
 # -- the pool under stalls, and the smaller reads ---------------------------------------------
@@ -1964,7 +2011,7 @@ def test_only_the_servers_own_session_is_reported_as_a_restricted_view() -> None
     counted = session.session_count()
 
     assert counted["visible"] == "own_only"
-    assert "Sessions.View" in counted["note"]
+    assert "Sessions.TerminateSession" in counted["note"]
 
 
 def test_an_ocr_failure_loses_the_text_not_the_console(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -3021,7 +3068,7 @@ def test_a_busy_window_is_read_in_pieces_not_cut_to_its_last_minutes() -> None:
 
 
 def test_no_sensor_data_is_unknown_and_readings_are_scaled() -> None:
-    from vsphere_triage.server import _sensor_reading  # noqa: PLC0415
+    _sensor_reading = hostsensors._reading
 
     assert _sensor_reading(SimpleNamespace(currentReading=4500, unitModifier=-2)) == 45.0
     assert _sensor_reading(SimpleNamespace(currentReading=None, unitModifier=0)) is None
@@ -3173,7 +3220,11 @@ def test_an_ha_restart_names_the_failed_host_not_the_one_the_vms_came_back_on() 
             "Insufficient resources to satisfy HA failover",
             "ha_capacity_warning",
         ),
-        ("HostIsolationIpPingFailedEvent", "Host esx-1 could not reach isolation address", "host_isolation"),
+        (
+            "HostIsolationIpPingFailedEvent",
+            "Host esx-1 could not reach isolation address",
+            "isolation_address_unreachable",
+        ),
     ],
 )
 def test_ha_wordings_the_patterns_had_missed(kind: str, message: str, bucket: str) -> None:
@@ -3305,3 +3356,730 @@ def test_a_power_operation_by_moref_alone_is_refused() -> None:
 
     assert result["found"] is False
     assert "needs the VM's name" in result["reason"]
+
+
+# -- review against the PowerFlex SDKs ----------------------------------------------------------
+
+
+def test_a_degraded_pool_with_no_rebuild_running_is_not_healthy() -> None:
+    sds = [{"name": "sds-1", "sdsState": "Normal", "mdmConnectionState": "Connected"}]
+    devices = [{"id": "d1", "deviceState": "Normal", "errorState": "None"}]
+
+    degraded = powerflex.summarize_health(sds, devices, {"semiProtectedCapacityInKb": 4096})
+    unreachable = powerflex.summarize_health(sds, devices, {"inaccessibleCapacityInKb": 10})
+
+    assert degraded["healthy"] is False
+    assert degraded["degraded"] is True
+    assert degraded["rebuild_active"] is False
+    assert any("no rebuild is running" in finding for finding in degraded["findings"])
+    assert unreachable["data_unavailable"] is True
+    assert any("inaccessibleCapacityInKb" in finding for finding in unreachable["findings"])
+
+
+def test_the_dmesg_filter_keeps_dracut_failures_and_drops_oops_on_the_command_line() -> None:
+    script = linuxboot.boot_probe_shell()
+    pattern = re.search(r"grep -iE '([^']+)'", script)
+    assert pattern
+    keep = re.compile(pattern.group(1), re.IGNORECASE)
+
+    assert keep.search("dracut-initqueue[285]: Warning: Could not boot.")
+    assert keep.search("Kernel panic - not syncing: VFS: Unable to mount root fs")
+    assert keep.search("Oops: 0000 [#1] SMP PTI")
+    assert not keep.search("Kernel command line: BOOT_IMAGE=/vmlinuz root=/dev/sda1 oops=panic")
+    oops = next(mark for name, _, mark in vmlog.LINUX_MARKS if name == "oops")
+    assert not oops.search("Kernel command line: root=/dev/sda1 oops=panic")
+    assert oops.search("Oops: 0000 [#1] SMP PTI")
+
+
+def test_a_probe_whose_output_could_not_be_read_back_says_why() -> None:
+    reason = guestexec.probe_failed({"output": "", "exit_code": 0, "output_error": "ConnectError: refused"})
+
+    assert reason
+    assert "ConnectError" in reason
+
+
+def test_an_sds_state_field_that_is_null_is_not_a_down_sds() -> None:
+    sds = [{"name": "sds-1", "sdsState": "Normal", "mdmConnectionState": None, "membershipState": "Joined"}]
+    devices = [{"id": "d1", "deviceState": "Normal", "errorState": "None"}]
+
+    summary = powerflex.summarize_health(sds, devices, {"semiProtectedCapacityInKb": 0})
+
+    assert summary["sds_down"] == []
+    assert summary["healthy"] is True
+
+
+# -- review against real guests and the vSphere API --------------------------------------------
+
+
+def test_a_localized_bugcheck_is_read_from_the_event_data() -> None:
+    parsed = {
+        "last_boot": "2026-10-29T02:00:00+00:00",
+        "bugchecks": [
+            {
+                "time": "2026-10-29T02:01:00+00:00",
+                "message": "Der Computer wurde nach einem Fehler neu gestartet. Fehlercode: ...",
+                "data": "0x0000007a (0xffffd7ec, 0xc000000e, 0x0, 0x0) | C:\\Windows\\MEMORY.DMP",
+            }
+        ],
+    }
+
+    summary = winboot.summarize_windows_boot(parsed)
+
+    assert summary["bugchecks"][0]["stop_codes"][0]["code"] == "0x0000007A"
+
+
+def test_every_windows_probe_prints_its_json_as_utf8() -> None:
+    from vsphere_triage import crashdump, emscheck  # noqa: PLC0415
+
+    for script in (
+        winboot.boot_probe_powershell(),
+        emscheck.bcd_probe_powershell(),
+        crashdump.dump_probe_powershell(),
+    ):
+        assert guestexec.PS_UTF8_OUTPUT in script
+    # The BCD probe switches only after bcdedit ran, so bcdedit's output is decoded right.
+    bcd = emscheck.bcd_probe_powershell()
+    assert bcd.index("bcdedit") < bcd.index(guestexec.PS_UTF8_OUTPUT)
+
+
+def test_every_windows_probe_fits_cmds_command_line_limit() -> None:
+    from vsphere_triage import crashdump, emscheck  # noqa: PLC0415
+
+    for script in (
+        winboot.boot_probe_powershell(),
+        emscheck.bcd_probe_powershell(),
+        crashdump.dump_probe_powershell(),
+    ):
+        _program, arguments = guestexec.guest_program_spec(
+            guestexec.encode_powershell(script), r"C:\Windows\Temp\vsphere-triage-x.txt", windows=True
+        )
+        assert len(arguments) < 8191
+
+
+def test_a_slow_unit_over_a_minute_keeps_its_name() -> None:
+    output = (
+        "===BLAME===\n1min 30.012s systemd-networkd-wait-online.service\n  2.100s sshd.service\n===END===\n"
+    )
+
+    summary = linuxboot.summarize_linux_boot(output)
+
+    assert summary["slow_units"][0] == {
+        "time": "1min 30.012s",
+        "unit": "systemd-networkd-wait-online.service",
+    }
+
+
+def test_no_entries_from_a_restricted_journal_is_not_a_clean_read() -> None:
+    output = (
+        "===DMESG_LINES===\n0\n===DMESG===\n===JOURNAL===\n-- No entries --\n"
+        "===BOOTS===\n3\n===PREVIOUS===\n-- No entries --\n===END===\n"
+    )
+
+    summary = linuxboot.summarize_linux_boot(output)
+
+    assert summary["restricted"] is True
+    assert summary["previous_boot_read"] is False
+
+
+def test_the_perf_rollup_matches_the_windows_age() -> None:
+    from vsphere_triage.vcenter import perf_interval  # noqa: PLC0415
+
+    assert perf_interval(timedelta(minutes=30)) == 20
+    assert perf_interval(timedelta(hours=12)) == 300
+    assert perf_interval(timedelta(days=3)) == 1800
+    assert perf_interval(timedelta(days=20)) == 7200
+    assert perf_interval(timedelta(days=200)) == 86400
+
+
+# -- review against real screens and logs -------------------------------------------------------
+
+
+def _screen(colour: tuple[int, int, int], spots: list[tuple[int, int, int, int]] = ()) -> bytes:
+    image = Image.new("RGB", (1024, 768), colour)
+    for left, top, width, height in spots:
+        image.paste((255, 255, 255), (left, top, left + width, top + height))
+    out = io.BytesIO()
+    image.save(out, format="PNG")
+    return out.getvalue()
+
+
+def test_a_moving_boot_spinner_is_not_a_frozen_screen() -> None:
+    dots_then = [(500 + 12 * index, 600, 6, 6) for index in range(5)]
+    dots_now = [(506, 590 + 10 * index, 6, 6) for index in range(5)]
+
+    result = console.read_captures(
+        [_screen((0, 0, 0), dots_then), _screen((0, 0, 0), dots_now)],
+        black_fraction=0.98,
+        frozen_difference=0.5,
+    )
+
+    assert result["mean_difference"] < 0.5
+    assert result["frozen"] is False
+
+
+def test_a_blinking_cursor_alone_does_not_unfreeze_a_screen() -> None:
+    text = [(20, 20 + 18 * row, 300, 10) for row in range(4)]
+
+    result = console.read_captures(
+        [_screen((0, 0, 0), [*text, (20, 100, 8, 16)]), _screen((0, 0, 0), text)],
+        black_fraction=0.9,
+        frozen_difference=0.5,
+    )
+
+    assert result["frozen"] is True
+
+
+def _conclude_screen(machine: VmFacts, console_reading: dict) -> dict:
+    return diagnose.conclude(
+        checks.classify(machine, LIMITS),
+        vm=machine,
+        cpu={"findings": [], "starved": False},
+        disk={"findings": [], "slow": False, "datastores": []},
+        environment={"signals": []},
+        logs={"available": False},
+        serial={"available": False},
+        console={"available": True, **console_reading},
+        host_log={"available": False},
+    )
+
+
+def test_a_still_blue_screen_without_ocr_is_crash_evidence_only_for_a_windows_vm_that_is_down() -> None:
+    blue = {"frozen": True, "blue_screen_colour": True, "screen_states": []}
+
+    down = _conclude_screen(vm(cpu_mhz=3600.0, os_family="windows"), blue)
+    idle = _conclude_screen(
+        vm(
+            cpu_mhz=30.0,
+            os_family="windows",
+            tools_running="guestToolsRunning",
+            heartbeat="green",
+            uptime_minutes=4000.0,
+        ),
+        blue,
+    )
+    installer = _conclude_screen(vm(cpu_mhz=3600.0, os_family="linux"), blue)
+
+    assert any(cause["cause"] == diagnose.WINDOWS_CRASH for cause in down["causes"])
+    assert not any(cause["cause"] == diagnose.WINDOWS_CRASH for cause in idle["causes"])
+    assert not any(cause["cause"] == diagnose.WINDOWS_CRASH for cause in installer["causes"])
+
+
+def test_still_text_on_black_on_a_down_windows_vm_is_a_crash_or_boot_error_not_a_login() -> None:
+    result = _conclude_screen(
+        vm(cpu_mhz=3600.0, os_family="windows"), {"frozen": True, "black": True, "text_on_black": True}
+    )
+
+    causes = [cause["cause"] for cause in result["causes"]]
+    assert diagnose.WINDOWS_CRASH in causes
+    assert diagnose.CANNOT_BOOT in causes
+    assert diagnose.TOOLS_DID_NOT_START not in causes
+    assert diagnose.EARLY_HANG not in causes
+
+
+def test_a_guest_reboot_in_the_same_log_starts_a_new_boot() -> None:
+    rows = [
+        "2026-10-29T02:00:00.000Z In(05) vmx - Powering on the virtual machine",
+        "2026-10-29T02:00:01.000Z In(05) vmx - EFI ROM loaded",
+        "2026-10-29T02:00:40.000Z In(05) vmx - Tools: Changing running status: 0 => 1.",
+        (
+            "2026-10-29T03:00:00.000Z In(05) vcpu-0 - Chipset: The guest has requested that the "
+            "virtual machine be hard reset."
+        ),
+        "2026-10-29T03:00:00.010Z In(05) vcpu-0 - CPU reset: hard (mode Emulation)",
+        "2026-10-29T03:00:00.020Z In(05) vcpu-1 - CPU reset: hard (mode Emulation)",
+        "2026-10-29T03:00:01.000Z In(05) vmx - EFI boot device order read",
+    ]
+    log = "\n".join(rows)
+
+    timeline = vmlog.boot_timeline(vmlog.parse_lines(log))
+
+    assert timeline["boot_started"] == datetime(2026, 10, 29, 3, 0, 0, 10000, tzinfo=UTC)
+    assert timeline["last_stage"] == "firmware"
+
+
+def test_routine_snapshot_stuns_and_tools_rpc_timeouts_are_not_storage() -> None:
+    rows = [
+        "2026-10-29T02:00:00.000Z In(05) vmx - Powering on the virtual machine",
+        "2026-10-29T02:10:00.000Z In(05) vmx - Checkpoint_Unstun: vm stopped for 412 us",
+        "2026-10-29T02:11:00.000Z In(05) vmx - GuestRpcSendTimedOut: message to toolbox timed out.",
+        "2026-10-29T02:12:00.000Z Wa(03) vmx - AIOGNRC: Failed to issue IO to file /vmfs/x.vmdk",
+    ]
+    log = "\n".join(rows)
+
+    storage = vmlog.boot_timeline(vmlog.parse_lines(log))["annotations"]["storage"]
+
+    assert storage["count"] == 1
+    assert "AIOGNRC" in storage["examples"][0]["message"]
+
+
+def test_continuation_lines_parse_and_old_ones_stay_out_of_a_since_window() -> None:
+    rows = [
+        "2026-10-29T01:00:00.000Z In(05) vmx - Msg_Question:",
+        "2026-10-29T01:00:00.000Z In(05)+ vmx - The datastore is full.",
+        "an unparsed body line of the question",
+        "2026-10-29T03:00:00.000Z In(05) vmx - Msg_Question: later",
+    ]
+    log = "\n".join(rows)
+    lines = vmlog.parse_lines(log)
+
+    kept, _ = vmlog.grep(lines, "question", since=datetime(2026, 10, 29, 2, tzinfo=UTC), limit=10)
+
+    assert lines[1].time is not None
+    assert [line.number for line in kept] == [4]
+
+
+def test_a_vcenter_that_is_not_a_vim_server_is_reported_unreachable(monkeypatch: pytest.MonkeyPatch) -> None:
+    def refuse(**_: object) -> None:
+        msg = "10.255.255.1:443 is down or is not a VIM server"
+        raise Exception(msg)  # noqa: TRY002 - what pyVmomi raises
+
+    from vsphere_triage.vcenter import VSphereError  # noqa: PLC0415
+
+    monkeypatch.setattr("vsphere_triage.vcenter.SmartConnect", refuse)
+    settings = Settings.from_environment(
+        {
+            "VSPHERE_VCENTERS": '[{"name": "vc-a", "host": "10.255.255.1"}]',
+            "VSPHERE_USERNAME": "u",
+            "VSPHERE_PASSWORD": "p",
+        }
+    )
+    session = VCenterSession(settings.vcenters[0], settings)
+
+    with pytest.raises(VSphereError, match="unreachable"):
+        session.connect()
+
+
+def test_context_flags_on_an_old_fleet_do_not_drown_the_stuck_group() -> None:
+    fleet = [
+        vm(
+            moref=f"vm-{index}",
+            host=f"esx-{index % 10}",
+            datastores=["ds-17" if index < 40 else f"ds-{index % 5}"],
+            created=NOW - timedelta(days=30),
+            read_at=NOW,
+            uptime_minutes=600.0,
+            swapped_mb=64 if index % 2 else 0,
+            tools_running="guestToolsNotRunning" if index < 30 else "guestToolsRunning",
+            heartbeat="gray" if index < 30 else "green",
+        )
+        for index in range(300)
+    ]
+
+    result = scan.summary(scan_of(fleet), limit=10)
+
+    assert result["findings"][0].startswith("30 abnormal of 300 powered-on VMs")
+    assert result["abnormal_vms_total"] == 30
+    assert result["context_flagged_vms_total"] == 270
+    assert result["strongest_groups"][0]["dimension"] == "datastore"
+    assert result["strongest_groups"][0]["value"].endswith("ds-17")
+    assert all(item["verdict"]["state"] != "ok" for item in result["abnormal_vms"][:10])
+
+
+def test_a_vm_in_a_vapp_gets_the_vapp_as_its_environment_folder() -> None:
+    from vsphere_triage import inventory  # noqa: PLC0415
+
+    root, vm_folder, vdc = vim.Folder("group-d1"), vim.Folder("group-v3"), vim.Folder("group-v9")
+    vapp = vim.VirtualApp("resgroup-v42")
+    rows = {
+        vim.Datacenter: [{"moref": "datacenter-2", "name": "DC0", "parent": root, "vmFolder": vm_folder}],
+        vim.Folder: [
+            {"moref": "group-d1", "name": "Datacenters", "parent": None},
+            {"moref": "group-v3", "name": "vm", "parent": vim.Datacenter("datacenter-2")},
+            {"moref": "group-v9", "name": "vdc-prod", "parent": vm_folder},
+        ],
+        vim.VirtualApp: [{"moref": "resgroup-v42", "name": "env-1003", "parentFolder": vdc}],
+    }
+    session = SimpleNamespace(retrieve=lambda kind, _paths: rows.get(kind, []))
+
+    folders = inventory.read_folders(session)
+    facts = inventory.vm_facts(
+        "vc-a",
+        {"moref": "vm-7", "name": "web-01", "parent": None, "parentVApp": vapp},
+        NOW,
+        folders,
+        {},
+        {},
+        with_devices=False,
+    )
+
+    assert facts.folder == "env-1003"
+    assert facts.folder_path == "/DC0/vm/vdc-prod/env-1003"
+    assert facts.folder_parent == "vdc-prod"
+    assert facts.datacenter == "DC0"
+    assert [folder.moref for folder in find_environment(folders, "env-1003")] == ["resgroup-v42"]
+
+
+def test_a_host_that_is_down_does_not_make_its_datastores_unreachable() -> None:
+    mounts = [
+        {"host_moref": "host-1", "mounted": True, "accessible": True, "inaccessible_reason": None},
+        {
+            "host_moref": "host-2",
+            "mounted": True,
+            "accessible": False,
+            "inaccessible_reason": None,
+            "host_up": False,
+        },
+    ]
+
+    verdict = storagehealth.classify_datastore(_store(mounts=mounts), LIMITS)
+
+    assert verdict["healthy"] is True
+    assert verdict["hosts_unreachable"] == []
+    assert verdict["hosts_down_mounting"] == 1
+    assert "not connected" in verdict["host_note"]
+
+
+def test_a_ptp_host_is_not_faulted_for_having_no_ntp() -> None:
+    verdict = timecheck.classify_host_time(
+        _host_time(ntp_servers=[], clock_protocol="ptp", service_key="ptpd"), LIMITS
+    )
+
+    assert verdict["healthy"] is True
+
+
+def test_a_vm_needing_consolidation_with_no_snapshot_tree_is_listed() -> None:
+    from vsphere_triage import inventory  # noqa: PLC0415
+
+    gb = 1024**3
+    layout = _LayoutEx(
+        files=[_File(1, "diskExtent", 40 * gb), _File(2, "diskExtent", 12 * gb)],
+        disks=[_Disk(200, [_Unit(1), _Unit(2)])],
+    )
+    ref = vim.VirtualMachine("vm-9")
+    rows = {
+        ("name", "parent", "parentVApp", "config.template", "runtime.consolidationNeeded", "snapshot"): [
+            {
+                "moref": "vm-9",
+                "_ref": ref,
+                "name": "db-01",
+                "runtime.consolidationNeeded": True,
+                "snapshot": None,
+            }
+        ],
+    }
+
+    def retrieve(_kind: object, paths: tuple, objects: object = None) -> list:
+        if objects is not None:
+            return [{"moref": "vm-9", "layoutEx": layout, "config.hardware.device": []}]
+        return rows[tuple(paths)]
+
+    session = SimpleNamespace(retrieve=retrieve, now=lambda: NOW, vcenter=SimpleNamespace(name="vc-a"))
+
+    found = inventory.read_vm_snapshots(session, {})
+
+    assert [item["moref"] for item in found] == ["vm-9"]
+    assert found[0]["consolidation_needed"] is True
+    assert found[0]["delta_bytes"] == 12 * gb
+
+
+def test_a_storage_path_going_dead_is_not_a_host_failure() -> None:
+    path = clusterevents.classify_event("EsxCommonEvent", "Device naa.600 path state changed to Dead")
+    host = clusterevents.classify_event(
+        "com.vmware.vc.HA.HostStateChangedEvent",
+        "The vSphere HA availability state of the host esx-1 in cluster C1 has changed to Dead",
+    )
+
+    assert path is None or path[0] != "host_failure"
+    assert host is not None
+    assert host[0] == "host_failure"
+
+
+def test_a_datastore_whose_every_host_is_down_is_unknown_not_unreachable() -> None:
+    mounts = [
+        {
+            "host_moref": "host-1",
+            "mounted": True,
+            "accessible": False,
+            "inaccessible_reason": None,
+            "host_up": False,
+        }
+    ]
+
+    verdict = storagehealth.classify_datastore(_store(accessible=False, mounts=mounts), LIMITS)
+
+    assert verdict["healthy"] is None
+    assert verdict["findings"] == []
+
+
+def test_a_limit_on_the_resource_pool_is_inherited_but_the_root_pool_is_not_a_limit() -> None:
+    from vsphere_triage import inventory  # noqa: PLC0415
+
+    cluster = vim.ClusterComputeResource("domain-c7")
+    root, team, inner = (
+        vim.ResourcePool("resgroup-1"),
+        vim.ResourcePool("resgroup-2"),
+        vim.ResourcePool("resgroup-3"),
+    )
+    rows = [
+        {"moref": "resgroup-1", "name": "Resources", "parent": cluster, "config.cpuAllocation.limit": 90000},
+        {"moref": "resgroup-2", "name": "team", "parent": root, "config.cpuAllocation.limit": 4000},
+        {
+            "moref": "resgroup-3",
+            "name": "batch",
+            "parent": team,
+            "config.cpuAllocation.limit": -1,
+            "config.memoryAllocation.limit": 8192,
+        },
+    ]
+    pools = inventory.pool_limits(SimpleNamespace(retrieve=lambda _kind, _paths: rows))
+
+    assert inventory.inherited_pool_limit(pools, inner._moId, "cpu_limit") == (4000, "team")
+    assert inventory.inherited_pool_limit(pools, inner._moId, "memory_limit") == (8192, "batch")
+    assert inventory.inherited_pool_limit(pools, root._moId, "cpu_limit") == (None, None)
+
+
+def test_a_vm_in_a_limited_pool_is_listed_as_limited() -> None:
+    row = {
+        "cpu_limit_mhz": None,
+        "memory_limit_mb": None,
+        "memory_mb": 4096,
+        "cpu_reservation_mhz": None,
+        "memory_reservation_mb": None,
+        "pool_cpu_limit_mhz": 4000,
+        "pool_cpu_limit_set_on": "team",
+        "pool_memory_limit_mb": None,
+        "pool_memory_limit_set_on": None,
+    }
+
+    assert resources._matches(row, "limits")
+    assert any("resource pool 'team'" in reason for reason in resources._findings_for(row))
+
+
+def test_an_expired_session_mid_scan_is_raised_for_the_pool_to_re_login() -> None:
+    def expired(**_: object) -> None:
+        raise vim.fault.NotAuthenticated
+
+    session = SimpleNamespace(now=lambda: NOW, events=expired)
+    settings = Settings.from_environment(
+        {
+            "VSPHERE_VCENTERS": '[{"name": "vc-a", "host": "a"}]',
+            "VSPHERE_USERNAME": "u",
+            "VSPHERE_PASSWORD": "p",
+        }
+    )
+
+    with pytest.raises(vim.fault.NotAuthenticated):
+        scan.scan_vcenter(session, settings)
+
+
+def test_windows_commands_follow_the_guests_system_root() -> None:
+    root = guestexec.system_root_from(["SystemRoot=D:\\WINDOWS"])
+    program, _ = guestexec.guest_program_spec("ver", r"D:\WINDOWS\Temp\o.txt", windows=True, system_root=root)
+
+    assert root == r"D:\WINDOWS"
+    assert program == r"D:\WINDOWS\System32\cmd.exe"
+    assert (
+        guestexec.guest_temp_path("t", windows=True, system_root=root)
+        == r"D:\WINDOWS\Temp\vsphere-triage-t.txt"
+    )
+    assert guestexec.system_root_from(None) == r"C:\Windows"
+
+
+def test_a_scan_re_judges_a_vm_rebooted_inside_the_guest_from_its_vmware_log() -> None:
+    from vsphere_triage.vcenter import DatastoreFile  # noqa: PLC0415
+
+    machine = vm(
+        moref="vm-7",
+        datacenter="DC0",
+        power_on_time=NOW - timedelta(days=3),
+        cpu_mhz=5.0,
+        tools_running="guestToolsNotRunning",
+    )
+    set_effective_boot(machine, NOW, reboots={})
+    inventory = Inventory("vc-a", NOW, [machine], {}, {}, {}, base_disks_read=True)
+    verdicts = {"vm-7": checks.classify(machine, LIMITS)}
+    rows = [
+        "2026-10-26T02:00:00.000Z In(05) vmx - Powering on the virtual machine",
+        "2026-10-29T02:26:00.000Z In(05) vcpu-0 - CPU reset: soft (mode Emulation)",
+        "2026-10-29T02:26:01.000Z In(05) vmx - EFI boot device order read",
+    ]
+    log = "\n".join(rows)
+    session = SimpleNamespace(
+        retrieve=lambda _kind, _paths, objects: [
+            {"moref": "vm-7", "config.files.vmPathName": "[ds-1] web-01/web-01.vmx"} for _ in objects
+        ],
+        reference=lambda kind, moref: f"{kind}:{moref}",
+        read_datastore_file=lambda _dc, path, _max, **_: DatastoreFile(path, log, len(log), False, 200),
+    )
+    settings = Settings.from_environment(
+        {
+            "VSPHERE_VCENTERS": '[{"name": "vc-a", "host": "a"}]',
+            "VSPHERE_USERNAME": "u",
+            "VSPHERE_PASSWORD": "p",
+        }
+    )
+    assert verdicts["vm-7"].state == checks.HUNG
+
+    notes = scan._recheck_in_guest_reboots(session, inventory, verdicts, {}, {}, settings)
+
+    assert machine.boot_source == "vmware_log"
+    assert verdicts["vm-7"].state == checks.BOOTING
+    assert "1 had rebooted" in notes[0]
+
+
+def test_a_scan_names_hosts_whose_hardware_sensors_are_red() -> None:
+    fleet = [vm(moref=f"vm-{index}", host="esx-1", host_moref="host-1") for index in range(3)]
+    result = scan_of(fleet)
+    vscan = result.vcenters["vc-a"]
+    vscan.inventory.hosts["host-1"] = HostFacts("host-1", "esx-1", None, "connected", False, None, None, None)
+    vscan.hardware = {
+        "host-1": hostsensors.classify_sensors(
+            [
+                {"name": "Power Supply 2", "type": "power", "health": "red"},
+                {"name": "Fan 1", "health": "green"},
+            ]
+        )
+    }
+
+    summary = scan.summary(result, limit=10)
+
+    assert summary["hosts_with_hardware_problems"][0]["red"] == ["Power Supply 2"]
+    assert summary["hosts_with_hardware_problems"][0]["powered_on_vms"] == 3
+    assert any("Power Supply 2" in finding for finding in summary["findings"])
+
+
+def test_red_host_sensors_are_evidence_in_a_diagnosis() -> None:
+    machine = vm(cpu_mhz=3600.0)
+    result = diagnose.conclude(
+        checks.classify(machine, LIMITS),
+        vm=machine,
+        cpu={"findings": [], "starved": False},
+        disk={"findings": [], "slow": False, "datastores": []},
+        environment={"signals": []},
+        logs={"available": False},
+        serial={"available": False},
+        console={"available": False},
+        host_log={"available": False},
+        host_hardware=hostsensors.classify_sensors(
+            [{"name": "CPU1 Temp", "type": "temperature", "health": "red"}]
+        ),
+    )
+
+    hardware = next(cause for cause in result["causes"] if cause["cause"] == diagnose.HOST_HARDWARE)
+    assert "CPU1 Temp" in hardware["for"][0]
+
+
+def test_sensors_are_read_for_many_hosts_in_one_call() -> None:
+    calls = []
+    sensor = SimpleNamespace(
+        name="PSU 1",
+        sensorType="power",
+        healthState=SimpleNamespace(key="red"),
+        currentReading=1,
+        unitModifier=0,
+    )
+
+    def retrieve(_kind: object, paths: tuple, objects: list) -> list:
+        calls.append(objects)
+        return [{"moref": ref, hostsensors.SENSOR_PATHS[0]: [sensor]} for ref in objects]
+
+    session = SimpleNamespace(retrieve=retrieve, reference=lambda _kind, moref: moref)
+
+    found = hostsensors.read_sensors(session, ["host-1", "host-2"])
+
+    assert len(calls) == 1
+    assert found["host-2"][0]["health"] == "red"
+
+
+def test_a_device_reset_line_does_not_start_a_new_boot() -> None:
+    rows = [
+        "2026-10-26T02:00:00.000Z In(05) vmx - Powering on the virtual machine",
+        "2026-10-26T02:01:00.000Z In(05) vmx - Tools: Changing running status: 0 => 1.",
+        "2026-10-29T02:28:00.000Z In(05) vcpu-1 - AHCI-VMM: sata0:0: Reset request",
+        "2026-10-29T02:28:01.000Z In(05) vmx - PVSCSI: scsi0: Bus reset request",
+    ]
+
+    timeline = vmlog.boot_timeline(vmlog.parse_lines("\n".join(rows)))
+
+    assert timeline["boot_started"] == datetime(2026, 10, 26, 2, 0, tzinfo=UTC)
+
+
+@pytest.mark.parametrize(
+    ("log_boot", "expected"),
+    [
+        (NOW - timedelta(days=3) + timedelta(seconds=5), "power_on"),  # the power-on itself
+        (NOW + timedelta(minutes=10), "power_on"),  # a host clock running ahead
+        (NOW - timedelta(minutes=4), "vmware_log"),  # a real reboot since
+    ],
+)
+def test_a_log_boot_counts_only_when_it_is_a_later_reboot(log_boot: datetime, expected: str) -> None:
+    machine = vm(power_on_time=NOW - timedelta(days=3), tools_running="guestToolsNotRunning")
+
+    set_effective_boot(machine, NOW, reboots={}, log_boot=log_boot)
+
+    assert machine.boot_source == expected
+
+
+def test_a_caller_reboot_time_wins_over_the_log() -> None:
+    machine = vm(power_on_time=NOW - timedelta(days=3))
+
+    set_effective_boot(
+        machine, NOW, reboots={}, rebooted_at=NOW - timedelta(minutes=30), log_boot=NOW - timedelta(minutes=4)
+    )
+
+    assert machine.boot_source == "reported_reboot"
+
+
+def test_a_lost_redundant_power_supply_weighs_less_than_a_hot_cpu() -> None:
+    def weight_of(sensor: dict) -> int:
+        machine = vm(cpu_mhz=3600.0)
+        result = diagnose.conclude(
+            checks.classify(machine, LIMITS),
+            vm=machine,
+            cpu={"findings": [], "starved": False},
+            disk={"findings": [], "slow": False, "datastores": []},
+            environment={"signals": []},
+            logs={"available": False},
+            serial={"available": False},
+            console={"available": False},
+            host_log={"available": False},
+            host_hardware=hostsensors.classify_sensors([sensor]),
+        )
+        return next(cause["score"] for cause in result["causes"] if cause["cause"] == diagnose.HOST_HARDWARE)
+
+    assert weight_of({"name": "PS Redundancy", "type": "power", "health": "red"}) == 1
+    assert weight_of({"name": "CPU1 Temp", "type": "temperature", "health": "red"}) == 2
+
+
+def test_a_green_software_components_sensor_is_no_proof_of_hardware_health() -> None:
+    verdict = hostsensors.classify_sensors(
+        [{"name": "Software Components", "type": "Software Components", "health": "green"}]
+    )
+
+    assert verdict["healthy"] is None
+
+
+def test_a_pool_well_under_its_limit_is_not_a_limit_in_play() -> None:
+    from vsphere_triage import inventory  # noqa: PLC0415
+
+    cluster = vim.ClusterComputeResource("domain-c7")
+    root = vim.ResourcePool("resgroup-1")
+    rows = [
+        {"moref": "resgroup-1", "name": "Resources", "parent": cluster},
+        {
+            "moref": "resgroup-2",
+            "name": "tenant",
+            "parent": root,
+            "config.cpuAllocation.limit": 100000,
+            "runtime.cpu.overallUsage": 2000,
+        },
+        {
+            "moref": "resgroup-3",
+            "name": "busy",
+            "parent": root,
+            "config.cpuAllocation.limit": 4000,
+            "runtime.cpu.overallUsage": 3900,
+        },
+    ]
+    pools = inventory.pool_limits(SimpleNamespace(retrieve=lambda _kind, _paths: rows))
+
+    assert inventory.inherited_pool_limit(pools, "resgroup-2", "cpu_limit") == (None, None)
+    assert inventory.inherited_pool_limit(pools, "resgroup-3", "cpu_limit") == (4000, "busy")
+
+
+def test_a_task_started_by_an_alarm_or_schedule_names_it() -> None:
+    from vsphere_triage.server import _task_started_by  # noqa: PLC0415
+
+    assert _task_started_by(vim.TaskReasonUser(userName="VSPHERE.LOCAL\\ops")) == "VSPHERE.LOCAL\\ops"
+    assert _task_started_by(vim.TaskReasonAlarm(alarmName="Host down")) == "alarm: Host down"
+    assert _task_started_by(vim.TaskReasonSystem()) == "system"

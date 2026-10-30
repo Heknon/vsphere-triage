@@ -6,9 +6,9 @@ consolidation across a cluster — these routinely slow or stall the VMs caught 
 them, and none of it shows in a single VM's counters. This reads the task stream
 over a window and groups it, so "a cause someone introduced" becomes visible.
 
-Tasks are read from the event stream (each task raises a TaskEvent carrying its
-operation, target, state and who asked), so this needs no method beyond the
-QueryEvents the rest of the server already uses. Pure and tested here.
+Tasks are read through a task history collector (`VCenterSession.tasks`), which
+holds each task's final state: the TaskEvents in the event stream carry a task
+as it was queued, so they never say it failed. Pure and tested here.
 """
 
 from __future__ import annotations
@@ -64,6 +64,7 @@ def summarize_tasks(rows: list[dict[str, Any]], *, now: datetime, window_minutes
                     "target": row.get("target"),
                     "time": row.get("time"),
                     "user": row.get("user"),
+                    "error": row.get("error"),
                 }
             )
     findings = []
@@ -88,12 +89,5 @@ def summarize_tasks(rows: list[dict[str, Any]], *, now: datetime, window_minutes
         "by_family": dict(sorted(families.items(), key=lambda item: -item[1])),
         "by_user": dict(sorted(by_user.items(), key=lambda item: -item[1])[:5]),
         "failures": failures[:20],
-        "findings": findings
-        or [
-            (
-                "no notable tasks in the window (each task's state is as recorded when it was created, "
-                "so a task that failed later may not show as failed here; check the VM's or host's events)"
-            )
-        ],
-        "note": "task states come from TaskEvents, a snapshot taken when each task was created",
+        "findings": findings or ["no notable tasks in the window"],
     }

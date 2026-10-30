@@ -27,31 +27,61 @@ if TYPE_CHECKING:
     from vsphere_triage.config import Settings
     from vsphere_triage.vcenter import VCenterPool, VCenterSession
 
-WINDOWS_SHELL = r"C:\Windows\System32\cmd.exe"
+# Where Windows lives when the guest does not say (%SystemRoot% is read first).
+DEFAULT_SYSTEM_ROOT = r"C:\Windows"
+WINDOWS_SHELL = DEFAULT_SYSTEM_ROOT + r"\System32\cmd.exe"
 LINUX_SHELL = "/bin/sh"
 
 
-def guest_temp_path(token: str, *, windows: bool) -> str:
+def system_root_from(variables: list[str] | None) -> str:
+    """%SystemRoot% from ReadEnvironmentVariableInGuest's `NAME=value` strings, or the default."""
+    for item in variables or []:
+        name, _, value = str(item).partition("=")
+        if name.strip().lower() == "systemroot" and value.strip():
+            return value.strip().rstrip("\\")
+    return DEFAULT_SYSTEM_ROOT
+
+
+def guest_temp_path(token: str, *, windows: bool, system_root: str = DEFAULT_SYSTEM_ROOT) -> str:
     """Where the command's output is redirected in the guest, by OS."""
     if windows:
-        return rf"C:\Windows\Temp\vsphere-triage-{token}.txt"
+        return rf"{system_root}\Temp\vsphere-triage-{token}.txt"
     return f"/tmp/vsphere-triage-{token}.txt"  # noqa: S108 - a path inside the guest, not a host temp file
 
 
-def guest_program_spec(command: str, out_path: str, *, windows: bool) -> tuple[str, str]:
+def guest_program_spec(
+    command: str, out_path: str, *, windows: bool, system_root: str = DEFAULT_SYSTEM_ROOT
+) -> tuple[str, str]:
     """The interpreter and arguments to run `command` and capture stdout+stderr to `out_path`.
 
     The whole command is captured, not only its last part: on Linux the shell's
     own output is redirected first (`exec >`), so `a; b`, `a || b` and `a && b`
     all land in the file; on Windows the command is grouped in parentheses.
-    The command is handed to the guest's shell as-is; a command containing the
-    shell's own quote character (or, on Windows, an unbalanced parenthesis) can
-    break the wrapping, which is a known limit of running an arbitrary string
-    rather than an argv.
+    On Linux, VMware Tools starts the program line itself through `/bin/sh -c`,
+    so the arguments pass through a second shell first, which would expand `$2`,
+    backticks and backslashes in the command; the command therefore travels
+    base64-encoded (`encode_shell`) and reaches its shell byte for byte. On
+    Windows it is handed to cmd.exe as-is; an unbalanced parenthesis or a quote
+    can break the wrapping there, a known limit of running a string, not an argv.
     """
     if windows:
-        return WINDOWS_SHELL, f'/c ({command}) > "{out_path}" 2>&1'
-    return LINUX_SHELL, f"-c \"exec > '{out_path}' 2>&1; {command}\""
+        return rf"{system_root}\System32\cmd.exe", f'/c ({command}) > "{out_path}" 2>&1'
+    # Escaped for the double quotes the outer shell reads it in.
+    inner = encode_shell(command)
+    for char in ("\\", '"', "$", "`"):
+        inner = inner.replace(char, "\\" + char)
+    return LINUX_SHELL, f"-c \"exec > '{out_path}' 2>&1; {inner}\""
+
+
+# PowerShell writes what it prints in the guest's OEM codepage (437, 850, 932,
+# 866, ...), which the server cannot know. Switching the console to UTF-8 before
+# the JSON is printed makes every guest's output decode the same way; on a
+# Japanese or Chinese guest the OEM bytes otherwise corrupt the JSON itself.
+# Set it after any native command (bcdedit) has run: PowerShell decodes a native
+# command's output with this same setting.
+PS_UTF8_OUTPUT = "[Console]::OutputEncoding=New-Object System.Text.UTF8Encoding $false;"
+# No progress records or error noise on the redirected streams.
+PS_QUIET = "$ProgressPreference='SilentlyContinue';$ErrorActionPreference='SilentlyContinue';"
 
 
 def encode_powershell(script: str) -> str:
@@ -70,13 +100,18 @@ def encode_powershell(script: str) -> str:
 def encode_shell(script: str) -> str:
     """A shell-safe command that runs a multi-line `script` under /bin/sh.
 
-    The script is base64-encoded and piped through `base64 -d | sh`, so the whole
-    thing — pipes, quotes, greps — travels as one token with nothing for the
-    guest's shell wrapper to mis-parse, the Linux counterpart of
-    `encode_powershell`.
+    The script is base64-encoded and decoded into `sh -c`, so the whole thing —
+    pipes, quotes, greps — travels as one token with nothing for the guest's
+    shell wrapper to mis-parse, the Linux counterpart of `encode_powershell`.
+    The script is an argument, not piped in: bash reads a piped script as it
+    runs, so a command that reads stdin would swallow the lines after it; its
+    stdin is /dev/null instead. A guest without `base64` says so and exits 127.
     """
     encoded = base64.b64encode(script.encode()).decode("ascii")
-    return f"echo {encoded}|base64 -d|sh"
+    return (
+        'command -v base64 >/dev/null || { echo "base64 is not installed in the guest"; exit 127; }; '
+        f'sh -c "$(echo {encoded}|base64 -d)" </dev/null'
+    )
 
 
 def probe_failed(result: dict[str, Any]) -> str | None:
@@ -88,6 +123,8 @@ def probe_failed(result: dict[str, Any]) -> str | None:
     """
     if result.get("timed_out"):
         return f"the guest probe did not finish within its timeout (exit code {result.get('exit_code')})"
+    if result.get("output_error"):
+        return f"the guest probe's output could not be read back: {result['output_error']}"
     if not str(result.get("output") or "").strip():
         return f"the guest probe produced no output (exit code {result.get('exit_code')})"
     return None

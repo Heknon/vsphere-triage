@@ -1,71 +1,67 @@
-# Is the correlation a cause
+# Checking that a correlation is a cause
 
-The server weighs causes for you. This file is how you check that weighing
-before you trust it, because the one mistake that makes a whole investigation
-wrong is calling a coincidence a cause.
+`diagnose_vm` and `explain_group` rank causes for you. Check the ranking before
+you write the verdict: the most common mistake is calling a coincidence a
+cause.
 
-## The three questions
+## Three questions
 
-For the leading cause in `conclusion.causes`, ask:
+For the leading cause in `conclusion.causes`:
 
-1. **Is there a mechanism, or only a timestamp?** "The datastore was slow and
-   the VM reads its disk to boot" is a mechanism. "The datastore was slow and
-   the VM is stuck" with nothing between them is a coincidence until you find
-   the read. The boot timeline and the `vmkernel` log are where the mechanism
-   shows: the boot stalled *at* the minute the latency peaked, not merely in
-   the same hour.
+1. **Is there a mechanism, or only a matching time?** "The datastore was slow
+   and the VM reads its disk to boot, and the boot stalled at the minute the
+   latency peaked" is a mechanism. "The datastore was slow and the VM is stuck"
+   is a coincidence until you find the link. The boot timeline and the
+   `vmkernel` log show it.
 
-2. **Did the healthy VMs escape it?** This is invariant 4, and it is the
-   strongest single test. If every VM on the slow datastore is stuck and every
-   VM elsewhere is fine, the datastore is the cause. If healthy VMs sit on the
-   same datastore, it is not — or not alone. `diagnose_vm`'s `environment`
-   signals and `explain_group`'s comparison already compute this; read the
-   `against` evidence, not only the `for`.
+2. **Did the healthy VMs avoid it?** If every VM on the slow datastore is stuck
+   and every VM elsewhere is fine, the datastore is the cause. If healthy VMs
+   sit on the same datastore, it is not the cause, or not the only one. The
+   `environment` signals in `diagnose_vm` and the comparison in
+   `explain_group` compute this; read the `against` evidence as well as `for`.
 
-3. **What one check would separate the two leading causes?** Write it in the
-   verdict's *next check* line even when you are fairly sure. The common ones:
+3. **What single check would separate the two leading causes?** Put it on the
+   verdict's Next line even when you are fairly sure:
 
-   | Two causes | The check that splits them |
+   | Two causes | Check that separates them |
    | --- | --- |
-   | Starved vs hung | the console across two captures; boot-to-Tools time |
-   | This datastore vs a bad template | does the same base disk boot fine on another datastore right now? |
-   | This host vs the whole cluster | are the stuck VMs only on one host, or spread? (`explain_group` on `host` vs `cluster`) |
-   | Storage vs the guest | datastore latency in the boot window vs the boot timeline reaching the drivers |
+   | Starved vs hung | two console captures; boot-to-Tools time |
+   | This datastore vs a bad template | does the same base disk boot on another datastore now? |
+   | One host vs the whole cluster | are the stuck VMs on one host or spread out? (`explain_group` on `host`, then `cluster`) |
+   | Storage vs the guest | datastore latency in the boot window vs how far the boot got |
    | New tonight vs every night | `vrops_compare_window` against previous days |
+   | A host failure vs separate hangs | `cluster_events`: did HA restart these VMs? |
 
-## Clock alignment
+## Clocks
 
-Every timestamp is UTC with its source named, but the sources are different
-clocks. Before you say "the latency spike at 02:13 caused the reset at 02:13":
+Results are in UTC with their source named, but the sources are different
+clocks. A reset time comes from a vCenter event (vCenter's clock), latency from
+a host counter (the host's clock), and the orchestrator's reboot time from the
+runner (a third clock).
 
-- The reset time comes from a vCenter event (vCenter's clock). The latency
-  comes from a host counter (the host's clock). The orchestrator's reboot time
-  comes from the runner (another clock).
-- If they agree to within a sample interval (20 s realtime, 5 min historical),
-  trust the correlation. If the reboot time from the orchestrator and the
-  power-on event from vCenter disagree by minutes, say so and widen the window rather than
-  trusting either to the second.
+If they agree within one sample interval (20 s for realtime counters, 5 min for
+historical), trust the correlation. If the orchestrator's reboot time and
+vCenter's power-on event differ by minutes, say so and widen the window rather
+than trusting either to the second.
 
-## Weak evidence, named as weak
+## Signals that look like causes
 
-Some signals look like causes and are not:
+- **One black screenshot** is not a hang: it can be early boot, a splash screen
+  or a blanked display. Two captures, or the CPU counter, decide. `diagnose_vm`
+  takes two; with only one, call the console reading inconclusive.
+- **One reset event** is not a boot loop; it is usually the reboot you are
+  investigating. Three or more in 30 minutes set the `boot_loop` flag.
+- **A red vCenter alarm** names a symptom vCenter noticed. Read what it is on;
+  it often repeats what the counters already say.
+- **"Tools not running" on a `no_tools` VM** is not a fault; Tools is not
+  installed.
+- **An unclean-shutdown event after a `hard_reset`** is the reset itself, not a
+  crash.
 
-- **A single black screenshot** is not a hang: it could be early boot before
-  the display, a splash screen, or a blanked display. Two captures, or the CPU
-  counter, decide. The server takes two; if you only have one, say the console
-  reading is inconclusive.
-- **A reset event** is not a boot loop: one reset is the reboot you are
-  investigating. Three or more in the window (`boot_loop` flag) is a loop.
-- **A red vCenter alarm** names a symptom vCenter noticed, not a cause. Read
-  what it is on; it often repeats what the counters already said.
-- **"Tools not running"** on a `no_tools` VM is not a fault at all — Tools is
-  not installed. Invariant: do not count it as stuck.
+## When the ranking and your reading disagree
 
-## When the server and your reading disagree
-
-If `conclusion.causes` leads with a cause but the three questions above do not
-support it — the mechanism is missing, or the healthy VMs share the blamed
-thing — trust your reading and say both: "the server weighs X highest, but
-healthy VMs share that datastore, so the window check is needed before X can be
-confirmed". The server's weighing is a draft; the healthy-neighbour test and
-the mechanism are the check on it.
+If `conclusion.causes` leads with a cause but the three questions do not
+support it (no mechanism, or healthy VMs share what it blames), write both:
+"the server ranks X highest, but healthy VMs share that datastore, so the
+window check is needed before X can be confirmed." The ranking is a draft; the
+mechanism and the healthy-neighbour test are the check on it.

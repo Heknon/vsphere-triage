@@ -1,6 +1,6 @@
 {
   "name": "vsphere-triage",
-  "version": "0.2.0",
+  "version": "0.2.1",
   "description": "vSphere VM incident triage: read-only MCP server plus the vm-incident diagnosis skill",
   "author": { "name": "Heknon" },
   "license": "MIT",
@@ -96,7 +96,7 @@
   "mcpServers": {
     "vsphere-triage": {
       "command": "uvx",
-      "args": ["vsphere-triage==0.2.0"],
+      "args": ["vsphere-triage==0.2.1"],
       "env": {
         "UV_INDEX_URL": "${user_config.index_url}",
         "VSPHERE_VCENTERS": "${user_config.vcenters}",

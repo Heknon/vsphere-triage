@@ -13,7 +13,7 @@ the fact, for the reader to see, rather than smoothed over.
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-from datetime import datetime
+from datetime import datetime, timedelta
 from typing import TYPE_CHECKING, Any
 
 from pyVmomi import vim
@@ -117,11 +117,18 @@ HOST_TIME_PATHS = (
     "name",
     "runtime.connectionState",
     "config.dateTimeInfo.ntpConfig.server",
+    # ESXi 7.0U3 and later: "ntp" or "ptp". An older host rejects it, which drops it.
+    "config.dateTimeInfo.systemClockProtocol",
+    # A PTP host that lost its PTP source and fell back to NTP.
+    "config.dateTimeInfo.inFallbackState",
     "config.service.service",
     "configManager.dateTimeSystem",
 )
 TIME_SERVICE_KEYS = ("ntpd", "chronyd", "ptpd")
 FOLDER_PATHS = ("name", "parent", "childType")
+# A vApp holds VMs as a folder does (vCloud Director builds every environment
+# from them) but is a resource pool: a VM in one has no parent folder.
+VAPP_PATHS = ("name", "parentFolder", "parentVApp")
 DATACENTER_PATHS = ("name", "parent", "vmFolder")
 CLUSTER_PATHS = ("name",)
 
@@ -571,8 +578,15 @@ def describe_devices(
     return described, findings, blocking
 
 
-DEVICE_QUERY_PATHS = ("name", "parent", "config.template", "config.hardware.device")
-SNAPSHOT_LIST_PATHS = ("name", "parent", "config.template", "runtime.consolidationNeeded", "snapshot")
+DEVICE_QUERY_PATHS = ("name", "parent", "parentVApp", "config.template", "config.hardware.device")
+SNAPSHOT_LIST_PATHS = (
+    "name",
+    "parent",
+    "parentVApp",
+    "config.template",
+    "runtime.consolidationNeeded",
+    "snapshot",
+)
 SNAPSHOT_STATE_TYPES = ("snapshotData", "snapshotMemory")
 
 
@@ -645,11 +659,37 @@ def snapshot_usage(snapshot_info: Any, layoutex: Any, read_at: datetime) -> dict
         "max_chain_depth": max_chain_depth,
         "oldest_age_hours": oldest_age,
         "oldest_name": oldest["name"] if oldest else None,
-        "has_memory_snapshot": state_bytes > 0,
+        "has_memory_snapshot": any(
+            f.type == "snapshotMemory" and f.size for f in (getattr(layoutex, "file", None) or [])
+        ),
         "delta_bytes": delta_bytes,
         "state_bytes": state_bytes,
         "total_bytes": delta_bytes + state_bytes,
         "snapshots": nodes,
+    }
+
+
+def orphaned_delta_usage(layoutex: Any) -> dict[str, Any]:
+    """Usage for a VM with no snapshot tree but delta disks left behind (consolidation needed)."""
+    delta_bytes = 0
+    if layoutex is not None:
+        files = {f.key: f for f in (layoutex.file or [])}
+        for disk in layoutex.disk or []:
+            chain = disk.chain or []
+            for unit in chain[1:]:
+                delta_bytes += sum(files[key].size for key in (unit.fileKey or []) if key in files)
+    return {
+        "count": 0,
+        "max_chain_depth": max((len(disk.chain or []) - 1 for disk in (layoutex.disk or [])), default=0)
+        if layoutex is not None
+        else None,
+        "oldest_age_hours": None,
+        "oldest_name": None,
+        "has_memory_snapshot": False,
+        "delta_bytes": delta_bytes,
+        "state_bytes": 0,
+        "total_bytes": delta_bytes,
+        "snapshots": [],
     }
 
 
@@ -662,7 +702,11 @@ def read_vm_snapshots(session: VCenterSession, folders: dict[str, FolderFacts]) 
     """
     read_at = session.now()
     rows = session.retrieve(vim.VirtualMachine, SNAPSHOT_LIST_PATHS)
-    with_snaps = [row for row in rows if row.get("snapshot") is not None]
+    # A VM that needs consolidation is kept even with no snapshot tree: a failed
+    # "Delete All" leaves its delta disks behind with the snapshot manager empty.
+    with_snaps = [
+        row for row in rows if row.get("snapshot") is not None or row.get("runtime.consolidationNeeded")
+    ]
     layouts: dict[str, Any] = {}
     bases: dict[str, str | None] = {}
     if with_snaps:
@@ -680,9 +724,10 @@ def read_vm_snapshots(session: VCenterSession, folders: dict[str, FolderFacts]) 
     for row in with_snaps:
         usage = snapshot_usage(row.get("snapshot"), layouts.get(row["moref"]), read_at)
         if usage is None:
-            continue
-        parent = row.get("parent")
-        folder = folders.get(parent._moId) if parent is not None else None  # noqa: SLF001
+            if not row.get("runtime.consolidationNeeded"):
+                continue
+            usage = orphaned_delta_usage(layouts.get(row["moref"]))
+        folder = folder_of(row, folders)
         result.append(
             {
                 "vcenter": session.vcenter.name,
@@ -724,8 +769,7 @@ def read_vm_devices(session: VCenterSession, folders: dict[str, FolderFacts]) ->
         for device in devices:
             kind = device_kind(device)
             by_category.setdefault(_device_category(device), []).append(kind)
-        parent = row.get("parent")
-        folder = folders.get(parent._moId) if parent is not None else None  # noqa: SLF001
+        folder = folder_of(row, folders)
         result.append(
             {
                 "vcenter": session.vcenter.name,
@@ -746,6 +790,8 @@ def read_vm_devices(session: VCenterSession, folders: dict[str, FolderFacts]) ->
 RESOURCE_POLICY_PATHS = (
     "name",
     "parent",
+    "parentVApp",
+    "resourcePool",
     "config.template",
     "summary.config.numCpu",
     "summary.config.memorySizeMB",
@@ -754,6 +800,78 @@ RESOURCE_POLICY_PATHS = (
     "config.memoryAllocation.limit",
     "config.memoryAllocation.reservation",
 )
+
+
+POOL_LIMIT_PATHS = (
+    "name",
+    "parent",
+    "config.cpuAllocation.limit",
+    "config.memoryAllocation.limit",
+    "runtime.cpu.overallUsage",
+    "runtime.memory.overallUsage",
+)
+# A pool using this share of its limit or more is running into it.
+POOL_NEAR_LIMIT = 0.85
+
+
+def _pool_limit_in_play(limit: int | None, usage: float | None) -> int | None:
+    """The limit, unless the pool is plainly well under it (usage read and below POOL_NEAR_LIMIT).
+
+    Tenant pools (vCloud Director, Tanzu namespaces) always carry a limit; one the
+    pool is nowhere near throttles nothing, and listing it would list every VM.
+    """
+    if limit is None or limit == 0:
+        return limit
+    if usage is not None and usage < POOL_NEAR_LIMIT * limit:
+        return None
+    return limit
+
+
+def pool_limits(session: VCenterSession) -> dict[str, dict[str, Any]]:
+    """Every resource pool and vApp with its own CPU and memory limit, by moref.
+
+    A cluster's root pool is left out: its allocation is the cluster's capacity,
+    not a limit anyone set. It is the pool whose parent is not a pool. A limit the
+    pool is well under is left out too: it throttles nothing now.
+    """
+    rows = session.retrieve(vim.ResourcePool, POOL_LIMIT_PATHS)
+    pools = {}
+    for row in rows:
+        parent = row.get("parent")
+        pools[row["moref"]] = {
+            "name": row.get("name", row["moref"]),
+            "parent": parent._moId if isinstance(parent, vim.ResourcePool) else None,  # noqa: SLF001
+            "root": not isinstance(parent, vim.ResourcePool),
+            "cpu_limit": _pool_limit_in_play(
+                _limit(row.get("config.cpuAllocation.limit")), _number(row.get("runtime.cpu.overallUsage"))
+            ),
+            # Memory usage is in bytes, its limit in MB.
+            "memory_limit": _pool_limit_in_play(
+                _limit(row.get("config.memoryAllocation.limit")),
+                (used / 1024**2)
+                if (used := _number(row.get("runtime.memory.overallUsage"))) is not None
+                else None,
+            ),
+        }
+    return pools
+
+
+def inherited_pool_limit(
+    pools: dict[str, dict[str, Any]], moref: str | None, key: str
+) -> tuple[int | None, str | None]:
+    """The tightest `key` limit on the pool `moref` and the pools above it, and the pool that sets it."""
+    tightest: tuple[int | None, str | None] = (None, None)
+    seen: set[str] = set()
+    while moref in pools and moref not in seen:
+        seen.add(moref)
+        pool = pools[moref]
+        if pool["root"]:
+            break
+        limit = pool[key]
+        if limit is not None and (tightest[0] is None or limit < tightest[0]):
+            tightest = (limit, pool["name"])
+        moref = pool["parent"]
+    return tightest
 
 
 def read_vm_resource_policy(session: VCenterSession, folders: dict[str, FolderFacts]) -> list[dict[str, Any]]:
@@ -767,15 +885,29 @@ def read_vm_resource_policy(session: VCenterSession, folders: dict[str, FolderFa
     the same limit on every clone of it.
     """
     rows = session.retrieve(vim.VirtualMachine, RESOURCE_POLICY_PATHS)
+    pools = pool_limits(session)
     constrained = []
     for row in rows:
+        pool = row.get("resourcePool")
+        pool_moref = pool._moId if pool is not None else None  # noqa: SLF001
+        row["_pool_cpu_limit"], row["_pool_cpu_by"] = inherited_pool_limit(pools, pool_moref, "cpu_limit")
+        row["_pool_memory_limit"], row["_pool_memory_by"] = inherited_pool_limit(
+            pools, pool_moref, "memory_limit"
+        )
         row["_cpu_limit"] = _limit(row.get("config.cpuAllocation.limit"))
         row["_cpu_reservation"] = _reservation(row.get("config.cpuAllocation.reservation"))
         row["_memory_limit"] = _limit(row.get("config.memoryAllocation.limit"))
         row["_memory_reservation"] = _reservation(row.get("config.memoryAllocation.reservation"))
         if any(
             row[key] is not None
-            for key in ("_cpu_limit", "_cpu_reservation", "_memory_limit", "_memory_reservation")
+            for key in (
+                "_cpu_limit",
+                "_cpu_reservation",
+                "_memory_limit",
+                "_memory_reservation",
+                "_pool_cpu_limit",
+                "_pool_memory_limit",
+            )
         ):
             constrained.append(row)
     # The base disk (template) is read only for the few VMs that carry a policy,
@@ -783,8 +915,7 @@ def read_vm_resource_policy(session: VCenterSession, folders: dict[str, FolderFa
     bases = base_disks_for(session, [row["_ref"] for row in constrained])
     result = []
     for row in rows:
-        parent = row.get("parent")
-        folder = folders.get(parent._moId) if parent is not None else None  # noqa: SLF001
+        folder = folder_of(row, folders)
         result.append(
             {
                 "vcenter": session.vcenter.name,
@@ -800,6 +931,11 @@ def read_vm_resource_policy(session: VCenterSession, folders: dict[str, FolderFa
                 "cpu_reservation_mhz": row["_cpu_reservation"],
                 "memory_limit_mb": row["_memory_limit"],
                 "memory_reservation_mb": row["_memory_reservation"],
+                # A limit on the resource pool or vApp the VM runs in, shared by all its VMs.
+                "pool_cpu_limit_mhz": row["_pool_cpu_limit"],
+                "pool_cpu_limit_set_on": row["_pool_cpu_by"],
+                "pool_memory_limit_mb": row["_pool_memory_limit"],
+                "pool_memory_limit_set_on": row["_pool_memory_by"],
             }
         )
     return result
@@ -858,8 +994,13 @@ def read_host_time(session: VCenterSession) -> list[dict[str, Any]]:
     result = []
     for row in rows:
         services = row.get("config.service.service") or []
+        protocol = row.get("config.dateTimeInfo.systemClockProtocol")
+        # The service of the protocol in use: a PTP host's ntpd is off by design.
+        if protocol == "ptp" and row.get("config.dateTimeInfo.inFallbackState"):
+            protocol = "ntp (PTP fell back)"
+        wanted = ("ptpd",) if protocol == "ptp" else TIME_SERVICE_KEYS
         time_service = next(
-            (service for service in services if getattr(service, "key", None) in TIME_SERVICE_KEYS), None
+            (service for service in services if getattr(service, "key", None) in wanted), None
         )
         dt_system = row.get("configManager.dateTimeSystem")
         result.append(
@@ -869,6 +1010,7 @@ def read_host_time(session: VCenterSession) -> list[dict[str, Any]]:
                 "name": row.get("name", row["moref"]),
                 "connection_state": row.get("runtime.connectionState"),
                 "ntp_servers": list(row.get("config.dateTimeInfo.ntpConfig.server") or []),
+                "clock_protocol": protocol,
                 "service_key": getattr(time_service, "key", None) if time_service else None,
                 "service_running": getattr(time_service, "running", None) if time_service else None,
                 "service_policy": getattr(time_service, "policy", None) if time_service else None,
@@ -878,11 +1020,23 @@ def read_host_time(session: VCenterSession) -> list[dict[str, Any]]:
     return result
 
 
-def read_folders(session: VCenterSession) -> dict[str, FolderFacts]:
-    """Every folder with its path from its datacenter, read in two calls."""
+def folder_of(row: dict[str, Any], folders: dict[str, FolderFacts]) -> FolderFacts | None:
+    """A VM row's folder: its parent folder, or the vApp it is in (read_folders lists both)."""
+    parent = row.get("parent") or row.get("parentVApp")
+    return folders.get(parent._moId) if parent is not None else None  # noqa: SLF001
+
+
+def read_folders(session: VCenterSession) -> dict[str, FolderFacts]:  # noqa: C901 - one walk, folders and vApps
+    """Every folder, and every vApp as one, with its path from its datacenter."""
     datacenters = session.retrieve(vim.Datacenter, DATACENTER_PATHS)
     rows = session.retrieve(vim.Folder, FOLDER_PATHS)
     raw = {row["moref"]: row for row in rows}
+    # A vApp sits in a folder or in another vApp; as a folder it has that parent.
+    for row in session.retrieve(vim.VirtualApp, VAPP_PATHS):
+        parent = row.get("parentVApp") or row.get("parentFolder")
+        raw.setdefault(
+            row["moref"], {"moref": row["moref"], "name": row.get("name", row["moref"]), "parent": parent}
+        )
 
     def datacenter_inventory_path(dc_row: dict[str, Any]) -> str:
         """The path the /folder endpoint's dcPath needs: the datacenter and any folders above it.
@@ -1060,7 +1214,7 @@ def read_inventory(
     )
 
 
-def vm_facts(  # noqa: C901, PLR0913, PLR0915 - one flattening of one row
+def vm_facts(  # noqa: C901, PLR0912, PLR0913, PLR0915 - one flattening of one row
     vcenter: str,
     row: dict[str, Any],
     read_at: datetime,
@@ -1079,7 +1233,10 @@ def vm_facts(  # noqa: C901, PLR0913, PLR0915 - one flattening of one row
     if vapp is not None:
         facts.vapp_moref = vapp._moId  # noqa: SLF001
     parent = row.get("parent")
-    if parent is not None and isinstance(parent, vim.Folder):
+    if parent is None and vapp is not None and vapp._moId in folders:  # noqa: SLF001
+        # A VM in a vApp: the vApp is its folder, as read_folders lists it.
+        parent = vapp
+    if parent is not None and (isinstance(parent, vim.Folder) or parent is vapp):
         folder = folders.get(parent._moId)  # noqa: SLF001
         facts.folder_moref = parent._moId  # noqa: SLF001
         if folder is not None:
@@ -1089,7 +1246,7 @@ def vm_facts(  # noqa: C901, PLR0913, PLR0915 - one flattening of one row
             facts.datacenter = folder.datacenter
             facts.datacenter_path = folder.datacenter_path
     elif parent is None:
-        facts.notes.append("vCenter reports no parent folder for this VM (it may belong to a vApp)")
+        facts.notes.append("vCenter reports no parent folder or vApp for this VM")
     facts.instance_uuid = row.get("config.instanceUuid")
     created = row.get("config.createDate")
     facts.created = as_utc(created) if isinstance(created, datetime) else None
@@ -1178,12 +1335,32 @@ def vm_facts(  # noqa: C901, PLR0913, PLR0915 - one flattening of one row
     return facts
 
 
+# A log boot this close to the power-on is that power-on, not a later reboot.
+LOG_BOOT_AFTER_POWER_ON = timedelta(seconds=60)
+# How far ahead of vCenter a host's clock may run before its log time is not trusted.
+LOG_CLOCK_SLACK = timedelta(minutes=2)
+
+
+def _plausible_log_boot(facts: VmFacts, read_at: datetime, log_boot: datetime | None) -> datetime | None:
+    """`log_boot` when it is a reboot after the power-on, by a host clock that agrees with vCenter's."""
+    if log_boot is None:
+        return None
+    when = as_utc(log_boot)
+    if facts.power_on_time is not None and when <= facts.power_on_time + LOG_BOOT_AFTER_POWER_ON:
+        return None
+    if when > read_at + LOG_CLOCK_SLACK:
+        # The host's clock runs ahead: the time cannot be placed against vCenter's.
+        return None
+    return min(when, read_at)
+
+
 def set_effective_boot(
     facts: VmFacts,
     read_at: datetime,
     *,
     reboots: dict[str, datetime] | None = None,
     rebooted_at: datetime | None = None,
+    log_boot: datetime | None = None,
 ) -> None:
     """Measure uptime from the most recent reboot, not from power-on.
 
@@ -1194,14 +1371,20 @@ def set_effective_boot(
     and is what the stuck/booting judgement must rest on. Called again by
     `diagnose_vm` once it has fetched
     the events, so a scan's power-on estimate is refined to the real reboot.
+    `log_boot` is the last power-on or reset in the VM's `vmware.log`, the one
+    record of a reboot started inside the guest, which logs no vCenter event. It
+    is used only when it is clearly after the power-on and the host's clock is
+    not running ahead, and never over a reboot time the caller gave.
     """
     reported = as_utc(rebooted_at) if rebooted_at is not None else None
     event_reboot = (reboots or {}).get(facts.moref)
+    log_boot = _plausible_log_boot(facts, read_at, log_boot) if reported is None else None
     candidates = [
         (when, source)
         for when, source in (
             (reported, "reported_reboot"),
             (event_reboot, "reboot_event"),
+            (as_utc(log_boot) if log_boot is not None else None, "vmware_log"),
             (facts.power_on_time, "power_on"),
         )
         if when is not None

@@ -47,11 +47,19 @@ def classify_datastore(row: dict[str, Any], thresholds: Thresholds) -> dict[str,
     exact_free = free / capacity * 100 if (capacity and free is not None) else None
     free_percent = round(exact_free, 1) if exact_free is not None else None
     ratio = round(provisioned / capacity, 2) if (capacity and provisioned is not None) else None
-    apd = [
-        {"host_moref": mount["host_moref"], "reason": mount["inaccessible_reason"]}
+    # A host that is not connected (or is powered off, in standby) reports every
+    # mount inaccessible: that is the host, not the datastore, and is not counted.
+    unreachable = [
+        mount
         for mount in row.get("mounts") or []
         if mount.get("mounted") and mount.get("accessible") is False
     ]
+    apd = [
+        {"host_moref": mount["host_moref"], "reason": mount["inaccessible_reason"]}
+        for mount in unreachable
+        if mount.get("host_up") is not False
+    ]
+    hosts_down = sum(1 for mount in unreachable if mount.get("host_up") is False)
     findings: list[str] = []
     name = row.get("name")
     unread = [
@@ -64,7 +72,13 @@ def classify_datastore(row: dict[str, Any], thresholds: Thresholds) -> dict[str,
         )
         if value is None
     ]
-    if row.get("accessible") is False:
+    mounts = row.get("mounts") or []
+    every_host_down = bool(mounts) and all(mount.get("host_up") is False for mount in mounts)
+    if row.get("accessible") is False and every_host_down:
+        # vCenter judges a datastore through its hosts: with all of them down it
+        # cannot tell, which is unknown, not unreachable.
+        unread.append("accessibility (every host mounting it is down)")
+    elif row.get("accessible") is False:
         findings.append(f"datastore {name} is not accessible from vCenter")
     if exact_free is not None and exact_free <= thresholds.datastore_full_percent:
         findings.append(f"nearly full: {free_percent}% free — a thin disk on it stalls on write")
@@ -77,6 +91,12 @@ def classify_datastore(row: dict[str, Any], thresholds: Thresholds) -> dict[str,
         reason = mount["reason"] or "inaccessible"
         apd_pdl = " (all-paths-down / permanent-device-loss)" if reason in APD_PDL_REASONS else ""
         findings.append(f"mounted but unreachable on a host: {reason}{apd_pdl} — its VMs there stall")
+    host_note = (
+        f"{hosts_down} host(s) mounting it are not connected or not powered on, so their mounts read "
+        "inaccessible; that is the host, not the datastore"
+        if hosts_down
+        else None
+    )
     naas = row.get("backing_naas") or []
     return {
         "vcenter": row["vcenter"],
@@ -97,6 +117,8 @@ def classify_datastore(row: dict[str, Any], thresholds: Thresholds) -> dict[str,
         "overprovision_ratio": ratio,
         "hosts_mounting": len(row.get("mounts") or []),
         "hosts_unreachable": apd,
+        "hosts_down_mounting": hosts_down,
+        "host_note": host_note,
         "holds_template": row.get("holds_template", False),
         "findings": findings,
         # Healthy only when it could be judged: a datastore whose capacity, free
@@ -116,8 +138,17 @@ def _scan_datastores(session: VCenterSession) -> list[dict[str, Any]]:
         if vm.get("config.template"):
             for store in vm.get("datastore") or []:
                 template_stores.add(store._moId)  # noqa: SLF001
+    # Whether each mounting host is up: a disconnected or powered-off host reads
+    # its mounts as inaccessible, which is no APD.
+    host_up = {
+        host["moref"]: host.get("runtime.connectionState") == "connected"
+        and host.get("runtime.powerState") in (None, "poweredOn")
+        for host in session.retrieve(vim.HostSystem, ("runtime.connectionState", "runtime.powerState"))
+    }
     for row in rows:
         row["holds_template"] = row["moref"] in template_stores
+        for mount in row.get("mounts") or []:
+            mount["host_up"] = host_up.get(mount["host_moref"])
     return rows
 
 

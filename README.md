@@ -25,6 +25,17 @@ wiring it to the system that creates your VMs.
 
 ## Quick start
 
+The server is a Python package; there is no separate binary to download.
+Installing it from PyPI puts a `vsphere-triage` command on your `PATH`, and
+the MCP client starts that command over stdio. What you need on the machine:
+
+- [uv](https://docs.astral.sh/uv/getting-started/installation/) (recommended):
+  `uvx` downloads the package and, if needed, a Python 3.12+ interpreter, and
+  caches both. The Claude Code plugin uses `uvx`, so it needs uv on the `PATH`.
+- or Python 3.12+ with `pipx` or `pip`.
+- `tesseract` on the `PATH`, only for OCR of the console screen (the `[ocr]`
+  extra); without it, console analysis still works but reads no text.
+
 ```sh
 uvx vsphere-triage                 # run from PyPI without installing
 uv tool install vsphere-triage     # or install the command
@@ -55,7 +66,10 @@ The minimum configuration is the vCenter list and a login:
 }
 ```
 
-The server speaks MCP over stdio by default. Python 3.12 or later.
+The server speaks MCP over stdio by default. With `uvx`, use
+`"command": "uvx", "args": ["vsphere-triage"]` (pin a version with
+`"vsphere-triage==0.2.1"`); with a `uv tool` or `pipx` install, use
+`"command": "vsphere-triage"` as above.
 
 ## Two ways to start
 
@@ -71,8 +85,11 @@ the environment, events, boot timeline from `vmware.log`, serial console,
 console screen, snapshots, hardware) and returns a `finding`, the ranked
 causes with the evidence for and against each, what it could not read
 (`not_checked`), and the next checks to run. If your orchestrator knows when it
-rebooted the VM, pass `rebooted_at`; vCenter does not move `runtime.bootTime`
-on an in-guest reboot.
+rebooted the VM, pass `rebooted_at`. vCenter does not move `runtime.bootTime`
+on an in-guest reboot and logs no event for it, so `diagnose_vm` also reads the
+last power-on or reset from the VM's `vmware.log`, and `scan` does the same for
+up to 40 VMs per vCenter that look stuck only because their uptime is counted
+from power-on.
 
 **From a question about the fleet.** `scan` judges every VM on some or all
 vCenters and groups the abnormal ones. Each group is compared with its
@@ -189,16 +206,16 @@ server always matches the skill. Invoke the skill as
 | Tool | What it returns |
 | --- | --- |
 | `list_vcenters` | each configured vCenter: reachable or not, version, clock |
-| `scan` | every VM judged; abnormal VMs grouped by vCenter, cluster, host, datastore, environment folder, its parent folder, base disk and OS, each group against its population; hosts over the CPU threshold, hosts near memory capacity, slow storage |
+| `scan` | every VM judged; abnormal VMs grouped by vCenter, cluster, host, datastore, environment folder, its parent folder, base disk and OS, each group against its population; hosts over the CPU threshold, hosts near memory capacity, hosts whose hardware sensors are red or yellow (with the sensors and how many VMs run there), slow storage |
 | `explain_group` | for one group from a scan: what its abnormal VMs share that the healthy ones do not, and host CPU and storage over their boot window |
 | `diagnose_window` | resets, failed power-ons, host CPU and storage over a past window |
 | `cluster_events` | vSphere HA restarts and VM-monitoring resets, host failures, isolations and lost connections, failed failovers, maintenance mode and migration waves over a window; names the failed host and the hosts VMs restarted onto |
-| `recent_tasks` | tasks over a window grouped by kind (migration, reconfigure, snapshot, clone, power, destroy), flagging 10 or more migrations, reconfigures or snapshot operations as a wave. Task states are as recorded when each task started, so later failures may not show |
+| `recent_tasks` | tasks over a window grouped by kind (migration, reconfigure, snapshot, clone, power, destroy), flagging 10 or more migrations, reconfigures or snapshot operations as a wave, and the tasks that failed, with their error. Read through a task history collector created and destroyed for the call |
 | `find_old_environments` | environment folders older than N hours (age of their oldest VM), optionally under given path segments, oldest first |
 | `hardware_profile` | device counts per category and kind across the fleet, NIC types, and VMs whose devices differ from the rest of their environment |
 | `find_vms_by_device` | VMs that have, or lack, a device category (`sound`, `usb`, `ethernet`, ...) or kind (`Vmxnet3`, `HdAudioCard`) |
 | `find_vms_by_snapshot` | VMs with snapshots, largest first: delta and memory-state size, oldest age, redo-chain depth, consolidation needed; rolled up per template |
-| `find_resource_limits` | VMs with a CPU or memory limit or reservation, tightest limit first, templates marked (linked clones inherit a template's limit) |
+| `find_resource_limits` | VMs with a CPU or memory limit or reservation, tightest limit first, templates marked (linked clones inherit a template's limit), and VMs in a resource pool or vApp running at 85% or more of a limit set on it, with the pool named |
 | `check_datastores` | each datastore's free space, thin over-provisioning ratio and per-host reachability (APD/PDL); datastores holding a template's base disk are marked |
 | `check_host_time` | each host's NTP configuration and clock skew from vCenter |
 
@@ -236,7 +253,7 @@ vCenter session drops mid-call (the error then says the action may have run).
 
 | Tool | What it does |
 | --- | --- |
-| `run_in_guest` | runs a command in the guest OS through VMware Tools and returns its output and exit code; needs Tools running and guest credentials. Output goes to a temp file in the guest, which is downloaded and deleted |
+| `run_in_guest` | runs a command in the guest OS through VMware Tools and returns its output and exit code; needs Tools running, guest credentials, and the VM's name with its moref (as every acting tool does; a mismatch is refused). Output goes to a temp file in the guest, which is downloaded and deleted |
 | `reboot_guest` | asks the guest OS to restart through Tools (a clean shutdown and boot); needs Tools. Requires the VM name together with a moref |
 | `hard_reset` | power-cycles the VM (`ResetVM_Task`) without asking the guest; works on a fully hung VM, but in-flight writes and unwritten crash dumps are lost. Use it only when `reboot_guest` cannot. Requires the VM name together with a moref |
 | `check_ems` | whether the serial console can carry the guest's boot output: serial-port hardware, output already seen, and on Windows the `bcdedit` EMS setting |
@@ -356,13 +373,23 @@ methods; that power, reset, answer, reconfigure, destroy and
 screenshot-to-datastore are refused through a live session; and that the acting
 tools never add a method to the guarded surface.
 
-Running with a dedicated vCenter role limits the account as well. The
-read-only tools need inventory read, datastore browse and file download,
-diagnostics (host logs), the console-screen privilege (confirm which one
-`/screen` needs on your version) and `Sessions.View` for the global session
-list. The acting tools also need `VirtualMachine.GuestOperations.Query`,
-`.Modify` and `.Execute` for guest commands, and `VirtualMachine.Interact.Reset`
-for both `RebootGuest` and `ResetVM_Task`.
+Running with a dedicated vCenter role limits the account as well. The stock
+Read-only role is not enough for every read:
+
+| Privilege | Needed for |
+| --- | --- |
+| Read-only (System.View, System.Read) | inventory, events, performance counters |
+| `Datastore.Browse` | `vmware.log`, serial-console files and datastore listings (`read_vm_log`, `get_boot_timeline`, `read_serial_console`); without it these return HTTP 403 |
+| `Global.Diagnostics` | host logs (`read_host_log`) |
+| the console privilege `/screen` needs (confirm on your version) | `get_vm_console` |
+| `Sessions.TerminateSession` | the full session list in `check_vcenters` / `vcenter_sessions`; vSphere has no separate view privilege for it, and without it only this server's own session is visible |
+| `VirtualMachine.GuestOperations.Query`, `.Modify`, `.Execute` | the guest-command tools |
+| `VirtualMachine.Interact.Reset` | `reboot_guest` and `hard_reset` |
+
+vCenter's default statistics level is 1. Host CPU demand, co-stop and the
+per-device storage counters are level 2 or 3, so on a stock vCenter they are
+kept only in the realtime hour; for older windows raise the statistics level, or
+use vROps. Each result says when a window's counters could not be read.
 
 ## Development
 
@@ -415,12 +442,12 @@ The simulator's limits, and how the tests handle them:
   returned with its line.
 - What EMS writes on your Windows versions, and the vROps stat keys on your
   version (`vrops_list_stat_keys` lists them).
-- The privilege that lets an account list every session (`Sessions.View` is
-  assumed), and snapshot sizes from `layoutEx` (the simulator reports 0).
+- Snapshot sizes from `layoutEx` (the simulator reports 0).
 - Guest exec: the guest-operation privileges, and that output capture works on
   your Windows and Linux guests.
-- That an in-guest reboot logs a reset or guest-reboot event. If yours are
-  silent, pass `rebooted_at` to `diagnose_vm`.
+- That an in-guest reboot shows in `vmware.log` as a reset (`CPU reset` on
+  vcpu-0, or the chipset's reset request). If your orchestrator knows the
+  reboot time, `rebooted_at` is still the surest input.
 - The HA event ids and messages your vCenter version writes, which
   `cluster_events` matches by pattern.
 - A datacenter inside a folder, and one datastore name in two datacenters (the

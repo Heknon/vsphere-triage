@@ -49,6 +49,7 @@ from vsphere_triage.checks import (
 )
 from vsphere_triage.console import read_captures
 from vsphere_triage.contention import hosts_cpu, storage, vm_cpu
+from vsphere_triage.hostsensors import classify_sensors, read_sensors
 from vsphere_triage.inventory import (
     DEVICE_PATH,
     VM_PATHS,
@@ -95,6 +96,7 @@ PAUSED_CAUSE = "the VM is paused"
 MEMORY = "memory pressure (the host ballooning or swapping the VM)"
 DATASTORE_CAPACITY = "its datastore is full or unreachable (APD/PDL)"
 HOST_DISCONNECTED = "its ESXi host is not connected to vCenter"
+HOST_HARDWARE = "its ESXi host reports failing hardware"
 
 DIAGNOSE_PATHS = (
     *VM_PATHS,
@@ -205,8 +207,16 @@ def locate(  # noqa: C901, PLR0911, PLR0912 - one lookup, each way it can fail b
     `strict=True` is for the tools that act on a VM (a guest command, a reboot, a
     reset): a moref whose name differs from the `vm_name` given is refused rather
     than noted, and the environment folder and the VM name must match exactly, so
-    a typo never lands the action on a neighbouring VM.
+    a typo never lands the action on a neighbouring VM. A moref alone is refused
+    too: morefs repeat across vCenters (vm-1001 on each), so one paired with the
+    wrong vCenter would act on some other VM; its name must come with it.
     """
+    if strict and moref and not vm_name:
+        return {
+            "found": False,
+            "reason": "acting on a VM needs its name with its moref (morefs repeat across vCenters); "
+            "pass vm_name too, so the right VM is checked before anything is run or sent",
+        }
     layout = Layout.of(session)
     if moref:
         found = read_vms(session, layout, objects=[session.reference("VirtualMachine", moref)])
@@ -351,6 +361,47 @@ def vm_folder(row: dict[str, Any], vm: VmFacts) -> str | None:
         own = vm.disk_chain[0][0]
         return own.rsplit("/", 1)[0] if "/" in own else None
     return None
+
+
+# Enough of the end of vmware.log to hold the last boot's start on a VM that has
+# been stuck a while; a scan reads this much for each suspect VM.
+LOG_REBOOT_BYTES = 512 * 1024
+
+
+# Sensor kinds whose failure slows the VMs on a host (throttling, memory errors).
+_SLOWING_SENSORS = ("temperature", "temp", "processor", "cpu", "memory")
+
+
+def _slows_vms(sensor: dict[str, Any]) -> bool:
+    """Whether a failing sensor is of a kind that slows the host's VMs."""
+    text = f"{sensor.get('type') or ''} {sensor.get('name') or ''}".lower()
+    return any(kind in text for kind in _SLOWING_SENSORS)
+
+
+def boot_from_vmware_log(
+    session: VCenterSession,
+    vm: VmFacts,
+    row: dict[str, Any],
+    max_bytes: int = LOG_REBOOT_BYTES,
+    *,
+    timeout_seconds: float | None = None,
+) -> datetime | None:
+    """When the last boot in the VM's `vmware.log` began, or None if it cannot be read.
+
+    A reboot started inside the guest logs no vCenter event and leaves
+    runtime.bootTime at the power-on; the VMX's own log still records the reset.
+    """
+    folder = vm_folder(row, vm)
+    datacenter = vm.datacenter_path or vm.datacenter
+    if folder is None or datacenter is None:
+        return None
+    found = session.read_datastore_file(
+        datacenter, f"{folder}/vmware.log", max_bytes, timeout_seconds=timeout_seconds, ceiling=max_bytes * 4
+    )
+    if found.status != 200:  # noqa: PLR2004
+        return None
+    timeline = boot_timeline(parse_lines(found.text))
+    return timeline.get("boot_started") if timeline.get("boot_found") else None
 
 
 def _read_reason(name: str, status: int, folder: str) -> str:
@@ -513,9 +564,9 @@ def environment_pattern(
     `vm` only names the folder and no finding speaks of "this VM".
     """
     # Healthy is the complement of abnormal, not a separate HEALTHY/BOOTING test:
-    # a VM that is HEALTHY but carries an attention flag (long_running, an alarm)
-    # is abnormal, and must not also be counted among the healthy, or one VM lands
-    # on both sides and "5 of 5 abnormal" hides the "only this one is stuck" signal.
+    # a VM that is HEALTHY but carries a trouble flag (a boot loop, a lost host) is
+    # abnormal, and must not also be counted among the healthy, or one VM lands on
+    # both sides. Context flags (long_running, an alarm) leave a VM healthy here.
     abnormal = [(peer, verdict) for peer, verdict in peers if verdict.abnormal]
     healthy = [(peer, verdict) for peer, verdict in peers if not verdict.abnormal]
     result: dict[str, Any] = {
@@ -589,6 +640,7 @@ def conclude(  # noqa: C901, PLR0912, PLR0913, PLR0915 - one ordered list of cau
     host_log: dict[str, Any],
     snapshots: dict[str, Any] | None = None,
     consolidation_needed: bool = False,
+    host_hardware: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     """Weigh the evidence into causes, strongest first, with what argues against each."""
     causes: dict[str, dict[str, Any]] = {}
@@ -641,6 +693,15 @@ def conclude(  # noqa: C901, PLR0912, PLR0913, PLR0915 - one ordered list of cau
         evidence(MEMORY, weight=2, text=f"its host is at {values.get('host_memory_percent')}% of memory")
     if HOST_NOT_CONNECTED in verdict.flags:
         evidence(HOST_DISCONNECTED, weight=3, text="vCenter reports the host not connected")
+    hardware = host_hardware or {}
+    red = hardware.get("red") or []
+    if red:
+        # A hot CPU or failing memory throttles or stalls every VM on the host while
+        # its CPU numbers look normal; a lost redundant power supply or fan usually
+        # does not, so it weighs less, under the counter-based causes.
+        slows = [sensor for sensor in red if _slows_vms(sensor)]
+        names = ", ".join(sorted({str(sensor.get("name")) for sensor in slows or red})[:5])
+        evidence(HOST_HARDWARE, weight=2 if slows else 1, text=f"host hardware sensors red: {names}")
     if HEARTBEAT_INTERMITTENT in verdict.flags:
         evidence(TOOLS_FLAPPING_CAUSE, weight=2, text="Tools runs but its heartbeat is intermittent (yellow)")
     if CPU_LIMITED in verdict.flags and verdict.state in (BUSY_NOT_UP, HUNG, BOOTED_NOT_UP):
@@ -759,14 +820,42 @@ def conclude(  # noqa: C901, PLR0912, PLR0913, PLR0915 - one ordered list of cau
                 evidence(CANNOT_BOOT, weight=4, text=f"console: {state['meaning']}")
             elif name in ("windows_logon", "linux_login"):
                 evidence(TOOLS_DID_NOT_START, weight=4, text=f"console: {state['meaning']}")
-        if console.get("frozen") and console.get("text_on_black"):
-            # A text console or login prompt, which is mostly black but not blank:
-            # the guest got far enough to print, so this is no early hang.
+        read_words = bool(console.get("screen_states") or console.get("stop_codes"))
+        # Without the words, a still screen's colour is a hint only for a Windows VM
+        # that did not come up: an idle VM at a blue sign-in screen, or a Server Core
+        # console, is still too, and VGA-blue Linux installer screens score as blue.
+        guess_from_colour = (
+            console.get("frozen")
+            and not read_words
+            and vm.os_family == "windows"
+            and vm.tools_running != "guestToolsRunning"
+        )
+        if guess_from_colour and console.get("blue_screen_colour"):
             evidence(
-                TOOLS_DID_NOT_START,
-                weight=1,
-                text="console shows text on a dark screen (a text console or login prompt), unchanged",
+                WINDOWS_CRASH,
+                weight=2,
+                text="console mostly Windows blue and unchanged, Tools not running (no OCR to confirm; "
+                "the recovery screens use the same blue)",
             )
+        if guess_from_colour and console.get("text_on_black"):
+            # Windows has no text console to log in at: still text on black is the
+            # black stop-error screen of 24H2+, or a firmware/boot-manager error.
+            for cause in (WINDOWS_CRASH, CANNOT_BOOT):
+                evidence(
+                    cause,
+                    weight=1,
+                    text="console shows still text on black on a Windows guest, Tools not running: a "
+                    "stop error (the 24H2+ black screen) or a boot error (no OCR to tell which)",
+                )
+        if console.get("frozen") and console.get("text_on_black"):
+            # Mostly black but not blank: something printed, so this is no early hang.
+            # On Linux it is a text console or login prompt; Windows has none.
+            if vm.os_family != "windows":
+                evidence(
+                    TOOLS_DID_NOT_START,
+                    weight=1,
+                    text="console shows text on a dark screen (a text console or login prompt), unchanged",
+                )
         elif console.get("frozen") and console.get("black"):
             evidence(EARLY_HANG, weight=2, text="console black and unchanged across captures")
         elif console.get("frozen"):
@@ -995,7 +1084,11 @@ def diagnose_vm(
     )
     raw_events = events.get("events", [])
     reboots = latest_reboot_by_vm(raw_events)
-    set_effective_boot(vm, now, reboots=reboots, rebooted_at=rebooted_at)
+    # The log first: a reboot started in the guest is only in vmware.log, and the
+    # verdict (booting or stuck) rests on when this boot began.
+    logs = piece("vmware.log", lambda: read_logs(session, settings, vm, row))
+    log_boot = (logs.get("timeline") or {}).get("boot_started") if logs.get("available") else None
+    set_effective_boot(vm, now, reboots=reboots, rebooted_at=rebooted_at, log_boot=log_boot)
     begin, end = window(now, vm.boot_time)
     resets = resets_by_vm(raw_events, thresholds.boot_loop_window_minutes, now).get(vm.moref, 0)
     verdict = classify(vm, thresholds, resets_in_window=resets)
@@ -1046,7 +1139,14 @@ def diagnose_vm(
         if host
         else {"available": False, "reason": "the VM's host is not known"}
     )
-    logs = piece("vmware.log", lambda: read_logs(session, settings, vm, row))
+    host_hardware = (
+        piece(
+            "host hardware",
+            lambda: classify_sensors(read_sensors(session, [host.moref]).get(host.moref, [])),
+        )
+        if host
+        else {"available": False, "reason": "the VM's host is not known"}
+    )
     serial = piece("serial console", lambda: read_serial_files(session, vm))
     console = (
         piece(
@@ -1071,6 +1171,7 @@ def diagnose_vm(
         host_log=host_log,
         snapshots=snapshots,
         consolidation_needed=vm.consolidation_needed,
+        host_hardware=host_hardware,
     )
     return {
         "found": True,
@@ -1100,6 +1201,7 @@ def diagnose_vm(
         "serial_console": serial,
         "console": console,
         "host_log": host_log,
+        "host_hardware": host_hardware,
         "snapshots": snapshots or {"count": 0},
         "events": summarize_events(raw_events) if "events" in events else events,
         # Stronger sources this diagnosis lacked: name them so a reader does not

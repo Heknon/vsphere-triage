@@ -45,13 +45,36 @@ T = TypeVar("T")
 PAGE_SIZE = 500
 # QueryEvents answers with at most this many events, the newest; a busier
 # window is cut, and results that use it say so.
+# Tasks read through one task history collector, in pages.
+TASKS_CAP = 5000
+TASK_PAGE = 500
 QUERY_EVENTS_CAP = 1000
 TASK_POLL_SECONDS = 0.1
 REALTIME_INTERVAL_SECONDS = 20
-HISTORICAL_INTERVAL_SECONDS = 300
 # vCenter keeps 20-second samples for about an hour; older windows come from
 # the first historical rollup, if the statistics level kept the counter at all.
 REALTIME_SPAN = timedelta(minutes=60)
+# vCenter's default historical rollups: (interval, how long it is kept). A window
+# is read from the finest rollup still kept for its age; the 300 s one is gone
+# after a day, though the 1800 s one holds the same window for a week.
+HISTORICAL_ROLLUPS = (
+    (300, timedelta(days=1)),
+    (1800, timedelta(days=7)),
+    (7200, timedelta(days=30)),
+    (86400, timedelta(days=365)),
+)
+
+
+def perf_interval(age: timedelta) -> int:
+    """The QueryPerf intervalId for a window that began `age` ago: realtime, then the rollups."""
+    if age <= REALTIME_SPAN:
+        return REALTIME_INTERVAL_SECONDS
+    for interval, kept in HISTORICAL_ROLLUPS:
+        if age <= kept:
+            return interval
+    return HISTORICAL_ROLLUPS[-1][0]
+
+
 # vCenter refuses a historical query naming more entity-counter pairs than
 # `config.vpxd.stats.maxQueryMetrics` (64 by default); realtime comes from the
 # hosts and has no such limit, but is still sent in batches to bound each reply.
@@ -134,13 +157,13 @@ def _declared_size(response: httpx.Response, *, ranged: bool) -> int | None:
 
 _OWN_ONLY_NOTE = (
     "only this server's own session is visible: either it is the only one open, or (far more "
-    "likely) the account lacks the Sessions.View privilege, which vCenter answers with just the "
+    "likely) the account lacks the Sessions.TerminateSession privilege, which vCenter answers with just the "
     "caller's session rather than an error; grant it to see the global count"
 )
 
 
 def _only_own(sessions: Sequence[Any], manager: Any) -> bool:
-    """Whether the session list is just this server's own session, as a role without Sessions.View sees it."""
+    """Whether the session list holds only this server's session, as an unprivileged account sees it."""
     own = getattr(getattr(manager, "currentSession", None), "key", None)
     return len(sessions) <= 1 and all(getattr(entry, "key", None) == own for entry in sessions)
 
@@ -220,6 +243,16 @@ class VCenterSession:
             msg = f"vCenter {self.vcenter.name}: login refused for {username!r}"
             raise VSphereError(msg) from error
         except (OSError, ssl.SSLError) as error:
+            msg = f"vCenter {self.vcenter.name} ({self.vcenter.host}) unreachable: {error}"
+            raise VSphereError(msg) from error
+        except vmodl.MethodFault:
+            raise
+        except Exception as error:
+            # pyVmomi's version probe raises a bare Exception ("... is down or is not
+            # a VIM server") for an unreachable network, a proxy's error page, or a
+            # web server that is not a vCenter: that is an unreachable vCenter too.
+            if type(error) is not Exception:
+                raise
             msg = f"vCenter {self.vcenter.name} ({self.vcenter.host}) unreachable: {error}"
             raise VSphereError(msg) from error
         self.last_login_seconds = round(time.monotonic() - started, 2)
@@ -319,7 +352,10 @@ class VCenterSession:
         except vim.fault.NoPermission:
             return {
                 "visible": "own_only",
-                "note": "the account may not list all sessions; grant Sessions.View to see the global count",
+                "note": (
+                    "the account may not list all sessions; reading SessionManager.sessionList needs "
+                    "Sessions.TerminateSession (vSphere has no separate view privilege for it)"
+                ),
                 "current_user": current,
             }
         if _only_own(sessions, manager):
@@ -360,7 +396,7 @@ class VCenterSession:
             return {
                 "visible": "own_only",
                 "note": (
-                    "this account may not list all sessions; grant the Sessions.View privilege (or a role "
+                    "this account may not list all sessions; grant Sessions.TerminateSession (or a role "
                     "that carries it) to diagnose exhaustion, or read the vCenter's session count from vROps"
                 ),
                 "current_user": getattr(manager.currentSession, "userName", None),
@@ -415,8 +451,10 @@ class VCenterSession:
         """The configured API idle-session timeout, if the setting is readable."""
         with contextlib.suppress(Exception):
             values = self.content.setting.QueryOptions("config.vmacore.soap.sessionTimeout")
-            if values and isinstance(values[0].value, (int, float)):
-                return float(values[0].value) / 60
+            # Read back as a string from vpxd.cfg, in minutes (the default is 30).
+            raw = values[0].value if values else None
+            if raw is not None and not isinstance(raw, bool):
+                return float(raw)
         return None
 
     def now(self) -> datetime:
@@ -575,9 +613,11 @@ class VCenterSession:
         """
         # Local import: guestexec imports diagnose, which imports this module.
         from vsphere_triage.guestexec import (  # noqa: PLC0415 - deferred to avoid a circular import
+            DEFAULT_SYSTEM_ROOT,
             guest_program_spec,
             guest_temp_path,
             rewrite_transfer_url,
+            system_root_from,
         )
 
         _ = self.content
@@ -593,8 +633,18 @@ class VCenterSession:
             username=username, password=password, interactiveSession=False
         )
         token = uuid.uuid4().hex
-        out_path = guest_temp_path(token, windows=windows)
-        program_path, arguments = guest_program_spec(command, out_path, windows=windows)
+        system_root = DEFAULT_SYSTEM_ROOT
+        if windows:
+            # Windows is not always on C:. Reading the variable changes nothing; if it
+            # cannot be read, the default is tried.
+            with contextlib.suppress(Exception):
+                system_root = system_root_from(
+                    process_manager.ReadEnvironmentVariableInGuest(vm, auth, ["SystemRoot"])
+                )
+        out_path = guest_temp_path(token, windows=windows, system_root=system_root)
+        program_path, arguments = guest_program_spec(
+            command, out_path, windows=windows, system_root=system_root
+        )
         spec = vim.vm.guest.ProcessManager.ProgramSpec(programPath=program_path, arguments=arguments)
         pid = process_manager.StartProgramInGuest(vm, auth, spec)
         deadline = time.monotonic() + timeout_seconds
@@ -613,12 +663,22 @@ class VCenterSession:
             with contextlib.suppress(Exception):
                 process_manager.TerminateProcessInGuest(vm, auth, pid)
                 terminated = True
-        output, truncated = "", False
+        output, truncated, output_error = "", False, None
         try:
             transfer = file_manager.InitiateFileTransferFromGuest(vm, auth, out_path)
-            output, truncated = self._download_text(
-                rewrite_transfer_url(transfer.url, self.vcenter.host), max_output_bytes
-            )
+            # Through vCenter the URL names the ESXi host itself: it must be reachable
+            # from this server and trusted by the CA bundle. If not, the command still
+            # ran: keep its exit code and say why the output is missing.
+            try:
+                output, truncated = self._download_text(
+                    rewrite_transfer_url(transfer.url, self.vcenter.host), max_output_bytes
+                )
+            except (httpx.HTTPError, ssl.SSLError, OSError) as error:
+                output_error = (
+                    f"the command ran, but its output could not be downloaded from the ESXi host "
+                    f"({type(error).__name__}: {error}); the host must be reachable from this server "
+                    "and its certificate trusted (VSPHERE_CA_BUNDLE)"
+                )
         finally:
             with contextlib.suppress(Exception):
                 file_manager.DeleteFileInGuest(vm, auth, out_path)
@@ -628,6 +688,7 @@ class VCenterSession:
             "pid": pid,
             "exit_code": exit_code,
             "timed_out": exit_code is None,
+            "output_error": output_error,
             # Only the shell Tools started is terminated: processes it spawned (a
             # pipeline, a background job) can outlive it.
             "shell_terminated_after_timeout": terminated,
@@ -656,6 +717,34 @@ class VCenterSession:
         finally:
             response.close()
         return body.decode("utf-8", errors="replace"), truncated
+
+    # -- tasks ---------------------------------------------------------------
+
+    def tasks(self, *, begin: datetime, end: datetime, max_tasks: int = TASKS_CAP) -> tuple[list[Any], bool]:
+        """The tasks queued in a window, as TaskInfo with their final state, oldest first.
+
+        A task history collector, not the TaskEvents: a TaskEvent carries the
+        task as it was when it was queued, so it never says the task failed.
+        The collector lives only in this session and is destroyed after the read,
+        like a container view. Returns the tasks and whether `max_tasks` cut them.
+        """
+        spec = vim.TaskFilterSpec(
+            time=vim.TaskFilterSpec.ByTime(timeType="queuedTime", beginTime=begin, endTime=end)
+        )
+        collector = self.content.taskManager.CreateCollectorForTasks(spec)
+        found: list[Any] = []
+        try:
+            collector.RewindCollector()
+            while len(found) < max_tasks:
+                page = collector.ReadNextTasks(min(TASK_PAGE, max_tasks - len(found))) or []
+                if not page:
+                    break
+                found.extend(page)
+        finally:
+            with contextlib.suppress(Exception):
+                collector.DestroyCollector()
+        cut = len(found) >= max_tasks
+        return sorted(found, key=lambda info: info.queueTime), cut
 
     # -- events --------------------------------------------------------------
 
@@ -756,7 +845,7 @@ class VCenterSession:
         if not wanted or not entities:
             return {}, unknown
         now = self.now()
-        interval = REALTIME_INTERVAL_SECONDS if now - begin <= REALTIME_SPAN else HISTORICAL_INTERVAL_SECONDS
+        interval = perf_interval(now - begin)
         by_key = {known[name].key: name for name in wanted}
         specs = [
             vim.PerformanceManager.QuerySpec(
@@ -878,14 +967,28 @@ class VCenterSession:
             headers={"Cookie": session_cookie(self._stub.cookie), **(headers or {})},
         )
 
-    def read_datastore_file(self, datacenter: str, path: str, max_bytes: int) -> DatastoreFile:
-        """The end of a datastore file, at most `max_bytes` of it, over HTTPS GET."""
+    def read_datastore_file(  # noqa: C901 - one bounded tail read, each response shape beside it
+        self,
+        datacenter: str,
+        path: str,
+        max_bytes: int,
+        *,
+        timeout_seconds: float | None = None,
+        ceiling: int | None = None,
+    ) -> DatastoreFile:
+        """The end of a datastore file, at most `max_bytes` of it, over HTTPS GET.
+
+        `timeout_seconds` bounds each wait on the network for this read, and
+        `ceiling` how much a vCenter that ignores Range may stream before giving up.
+        """
         datastore, inside = parse_datastore_path(path)
         # Ask for only the last `max_bytes` with a suffix Range. A vCenter that
         # honors it answers 206 with the tail; one that ignores it answers 200
         # with the whole file, which the stream below caps and tails itself.
         request = self._get_request(
             "/folder/" + quote(inside),
+            # Names go as vSphere returns them (%, / and \\ escaped as %25, %2f,
+            # %5c) and are URL-encoded on top, as govmomi's Datastore.NewURL does.
             {"dcPath": datacenter, "dsName": datastore},
             headers={"Range": f"bytes=-{max_bytes}"},
         )
@@ -894,7 +997,10 @@ class VCenterSession:
         kept = 0
         total = 0
         capped = False
-        ceiling = max(self.settings.max_download_bytes, max_bytes)
+        if ceiling is None:
+            ceiling = max(self.settings.max_download_bytes, max_bytes)
+        if timeout_seconds is not None:
+            request.extensions["timeout"] = httpx.Timeout(timeout_seconds).as_dict()
         response = self._http.send(request, stream=True)
         try:
             if response.is_redirect:
@@ -1070,10 +1176,12 @@ class VCenterPool:
             )
             raise VSphereError(msg) from None
         try:
-            await self._bounded(session.connect, slot=slot)
+            await self._bounded(session.connect, slot=slot, what=f"vCenter {name}: connecting")
             generation = session.generation
             try:
-                return await self._bounded(lambda: work(session), deadline, slot=slot)
+                return await self._bounded(
+                    lambda: work(session), deadline, slot=slot, what=f"vCenter {name}: the read"
+                )
             except DeadlineError as error:
                 if retry:
                     raise
@@ -1085,22 +1193,34 @@ class VCenterPool:
             except vim.fault.NotAuthenticated:
                 # The session expired. Reconnect (a no-op if a sibling call already
                 # did, so we never log its new session out), then retry once.
-                await self._bounded(lambda: session.reconnect(generation), slot=slot)
+                await self._bounded(
+                    lambda: session.reconnect(generation), slot=slot, what=f"vCenter {name}: reconnecting"
+                )
                 if not retry:
                     raise _not_retried(name, "the session expired") from None
-                return await self._bounded(lambda: work(session), deadline, slot=slot)
+                return await self._bounded(
+                    lambda: work(session), deadline, slot=slot, what=f"vCenter {name}: the read"
+                )
             except (ssl.SSLError, ConnectionError, HTTPException) as dropped:
                 # A dropped or reset connection — under load often the vCenter at
                 # its connection or session limit. Reconnect and retry once; if it
                 # happens again, say so plainly rather than as a bare socket error.
                 if not retry:
                     with contextlib.suppress(Exception):
-                        await self._bounded(lambda: session.reconnect(generation), slot=slot)
+                        await self._bounded(
+                            lambda: session.reconnect(generation),
+                            slot=slot,
+                            what=f"vCenter {name}: reconnecting",
+                        )
                     why = f"the connection dropped ({type(dropped).__name__})"
                     raise _not_retried(name, why) from dropped
                 try:
-                    await self._bounded(lambda: session.reconnect(generation), slot=slot)
-                    return await self._bounded(lambda: work(session), deadline, slot=slot)
+                    await self._bounded(
+                        lambda: session.reconnect(generation), slot=slot, what=f"vCenter {name}: reconnecting"
+                    )
+                    return await self._bounded(
+                        lambda: work(session), deadline, slot=slot, what=f"vCenter {name}: the read"
+                    )
                 except (ssl.SSLError, ConnectionError, HTTPException) as again:
                     msg = (
                         f"vCenter {name} dropped the connection twice ({type(again).__name__}: {again}). "
@@ -1120,7 +1240,12 @@ class VCenterPool:
         return await self.run(name, work, timeout_seconds=self.settings.scan_timeout_seconds)
 
     async def _bounded(
-        self, work: Callable[[], T], timeout_seconds: float | None = None, *, slot: _Slot | None = None
+        self,
+        work: Callable[[], T],
+        timeout_seconds: float | None = None,
+        *,
+        slot: _Slot | None = None,
+        what: str = "vCenter read",
     ) -> T:
         deadline = timeout_seconds or self.settings.timeout_seconds
         future = asyncio.ensure_future(asyncio.to_thread(work))
@@ -1131,7 +1256,7 @@ class VCenterPool:
             # it ends, so stalled reads cannot pile up past the per-vCenter limit.
             if slot is not None:
                 slot.hand_off(future)
-            msg = f"vCenter read exceeded its deadline ({deadline:g}s)"
+            msg = f"{what} exceeded its deadline ({deadline:g}s)"
             raise DeadlineError(msg) from error
         except asyncio.CancelledError:
             if slot is not None:

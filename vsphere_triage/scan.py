@@ -12,17 +12,24 @@ from __future__ import annotations
 
 import asyncio
 import itertools
+import time
 import uuid
 from collections import Counter, OrderedDict
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta
 from typing import TYPE_CHECKING, Any
 
+from pyVmomi import vim
+
 from vsphere_triage.checks import (
     ABNORMAL,
     ATTENTION_FLAGS,
+    BOOTED_NOT_UP,
+    BUSY_NOT_UP,
+    CONTEXT_FLAGS,
     FLAG_MEANING,
     FLAGS,
+    HUNG,
     MEANING,
     OFF,
     RESET_EVENTS,
@@ -35,6 +42,8 @@ from vsphere_triage.checks import (
 )
 from vsphere_triage.config import NotFoundError
 from vsphere_triage.contention import hosts_cpu, storage
+from vsphere_triage.diagnose import boot_from_vmware_log
+from vsphere_triage.hostsensors import classify_sensors, read_sensors
 from vsphere_triage.inventory import (
     HostFacts,
     Inventory,
@@ -42,6 +51,7 @@ from vsphere_triage.inventory import (
     read_datastores,
     read_hosts,
     read_inventory,
+    set_effective_boot,
 )
 from vsphere_triage.vcenter import QUERY_EVENTS_CAP, VSphereError
 
@@ -79,6 +89,10 @@ GROUPS_PER_DIMENSION = 5
 REPRESENTATIVES = 3
 # What a scan reports by default: every abnormal state, and the flags.
 FLAGGED = (*ABNORMAL, *ATTENTION_FLAGS)
+# What counts as abnormal in rates and groups: the states, and the flags that
+# mean a VM in trouble. Context flags (long_running, memory_reclaimed, ...) are
+# listed but would otherwise make a fleet of old VMs read as all abnormal.
+STUCK = tuple(item for item in FLAGGED if item not in CONTEXT_FLAGS)
 # Anything a caller may ask a scan for: every state, every flag.
 SELECTABLE = (*STATES, *FLAGS)
 
@@ -92,6 +106,8 @@ class VCenterScan:
     hosts: dict[str, dict[str, Any]]
     storage: dict[str, Any] | None
     notes: list[str] = field(default_factory=list)
+    # Hardware sensor verdicts of the hosts read, by host moref.
+    hardware: dict[str, dict[str, Any]] = field(default_factory=dict)
 
 
 @dataclass
@@ -103,6 +119,8 @@ class Scan:
     vcenters: dict[str, VCenterScan]
     errors: dict[str, str]
     host_memory_percent: float = 95.0
+    # What the scan was asked for, so explain_group drills into the groups it showed.
+    states: tuple[str, ...] = FLAGGED
 
     def all_vms(self) -> list[tuple[VmFacts, Verdict]]:
         """Every VM read, with its verdict."""
@@ -133,7 +151,7 @@ class ScanStore:
             raise NotFoundError(msg) from None
 
 
-def scan_vcenter(session: VCenterSession, settings: Settings) -> VCenterScan:
+def scan_vcenter(session: VCenterSession, settings: Settings) -> VCenterScan:  # noqa: C901 - one read per source, each optional
     """Read and judge one vCenter. Blocking: runs in a worker thread."""
     thresholds = settings.thresholds
     notes = []
@@ -152,6 +170,8 @@ def scan_vcenter(session: VCenterSession, settings: Settings) -> VCenterScan:
                 f"{len(events)} reset events in the window: vCenter returns at most "
                 f"{QUERY_EVENTS_CAP}, so boot-loop counts are low and some reboots may be missed"
             )
+    except vim.fault.NotAuthenticated:
+        raise  # the session expired: let the pool re-login and run the scan again
     except Exception as error:  # noqa: BLE001 - a scan without events is still a scan
         resets, reboots = {}, {}
         notes.append(
@@ -162,6 +182,7 @@ def scan_vcenter(session: VCenterSession, settings: Settings) -> VCenterScan:
     verdicts = {
         vm.moref: classify(vm, thresholds, resets_in_window=resets.get(vm.moref, 0)) for vm in inventory.vms
     }
+    notes.extend(_recheck_in_guest_reboots(session, inventory, verdicts, reboots, resets, settings))
     live_hosts = [host for host in inventory.hosts.values() if host.connection_state in (None, "connected")]
     try:
         hosts, unknown = hosts_cpu(
@@ -169,9 +190,19 @@ def scan_vcenter(session: VCenterSession, settings: Settings) -> VCenterScan:
         )
         if unknown:
             notes.append("host CPU counters unavailable: " + ", ".join(unknown))
+    except vim.fault.NotAuthenticated:
+        raise  # the session expired: let the pool re-login and run the scan again
     except Exception as error:  # noqa: BLE001
         hosts = {}
         notes.append(f"host CPU not read ({type(error).__name__})")
+    hardware: dict[str, dict[str, Any]] = {}
+    try:
+        sensors = read_sensors(session, [host.moref for host in live_hosts])
+        hardware = {moref: classify_sensors(found) for moref, found in sensors.items()}
+    except vim.fault.NotAuthenticated:
+        raise  # the session expired: let the pool re-login and run the scan again
+    except Exception as error:  # noqa: BLE001
+        notes.append(f"host hardware sensors not read ({type(error).__name__})")
     store_report = None
     try:
         store_report = storage(
@@ -183,9 +214,93 @@ def scan_vcenter(session: VCenterSession, settings: Settings) -> VCenterScan:
             thresholds=thresholds,
             with_devices=False,  # datastore-level only across the fleet; devices in explain_group
         )
+    except vim.fault.NotAuthenticated:
+        raise  # the session expired: let the pool re-login and run the scan again
     except Exception as error:  # noqa: BLE001
         notes.append(f"storage counters not read ({type(error).__name__})")
-    return VCenterScan(inventory, verdicts, hosts, store_report, notes)
+    return VCenterScan(inventory, verdicts, hosts, store_report, notes, hardware)
+
+
+# States that rest on uptime: a VM rebooted inside the guest looks long-stuck in
+# them, because vCenter logs no event for that reboot.
+UPTIME_STATES = (HUNG, BUSY_NOT_UP, BOOTED_NOT_UP)
+# How many such VMs a scan re-checks against their vmware.log, per vCenter, in
+# how long, reading how much of each log, waiting how long for each read.
+LOG_RECHECKS = 40
+LOG_RECHECK_SECONDS = 30.0
+LOG_RECHECK_BYTES = 256 * 1024
+LOG_RECHECK_TIMEOUT = 10.0
+
+
+def _recheck_in_guest_reboots(  # noqa: C901 - one bounded pass, each way a read can fail beside it
+    session: VCenterSession,
+    inventory: Inventory,
+    verdicts: dict[str, Verdict],
+    reboots: dict[str, datetime],
+    resets: dict[str, int],
+    settings: Settings,
+) -> list[str]:
+    """Re-judge VMs stuck by uptime from power-on against the last boot in their vmware.log.
+
+    The same check diagnose_vm makes, made here for the suspects only: a mass
+    in-guest reboot otherwise reads as a fleet of hung VMs. Returns notes.
+    """
+    suspects = [
+        vm
+        for vm in inventory.vms
+        if verdicts[vm.moref].state in UPTIME_STATES and vm.boot_source in ("power_on", "quickstats")
+    ]
+    if not suspects:
+        return []
+    checked = suspects[:LOG_RECHECKS]
+    try:
+        rows = {
+            row["moref"]: row
+            for row in session.retrieve(
+                vim.VirtualMachine,
+                ("config.files.vmPathName", "config.files.logDirectory"),
+                objects=[session.reference("VirtualMachine", vm.moref) for vm in checked],
+            )
+        }
+    except vim.fault.NotAuthenticated:
+        raise
+    except Exception as error:  # noqa: BLE001 - the scan stands without the re-check
+        return [f"in-guest reboots not re-checked in vmware.log ({type(error).__name__})"]
+    rebooted = 0
+    read = 0
+    # Suspects often sit on a slow or unreachable datastore: the re-check gets its
+    # own time budget and reads little per VM, so it cannot sink the whole scan.
+    deadline = time.monotonic() + LOG_RECHECK_SECONDS
+    for vm in checked:
+        if time.monotonic() >= deadline:
+            break
+        read += 1
+        try:
+            log_boot = boot_from_vmware_log(
+                session, vm, rows.get(vm.moref, {}), LOG_RECHECK_BYTES, timeout_seconds=LOG_RECHECK_TIMEOUT
+            )
+        except vim.fault.NotAuthenticated:
+            raise
+        except Exception:  # noqa: BLE001, S112 - one unreadable log leaves that VM as judged
+            continue
+        if log_boot is None:
+            continue
+        set_effective_boot(vm, inventory.read_at, reboots=reboots, log_boot=log_boot)
+        if vm.boot_source == "vmware_log":
+            rebooted += 1
+            verdicts[vm.moref] = classify(vm, settings.thresholds, resets_in_window=resets.get(vm.moref, 0))
+    notes = [
+        (
+            f"{read} VM(s) stuck by uptime from power-on re-checked against vmware.log for an "
+            f"in-guest reboot: {rebooted} had rebooted since and were re-judged from that reboot"
+        )
+    ]
+    if len(suspects) > read:
+        notes.append(
+            f"{len(suspects) - read} more were not re-checked (at most {LOG_RECHECKS} VMs or "
+            f"{LOG_RECHECK_SECONDS:g} s); diagnose_vm re-checks any one of them"
+        )
+    return notes
 
 
 async def run_scan(pool: VCenterPool, settings: Settings, names: Sequence[str]) -> Scan:
@@ -213,8 +328,18 @@ async def run_scan(pool: VCenterPool, settings: Settings, names: Sequence[str]) 
     )
 
 
+def grouping_states(states: Sequence[str]) -> tuple[str, ...]:
+    """What makes a VM abnormal for rates and groups: `states` less the context flags.
+
+    A caller who asked for context flags alone (scan for long_running) gets them.
+    """
+    stuck = tuple(item for item in states if item not in CONTEXT_FLAGS)
+    return stuck or tuple(states)
+
+
 def groups(scan: Scan, *, states: Sequence[str] = FLAGGED) -> dict[str, list[dict[str, Any]]]:
     """The groups abnormal VMs fall into, per dimension, strongest first."""
+    states = grouping_states(states)
     considered = [(vm, verdict) for vm, verdict in scan.all_vms() if verdict.state != OFF]
     flagged = [(vm, verdict) for vm, verdict in considered if _counts(verdict, states)]
     if not considered or not flagged:
@@ -277,6 +402,8 @@ def summary(scan: Scan, *, states: Sequence[str] = FLAGGED, limit: int) -> dict[
     """A scan as a tool result: findings, counts, groups, infrastructure, then VMs."""
     everything = scan.all_vms()
     flagged = [(vm, verdict) for vm, verdict in everything if _counts(verdict, states)]
+    stuck = grouping_states(states)
+    abnormal = [(vm, verdict) for vm, verdict in flagged if _counts(verdict, stuck)]
     by_state = count_states({f"{vm.vcenter}/{vm.moref}": verdict for vm, verdict in everything})
     grouped = groups(scan, states=states)
     strongest = sorted(
@@ -311,6 +438,33 @@ def summary(scan: Scan, *, states: Sequence[str] = FLAGGED, limit: int) -> dict[
         for host in vscan.inventory.hosts.values()
         if host.connection_state not in (None, "connected")
     ]
+    vms_on_host = Counter(
+        (name, vm.host_moref)
+        for name, vscan in scan.vcenters.items()
+        for vm in vscan.inventory.vms
+        if vm.powered_on
+    )
+    failing_hardware: list[dict[str, Any]] = [
+        {
+            "vcenter": name,
+            "name": vscan.inventory.hosts[moref].name if moref in vscan.inventory.hosts else moref,
+            "moref": moref,
+            "red": [sensor.get("name") for sensor in verdict["red"]][:10],
+            "yellow": [sensor.get("name") for sensor in verdict["yellow"]][:10],
+            "powered_on_vms": vms_on_host.get((name, moref), 0),
+        }
+        for name, vscan in scan.vcenters.items()
+        for moref, verdict in vscan.hardware.items()
+        if verdict["healthy"] is False
+    ]
+    # Red before yellow, then the hosts carrying the most VMs.
+    failing_hardware.sort(key=lambda host: (not host["red"], -int(host["powered_on_vms"])))
+    hardware_unjudged = sum(
+        1
+        for vscan in scan.vcenters.values()
+        for verdict in vscan.hardware.values()
+        if verdict["healthy"] is None
+    )
     flag_counts: Counter[str] = Counter(flag for _, verdict in everything for flag in verdict.flags)
     slow_storage = [
         finding
@@ -323,13 +477,16 @@ def summary(scan: Scan, *, states: Sequence[str] = FLAGGED, limit: int) -> dict[
     # A powered-off leftover can carry an attention flag (long_running), so it is
     # flagged but not among the powered-on: count the two separately rather than
     # reporting "N abnormal of M powered-on" with N larger than M.
-    abnormal_on = sum(1 for _, verdict in flagged if verdict.state != OFF)
-    flagged_off = len(flagged) - abnormal_on
+    abnormal_on = sum(1 for _, verdict in abnormal if verdict.state != OFF)
+    context_only = len(flagged) - len(abnormal)
+    flagged_off = sum(1 for _, verdict in abnormal if verdict.state == OFF)
     findings.append(
         f"{abnormal_on} abnormal of {considered} powered-on VMs across {len(scan.vcenters)} vCenter(s)"
+        + (f"; {flagged_off} powered-off VM(s) also flagged" if flagged_off else "")
         + (
-            f"; {flagged_off} powered-off VM(s) also flagged (e.g. long-running leftovers)"
-            if flagged_off
+            f"; {context_only} more carry only context flags (long_running, memory_reclaimed, ...), "
+            "listed but not counted as abnormal"
+            if context_only
             else ""
         )
     )
@@ -364,6 +521,23 @@ def summary(scan: Scan, *, states: Sequence[str] = FLAGGED, limit: int) -> dict[
                 for host in not_connected[:HOSTS_LISTED]
             )
         )
+    if failing_hardware:
+        listed = "; ".join(
+            f"{host['vcenter']}:{host['name']} ("
+            + (
+                f"red: {', '.join(map(str, host['red']))}"
+                if host["red"]
+                else f"yellow: {', '.join(map(str, host['yellow']))}"
+            )
+            + f"; {host['powered_on_vms']} VMs)"
+            for host in failing_hardware[:HOSTS_LISTED]
+        )
+        findings.append(f"{len(failing_hardware)} host(s) report hardware sensors red or yellow: {listed}")
+    if hardware_unjudged:
+        findings.append(
+            f"{hardware_unjudged} host(s) report no usable hardware sensor data (no CIM provider, or all "
+            "unknown): their hardware is not judged"
+        )
     findings.extend(
         f"{count} VM(s) flagged {flag}: {FLAG_MEANING[flag]}"
         for flag, count in flag_counts.most_common()
@@ -375,6 +549,7 @@ def summary(scan: Scan, *, states: Sequence[str] = FLAGGED, limit: int) -> dict[
     rows = sorted(
         flagged,
         key=lambda pair: (
+            not _counts(pair[1], stuck),
             ABNORMAL.index(pair[1].state) if pair[1].state in ABNORMAL else len(ABNORMAL),
             -(pair[0].uptime_minutes or 0),
         ),
@@ -391,6 +566,8 @@ def summary(scan: Scan, *, states: Sequence[str] = FLAGGED, limit: int) -> dict[
         "hosts_over_cpu_threshold": overcommitted,
         "hosts_near_memory_capacity": memory_pressed,
         "hosts_not_connected": not_connected,
+        "hosts_with_hardware_problems": failing_hardware[:50],
+        "hosts_with_hardware_problems_total": len(failing_hardware),
         "storage_findings": slow_storage,
         "vcenters": {
             name: {
@@ -403,7 +580,8 @@ def summary(scan: Scan, *, states: Sequence[str] = FLAGGED, limit: int) -> dict[
             for name, vscan in scan.vcenters.items()
         },
         "errors": scan.errors,
-        "abnormal_vms_total": len(flagged),
+        "abnormal_vms_total": len(abnormal),
+        "context_flagged_vms_total": context_only,
         "abnormal_vms": [
             vm.identity() | {"verdict": verdict.as_dict(), "notes": vm.notes} for vm, verdict in rows[:limit]
         ],
@@ -413,6 +591,13 @@ def summary(scan: Scan, *, states: Sequence[str] = FLAGGED, limit: int) -> dict[
             "diagnose_vm on its representatives"
         ),
     }
+
+
+def _sensor_names(host: dict[str, Any]) -> str:
+    """The failing sensors of a host, red ones when it has any."""
+    red: list[Any] = host["red"]
+    yellow: list[Any] = host["yellow"]
+    return f"red: {', '.join(map(str, red))}" if red else f"yellow: {', '.join(map(str, yellow))}"
 
 
 def _window_since(boots: list[datetime], now: datetime) -> tuple[datetime, datetime]:
@@ -467,8 +652,10 @@ async def explain_group(  # noqa: C901 - one comparison, then one check per vCen
     inside = [
         (vm, verdict) for vm, verdict in scan.all_vms() if value in values_of(vm) and verdict.state != OFF
     ]
-    members = [vm for vm, verdict in inside if _counts(verdict, FLAGGED)]
-    healthy = [vm for vm, verdict in inside if not _counts(verdict, FLAGGED)]
+    # As the scan's groups counted them, from the states the scan was asked for.
+    counted = grouping_states(scan.states)
+    members = [vm for vm, verdict in inside if _counts(verdict, counted)]
+    healthy = [vm for vm, verdict in inside if not _counts(verdict, counted)]
     if not members:
         return {"found": False, "reason": f"no abnormal VMs on {dimension} {value!r} in scan {scan.id}"}
     comparison = {}
@@ -545,7 +732,8 @@ def window_on_vcenter(
 ) -> dict[str, Any]:
     """Resets, failures and pressure on one vCenter over a past window. Blocking."""
     thresholds = settings.thresholds
-    events = session.events(begin=begin, end=end, types=WINDOW_EVENTS)
+    # Read in pieces when the window holds more than one QueryEvents answer.
+    events, events_cut = session.events_covering(begin=begin, end=end, types=WINDOW_EVENTS)
     by_host: Counter[str] = Counter()
     by_type: Counter[str] = Counter()
     by_folder_vm: Counter[str] = Counter()
@@ -581,7 +769,7 @@ def window_on_vcenter(
     storage_matched = any(entry.get("matched_instance") for entry in disk.get("datastores", []))
     return {
         "events_read": len(events),
-        "events_capped": len(events) >= QUERY_EVENTS_CAP,
+        "events_capped": events_cut,
         "events_by_type": dict(by_type),
         "events_by_host": dict(by_host.most_common(15)),
         "vms_with_most_events": {
@@ -622,8 +810,8 @@ async def diagnose_window(
         per_vcenter[name] = result
         if result["events_capped"]:
             findings.append(
-                f"{name}: vCenter returned its maximum of {QUERY_EVENTS_CAP} events; "
-                "narrow the window for complete counts"
+                f"{name}: some part of the window still held over {QUERY_EVENTS_CAP} events after "
+                "splitting it; counts are incomplete, narrow the window"
             )
         resets = sum(result["events_by_type"].get(kind, 0) for kind in RESET_EVENTS)
         failures = result["events_by_type"].get("VmFailedToPowerOnEvent", 0)

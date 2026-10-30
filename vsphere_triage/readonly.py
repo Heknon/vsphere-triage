@@ -15,9 +15,10 @@ only paths in the whole server that can change anything. Everything else, proven
 by the sweep test below, only reads.
 
 What is on the list reads, or creates something that lives only in this
-session and changes nothing anyone else can see (a container view). Task
-history is read from TaskEvents through QueryEvents, never through a task
-collector. Nothing on it powers, answers, migrates, reconfigures,
+session and changes nothing anyone else can see (a container view, a task
+history collector), destroyed after use. Task history needs the collector: the
+TaskEvents QueryEvents returns carry each task as it was queued, never its
+outcome. Nothing on it powers, answers, migrates, reconfigures,
 creates, deletes or writes a datastore file. `SearchDatastore_Task` is a task,
 but it only lists files.
 
@@ -48,6 +49,12 @@ ALLOWED_METHODS = frozenset(
         # Session-scoped views over the inventory, destroyed after use.
         "CreateContainerView",
         "DestroyView",
+        # A session-scoped task history collector, read and destroyed: the only
+        # place a finished task's state (success, error) can be read.
+        "CreateCollectorForTasks",
+        "RewindCollector",
+        "ReadNextTasks",
+        "DestroyCollector",
         # Events.
         "QueryEvents",
         # Performance counters.

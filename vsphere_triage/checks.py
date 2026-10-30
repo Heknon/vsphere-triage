@@ -93,6 +93,11 @@ ATTENTION_FLAGS = (
     LONG_RUNNING,
     CONSOLIDATION_NEEDED,
 )
+# Attention flags that are context, not a VM in trouble: common on a healthy
+# fleet (every VM older than a day, swapped pages that stay counted long after
+# the pressure ended), so they are reported but never make a VM count as
+# abnormal in a scan's rates and groups.
+CONTEXT_FLAGS = (MEMORY_RECLAIMED, HOST_MEMORY_PRESSURE, VCENTER_ALARM, LONG_RUNNING, CONSOLIDATION_NEEDED)
 DETAIL_FLAGS = (HOST_IN_MAINTENANCE, TOOLS_OUTDATED, CPU_LIMITED, MEMORY_LIMITED)
 FLAGS = (*ATTENTION_FLAGS, *DETAIL_FLAGS)
 FLAG_MEANING = {
@@ -131,8 +136,14 @@ class Verdict:
 
     @property
     def abnormal(self) -> bool:
-        """Whether the state, or a flag that matters on its own, is worth a look."""
-        return self.state in ABNORMAL or any(flag in ATTENTION_FLAGS for flag in self.flags)
+        """Whether the VM is in trouble: an abnormal state, or a flag that means trouble.
+
+        Context flags (long_running, memory_reclaimed, ...) do not count: on a
+        healthy fleet of old VMs they would make every VM abnormal, as in scan.
+        """
+        return self.state in ABNORMAL or any(
+            flag in ATTENTION_FLAGS and flag not in CONTEXT_FLAGS for flag in self.flags
+        )
 
     def as_dict(self) -> dict[str, Any]:
         """The verdict as a tool result shows it."""

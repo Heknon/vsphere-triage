@@ -40,9 +40,11 @@ _MARKERS = ("LAST_BOOT", "BLAME", "CRITICAL", "DMESG_LINES", "DMESG", "JOURNAL",
 
 def boot_probe_shell() -> str:
     """A /bin/sh script that prints the Linux boot evidence in marked sections."""
-    patterns = "panic|oops|call trace|hung_task|blocked for more than|soft lockup|rcu.*stall|"
+    # Specific phrases only: a bare "panic" also matches the kernel command line's
+    # "panic=1", and noise like that pushes real faults out of the last 40 lines kept.
+    patterns = "kernel panic|oops([^=]|$)|call trace|hung_task|blocked for more than|soft lockup|rcu.*stall|"
     patterns += "i/o error|blk_update_request|ext4-fs error|xfs.*(error|corrupt)|timed out|"
-    patterns += "dracut|emergency mode"
+    patterns += "dracut.*(timeout|emergency|could not boot)|emergency mode"
     return (
         "echo ===LAST_BOOT===; (uptime -s 2>/dev/null || who -b 2>/dev/null);"
         "echo ===BLAME===; systemd-analyze blame 2>/dev/null | head -n 15;"
@@ -73,7 +75,9 @@ def _split_sections(output: str) -> dict[str, list[str]]:
             label = stripped.strip("=")
             current = label if label in sections else None
             continue
-        if current and line:
+        # journalctl prints "-- No entries --" (and "-- Logs begin at ..." on older
+        # systemd) on stdout: not log lines, and not evidence the journal was read.
+        if current and line and not stripped.startswith("-- "):
             sections[current].append(line)
     return sections
 
@@ -82,9 +86,10 @@ def _slow_units(blame_lines: list[str]) -> list[dict[str, str]]:
     """The units systemd-analyze blame lists, as {time, unit} (already slowest-first)."""
     units = []
     for line in blame_lines:
-        parts = line.split(None, 1)
-        if len(parts) == 2 and parts[1].strip():  # noqa: PLR2004 - "<time> <unit>"
-            units.append({"time": parts[0], "unit": parts[1].strip()})
+        # The unit is the last field; the time before it can be several ("1min 30.012s").
+        parts = line.rsplit(None, 1)
+        if len(parts) == 2 and parts[0].strip():  # noqa: PLR2004 - "<time> <unit>"
+            units.append({"time": parts[0].strip(), "unit": parts[1]})
     return units
 
 
@@ -116,7 +121,13 @@ def summarize_linux_boot(output: str) -> dict[str, Any]:
     for finding in kernel_findings:
         layer = f" — {finding['points_at']}" if finding["points_at"] else ""
         picture.append(f"current boot: {finding['count']}x {finding['kind']}{layer}")
-    previous_read = bool(sections["PREVIOUS"]) or (boots is not None and boots > 1)
+    # The previous boot was read if it returned lines, or if the journal holds more
+    # than one boot and this account can read the system journal at all (the current
+    # boot returned lines). A non-root account can count its own user journal's boots
+    # while reading none of the system's.
+    previous_read = bool(sections["PREVIOUS"]) or (
+        boots is not None and boots > 1 and bool(sections["JOURNAL"])
+    )
     if not previous_read:
         picture.append(
             "the previous boot's journal is not available (the journal is not persistent, or was not "
@@ -129,14 +140,17 @@ def summarize_linux_boot(output: str) -> dict[str, Any]:
     dmesg_lines = int(dmesg_text) if dmesg_text.isdigit() else None
     # Thin only when nothing could be read at all: a readable dmesg with no fault
     # lines is a clean result, not a restricted one.
-    thin = not dmesg_lines and not sections["DMESG"] and not sections["JOURNAL"]
+    # A readable dmesg is never empty: 0 lines means it was restricted
+    # (dmesg_restrict=1, the Debian/Ubuntu default for non-root).
+    thin = not dmesg_lines and not sections["JOURNAL"]
     if thin:
         picture.append(
             "dmesg and the journal came back empty — likely restricted to root/adm; run as a "
             "privileged account for the kernel's own words"
         )
     return {
-        "last_boot": " ".join(sections["LAST_BOOT"]) or None,
+        # `who -b` (when `uptime -s` is missing) prints "system boot  Oct 30 14:35".
+        "last_boot": " ".join(" ".join(sections["LAST_BOOT"]).replace("system boot", "").split()) or None,
         "picture": picture or ["no kernel faults found in what could be read"],
         "kernel_findings": kernel_findings,
         "previous_boot_findings": previous_findings,

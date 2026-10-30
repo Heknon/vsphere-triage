@@ -59,6 +59,7 @@ from vsphere_triage.checks import (
     BLOCKED_ON_QUESTION,
     BOOTED_NOT_UP,
     BUSY_NOT_UP,
+    CONTEXT_FLAGS,
     HUNG,
     INACCESSIBLE,
     LOST_HEARTBEAT,
@@ -81,12 +82,12 @@ from vsphere_triage.diagnose import (
     summarize_events,
     vm_folder,
 )
-from vsphere_triage.formatting import bounded
+from vsphere_triage.formatting import MAX_RESPONSE_CHARACTERS, bounded, jsonable, size
 from vsphere_triage.inventory import find_environment as environment_folders
 from vsphere_triage.inventory import read_datastore_mounts, read_inventory
 from vsphere_triage.powerflex import PowerFlexError
 from vsphere_triage.readonly import ReadOnlyViolationError
-from vsphere_triage.vcenter import VCenterPool, VSphereError
+from vsphere_triage.vcenter import TASKS_CAP, VCenterPool, VSphereError
 from vsphere_triage.vmlog import caller_pattern, grep, parse_lines
 from vsphere_triage.vrops import KINDS, SUGGESTED_STAT_KEYS, Vrops, VropsError
 
@@ -553,27 +554,27 @@ def _register_fleet_tools(  # noqa: C901, PLR0915 - one closure per tool
 
         def run(session: VCenterSession) -> dict[str, Any]:
             now = session.now()
-            events, cut = session.events_covering(
-                begin=now - timedelta(minutes=minutes), end=now, types=("TaskEvent",)
-            )
+            tasks, cut = session.tasks(begin=now - timedelta(minutes=minutes), end=now)
             rows = []
-            for event in events:
-                info = getattr(event, "info", None)
-                if info is None:
-                    continue
+            for info in tasks:
                 reason = getattr(info, "reason", None)
+                error = getattr(info, "error", None)
                 rows.append(
                     {
                         "operation": getattr(info, "descriptionId", None) or getattr(info, "name", "") or "",
                         "target": getattr(info, "entityName", None),
                         "state": str(getattr(info, "state", "")),
-                        "time": getattr(event, "createdTime", None),
-                        "user": getattr(reason, "userName", None) or getattr(event, "userName", None),
+                        "time": getattr(info, "queueTime", None),
+                        "user": _task_started_by(reason),
+                        "error": (getattr(error, "msg", None) or type(error).__name__) if error else None,
                     }
                 )
             summary = taskhistory.summarize_tasks(rows, now=now, window_minutes=minutes)
             if cut:
-                summary["findings"] = [*summary["findings"], CAP_NOTE.format(n=16)]
+                summary["findings"] = [
+                    *summary["findings"],
+                    f"over {TASKS_CAP} tasks in the window; only the oldest {TASKS_CAP} were read, narrow it",
+                ]
             return {"vcenter": session.vcenter.name} | summary
 
         return await fleet.sweep(name, run)
@@ -604,7 +605,7 @@ def _register_fleet_tools(  # noqa: C901, PLR0915 - one closure per tool
         *,
         vcenters: list[str] | None = None,
         states: list[str] | None = None,
-        limit: int = 40,
+        limit: int = 20,
     ) -> dict[str, Any]:
         """Find abnormal VMs on some or all vCenters, and what the abnormal ones share.
 
@@ -618,7 +619,8 @@ def _register_fleet_tools(  # noqa: C901, PLR0915 - one closure per tool
             vcenters: vCenter names (any spelling they are known by); all when empty.
             states: only these states or flags, e.g. ["no_tools"] or ["long_running"]; the
                 abnormal states and attention flags when empty.
-            limit: how many abnormal VMs to list (groups and counts always cover all).
+            limit: how many abnormal VMs to list (groups and counts always cover all); fewer
+                are listed when the full rows would not fit the response.
 
         """
         names = _names(fleet, vcenters)
@@ -628,8 +630,16 @@ def _register_fleet_tools(  # noqa: C901, PLR0915 - one closure per tool
             msg = f"unknown states or flags {unknown}; choose from {list(scanning.SELECTABLE)}"
             raise ValueError(msg)
         result = await scanning.run_scan(fleet, resolved, names)
+        result.states = wanted
         scans.put(result)
-        return scanning.summary(result, states=wanted, limit=max(1, min(limit, MAX_LIMIT)))
+        # The VM rows are the bulk of a scan: list fewer of them before the
+        # generic cut would trim the groups and findings along with them.
+        summary = scanning.summary(result, states=wanted, limit=max(1, min(limit, MAX_LIMIT)))
+        rows = summary["abnormal_vms"]
+        while len(summary["abnormal_vms"]) > 1 and size(jsonable(summary)) > MAX_RESPONSE_CHARACTERS:
+            summary["abnormal_vms"] = summary["abnormal_vms"][: len(summary["abnormal_vms"]) // 2]
+        summary["abnormal_vms_truncated"] += len(rows) - len(summary["abnormal_vms"])
+        return summary
 
     @tool()
     async def explain_group(*, scan_id: str, dimension: str, value: str) -> dict[str, Any]:
@@ -1073,14 +1083,14 @@ def _register_machine_tools(  # noqa: C901, PLR0915 - one closure per tool
         Linux); a command containing the shell's quote character can break the
         wrapping.
 
-        Find the VM by moref, or by env_id plus vm_name (never by name alone).
+        Find the VM by moref plus vm_name, or by env_id plus vm_name (never by name alone).
 
         Args:
             vcenter: the VM's vCenter.
             command: the command line to run in the guest.
-            moref: the VM's moref, or give env_id and vm_name.
+            moref: the VM's moref (with vm_name), or give env_id and vm_name.
             env_id: the environment id, with vm_name.
-            vm_name: the machine's name inside its environment.
+            vm_name: the machine's name; required, and checked against the moref before acting.
             username: guest-OS account; the configured default when omitted.
             password: that account's password; the configured default when omitted.
 
@@ -1124,7 +1134,7 @@ def _register_machine_tools(  # noqa: C901, PLR0915 - one closure per tool
             vcenter: the VM's vCenter.
             moref: the VM's moref, given together with vm_name; or give env_id and vm_name.
             env_id: the environment id, with vm_name.
-            vm_name: the machine's name inside its environment.
+            vm_name: the machine's name; required, and checked against the moref before acting.
 
         """
         name = fleet.resolve(vcenter)
@@ -1157,7 +1167,7 @@ def _register_machine_tools(  # noqa: C901, PLR0915 - one closure per tool
             vcenter: the VM's vCenter.
             moref: the VM's moref, given together with vm_name; or give env_id and vm_name.
             env_id: the environment id, with vm_name.
-            vm_name: the machine's name inside its environment.
+            vm_name: the machine's name; required, and checked against the moref before acting.
 
         """
         name = fleet.resolve(vcenter)
@@ -1186,13 +1196,13 @@ def _register_machine_tools(  # noqa: C901, PLR0915 - one closure per tool
         close it. Reading the BCD runs a read-only command in the guest, so this
         is marked not-read-only.
 
-        Find the VM by moref, or by env_id plus vm_name.
+        Find the VM by moref plus vm_name, or by env_id plus vm_name.
 
         Args:
             vcenter: the VM's vCenter.
-            moref: the VM's moref, or give env_id and vm_name.
+            moref: the VM's moref (with vm_name), or give env_id and vm_name.
             env_id: the environment id, with vm_name.
-            vm_name: the machine's name inside its environment.
+            vm_name: the machine's name; required, and checked against the moref before acting.
             username: guest-OS account for the BCD read; the configured default when omitted.
             password: that account's password; the configured default when omitted.
 
@@ -1239,9 +1249,9 @@ def _register_machine_tools(  # noqa: C901, PLR0915 - one closure per tool
 
         Args:
             vcenter: the VM's vCenter.
-            moref: the VM's moref, or give env_id and vm_name.
+            moref: the VM's moref (with vm_name), or give env_id and vm_name.
             env_id: the environment id, with vm_name.
-            vm_name: the machine's name inside its environment.
+            vm_name: the machine's name; required, and checked against the moref before acting.
             username: guest-OS account; the configured default when omitted.
             password: that account's password; the configured default when omitted.
 
@@ -1286,9 +1296,9 @@ def _register_machine_tools(  # noqa: C901, PLR0915 - one closure per tool
 
         Args:
             vcenter: the VM's vCenter.
-            moref: the VM's moref, or give env_id and vm_name.
+            moref: the VM's moref (with vm_name), or give env_id and vm_name.
             env_id: the environment id, with vm_name.
-            vm_name: the machine's name inside its environment.
+            vm_name: the machine's name; required, and checked against the moref before acting.
             username: guest-OS account; the configured default when omitted.
             password: that account's password; the configured default when omitted.
 
@@ -1327,9 +1337,9 @@ def _register_machine_tools(  # noqa: C901, PLR0915 - one closure per tool
 
         Args:
             vcenter: the VM's vCenter.
-            moref: the VM's moref, or give env_id and vm_name.
+            moref: the VM's moref (with vm_name), or give env_id and vm_name.
             env_id: the environment id, with vm_name.
-            vm_name: the machine's name inside its environment.
+            vm_name: the machine's name; required, and checked against the moref before acting.
             username: guest-OS account; the configured default when omitted.
             password: that account's password; the configured default when omitted.
 
@@ -1613,6 +1623,13 @@ def _register_infrastructure_tools(tool: Callable[..., Any], fleet: VCenterPool,
                     for vm in vms
                     if verdicts[vm.moref].abnormal
                 ][:50],
+                # Not in trouble, but carrying a flag about this host or datastore
+                # (memory reclaimed, host memory pressure, a vCenter alarm).
+                "context_flagged_vms": [
+                    vm.identity() | {"flags": verdicts[vm.moref].flags}
+                    for vm in vms
+                    if not verdicts[vm.moref].abnormal and set(verdicts[vm.moref].flags) & set(CONTEXT_FLAGS)
+                ][:50],
             }
 
         return await fleet.run(name, run)
@@ -1661,6 +1678,13 @@ def _register_infrastructure_tools(tool: Callable[..., Any], fleet: VCenterPool,
                     vm.identity() | {"verdict": verdicts[vm.moref].as_dict()}
                     for vm in vms
                     if verdicts[vm.moref].abnormal
+                ][:50],
+                # Not in trouble, but carrying a flag about this host or datastore
+                # (memory reclaimed, host memory pressure, a vCenter alarm).
+                "context_flagged_vms": [
+                    vm.identity() | {"flags": verdicts[vm.moref].flags}
+                    for vm in vms
+                    if not verdicts[vm.moref].abnormal and set(verdicts[vm.moref].flags) & set(CONTEXT_FLAGS)
                 ][:50],
             }
 
@@ -2036,47 +2060,20 @@ def _register_powerflex_tools(  # noqa: C901, PLR0915 - one closure per tool
         }
 
 
-def _sensor_reading(sensor: Any) -> float | None:
-    """A numeric sensor's reading in its base units, applying its unitModifier."""
-    raw = getattr(sensor, "currentReading", None)
-    if not isinstance(raw, (int, float)) or isinstance(raw, bool):
+def _task_started_by(reason: Any) -> str | None:
+    """Who or what started a task: a user, or the alarm, schedule or system behind it."""
+    if reason is None:
         return None
-    modifier = getattr(sensor, "unitModifier", 0) or 0
-    return round(raw * (10**modifier), 3) if isinstance(modifier, int) else float(raw)
+    if getattr(reason, "userName", None):
+        return reason.userName
+    kind = type(reason).__name__.rsplit(".", 1)[-1].removeprefix("TaskReason").lower()
+    detail = getattr(reason, "alarmName", None) or getattr(reason, "name", None)
+    return f"{kind}: {detail}" if detail else kind
 
 
 def _read_host_sensors(session: VCenterSession, host_moref: str) -> list[dict[str, Any]]:
     """A host's hardware sensors, flattened to {name, type, health, reading}. Read-only."""
-    paths = (
-        "runtime.healthSystemRuntime.systemHealthInfo.numericSensorInfo",
-        "runtime.healthSystemRuntime.hardwareStatusInfo",
-    )
-    rows = session.retrieve(vim.HostSystem, paths, objects=[session.reference("HostSystem", host_moref)])
-    if not rows:
-        return []
-    sensors: list[dict[str, Any]] = [
-        {
-            "name": getattr(sensor, "name", None),
-            "type": getattr(sensor, "sensorType", None),
-            "health": getattr(getattr(sensor, "healthState", None), "key", None),
-            # currentReading is scaled by 10^unitModifier: 4500 with modifier -2 is 45.0.
-            "reading": _sensor_reading(sensor),
-            "unit": getattr(sensor, "baseUnits", None) or None,
-        }
-        for sensor in rows[0].get("runtime.healthSystemRuntime.systemHealthInfo.numericSensorInfo") or []
-    ]
-    hardware_status = rows[0].get("runtime.healthSystemRuntime.hardwareStatusInfo")
-    for group in ("memoryStatusInfo", "cpuStatusInfo", "storageStatusInfo"):
-        sensors.extend(
-            {
-                "name": getattr(item, "name", None),
-                "type": group.removesuffix("StatusInfo"),
-                "health": getattr(getattr(item, "status", None), "key", None),
-                "reading": None,
-            }
-            for item in getattr(hardware_status, group, None) or []
-        )
-    return sensors
+    return hostsensors.read_sensors(session, [host_moref]).get(host_moref, [])
 
 
 def _pick[T](items: Any, wanted: str, keys: Callable[[T], tuple[str, str]]) -> T:
