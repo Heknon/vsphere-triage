@@ -206,7 +206,7 @@ server always matches the skill. Invoke the skill as
 | Tool | What it returns |
 | --- | --- |
 | `list_vcenters` | each configured vCenter: reachable or not, version, clock |
-| `scan` | every VM judged; abnormal VMs grouped by vCenter, cluster, host, datastore, environment folder, its parent folder, base disk and OS, each group against its population; hosts over the CPU threshold, hosts near memory capacity, slow storage |
+| `scan` | every VM judged; abnormal VMs grouped by vCenter, cluster, host, datastore, environment folder, its parent folder, base disk and OS, each group against its population; hosts over the CPU threshold, hosts near memory capacity, hosts whose hardware sensors are red or yellow (with the sensors and how many VMs run there), slow storage |
 | `explain_group` | for one group from a scan: what its abnormal VMs share that the healthy ones do not, and host CPU and storage over their boot window |
 | `diagnose_window` | resets, failed power-ons, host CPU and storage over a past window |
 | `cluster_events` | vSphere HA restarts and VM-monitoring resets, host failures, isolations and lost connections, failed failovers, maintenance mode and migration waves over a window; names the failed host and the hosts VMs restarted onto |
@@ -253,7 +253,7 @@ vCenter session drops mid-call (the error then says the action may have run).
 
 | Tool | What it does |
 | --- | --- |
-| `run_in_guest` | runs a command in the guest OS through VMware Tools and returns its output and exit code; needs Tools running and guest credentials. Output goes to a temp file in the guest, which is downloaded and deleted |
+| `run_in_guest` | runs a command in the guest OS through VMware Tools and returns its output and exit code; needs Tools running, guest credentials, and the VM's name with its moref (as every acting tool does; a mismatch is refused). Output goes to a temp file in the guest, which is downloaded and deleted |
 | `reboot_guest` | asks the guest OS to restart through Tools (a clean shutdown and boot); needs Tools. Requires the VM name together with a moref |
 | `hard_reset` | power-cycles the VM (`ResetVM_Task`) without asking the guest; works on a fully hung VM, but in-flight writes and unwritten crash dumps are lost. Use it only when `reboot_guest` cannot. Requires the VM name together with a moref |
 | `check_ems` | whether the serial console can carry the guest's boot output: serial-port hardware, output already seen, and on Windows the `bcdedit` EMS setting |

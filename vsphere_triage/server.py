@@ -1083,14 +1083,14 @@ def _register_machine_tools(  # noqa: C901, PLR0915 - one closure per tool
         Linux); a command containing the shell's quote character can break the
         wrapping.
 
-        Find the VM by moref, or by env_id plus vm_name (never by name alone).
+        Find the VM by moref plus vm_name, or by env_id plus vm_name (never by name alone).
 
         Args:
             vcenter: the VM's vCenter.
             command: the command line to run in the guest.
-            moref: the VM's moref, or give env_id and vm_name.
+            moref: the VM's moref (with vm_name), or give env_id and vm_name.
             env_id: the environment id, with vm_name.
-            vm_name: the machine's name inside its environment.
+            vm_name: the machine's name; required, and checked against the moref before acting.
             username: guest-OS account; the configured default when omitted.
             password: that account's password; the configured default when omitted.
 
@@ -1134,7 +1134,7 @@ def _register_machine_tools(  # noqa: C901, PLR0915 - one closure per tool
             vcenter: the VM's vCenter.
             moref: the VM's moref, given together with vm_name; or give env_id and vm_name.
             env_id: the environment id, with vm_name.
-            vm_name: the machine's name inside its environment.
+            vm_name: the machine's name; required, and checked against the moref before acting.
 
         """
         name = fleet.resolve(vcenter)
@@ -1167,7 +1167,7 @@ def _register_machine_tools(  # noqa: C901, PLR0915 - one closure per tool
             vcenter: the VM's vCenter.
             moref: the VM's moref, given together with vm_name; or give env_id and vm_name.
             env_id: the environment id, with vm_name.
-            vm_name: the machine's name inside its environment.
+            vm_name: the machine's name; required, and checked against the moref before acting.
 
         """
         name = fleet.resolve(vcenter)
@@ -1196,13 +1196,13 @@ def _register_machine_tools(  # noqa: C901, PLR0915 - one closure per tool
         close it. Reading the BCD runs a read-only command in the guest, so this
         is marked not-read-only.
 
-        Find the VM by moref, or by env_id plus vm_name.
+        Find the VM by moref plus vm_name, or by env_id plus vm_name.
 
         Args:
             vcenter: the VM's vCenter.
-            moref: the VM's moref, or give env_id and vm_name.
+            moref: the VM's moref (with vm_name), or give env_id and vm_name.
             env_id: the environment id, with vm_name.
-            vm_name: the machine's name inside its environment.
+            vm_name: the machine's name; required, and checked against the moref before acting.
             username: guest-OS account for the BCD read; the configured default when omitted.
             password: that account's password; the configured default when omitted.
 
@@ -1249,9 +1249,9 @@ def _register_machine_tools(  # noqa: C901, PLR0915 - one closure per tool
 
         Args:
             vcenter: the VM's vCenter.
-            moref: the VM's moref, or give env_id and vm_name.
+            moref: the VM's moref (with vm_name), or give env_id and vm_name.
             env_id: the environment id, with vm_name.
-            vm_name: the machine's name inside its environment.
+            vm_name: the machine's name; required, and checked against the moref before acting.
             username: guest-OS account; the configured default when omitted.
             password: that account's password; the configured default when omitted.
 
@@ -1296,9 +1296,9 @@ def _register_machine_tools(  # noqa: C901, PLR0915 - one closure per tool
 
         Args:
             vcenter: the VM's vCenter.
-            moref: the VM's moref, or give env_id and vm_name.
+            moref: the VM's moref (with vm_name), or give env_id and vm_name.
             env_id: the environment id, with vm_name.
-            vm_name: the machine's name inside its environment.
+            vm_name: the machine's name; required, and checked against the moref before acting.
             username: guest-OS account; the configured default when omitted.
             password: that account's password; the configured default when omitted.
 
@@ -1337,9 +1337,9 @@ def _register_machine_tools(  # noqa: C901, PLR0915 - one closure per tool
 
         Args:
             vcenter: the VM's vCenter.
-            moref: the VM's moref, or give env_id and vm_name.
+            moref: the VM's moref (with vm_name), or give env_id and vm_name.
             env_id: the environment id, with vm_name.
-            vm_name: the machine's name inside its environment.
+            vm_name: the machine's name; required, and checked against the moref before acting.
             username: guest-OS account; the configured default when omitted.
             password: that account's password; the configured default when omitted.
 
@@ -2060,47 +2060,9 @@ def _register_powerflex_tools(  # noqa: C901, PLR0915 - one closure per tool
         }
 
 
-def _sensor_reading(sensor: Any) -> float | None:
-    """A numeric sensor's reading in its base units, applying its unitModifier."""
-    raw = getattr(sensor, "currentReading", None)
-    if not isinstance(raw, (int, float)) or isinstance(raw, bool):
-        return None
-    modifier = getattr(sensor, "unitModifier", 0) or 0
-    return round(raw * (10**modifier), 3) if isinstance(modifier, int) else float(raw)
-
-
 def _read_host_sensors(session: VCenterSession, host_moref: str) -> list[dict[str, Any]]:
     """A host's hardware sensors, flattened to {name, type, health, reading}. Read-only."""
-    paths = (
-        "runtime.healthSystemRuntime.systemHealthInfo.numericSensorInfo",
-        "runtime.healthSystemRuntime.hardwareStatusInfo",
-    )
-    rows = session.retrieve(vim.HostSystem, paths, objects=[session.reference("HostSystem", host_moref)])
-    if not rows:
-        return []
-    sensors: list[dict[str, Any]] = [
-        {
-            "name": getattr(sensor, "name", None),
-            "type": getattr(sensor, "sensorType", None),
-            "health": getattr(getattr(sensor, "healthState", None), "key", None),
-            # currentReading is scaled by 10^unitModifier: 4500 with modifier -2 is 45.0.
-            "reading": _sensor_reading(sensor),
-            "unit": getattr(sensor, "baseUnits", None) or None,
-        }
-        for sensor in rows[0].get("runtime.healthSystemRuntime.systemHealthInfo.numericSensorInfo") or []
-    ]
-    hardware_status = rows[0].get("runtime.healthSystemRuntime.hardwareStatusInfo")
-    for group in ("memoryStatusInfo", "cpuStatusInfo", "storageStatusInfo"):
-        sensors.extend(
-            {
-                "name": getattr(item, "name", None),
-                "type": group.removesuffix("StatusInfo"),
-                "health": getattr(getattr(item, "status", None), "key", None),
-                "reading": None,
-            }
-            for item in getattr(hardware_status, group, None) or []
-        )
-    return sensors
+    return hostsensors.read_sensors(session, [host_moref]).get(host_moref, [])
 
 
 def _pick[T](items: Any, wanted: str, keys: Callable[[T], tuple[str, str]]) -> T:

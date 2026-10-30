@@ -3068,7 +3068,7 @@ def test_a_busy_window_is_read_in_pieces_not_cut_to_its_last_minutes() -> None:
 
 
 def test_no_sensor_data_is_unknown_and_readings_are_scaled() -> None:
-    from vsphere_triage.server import _sensor_reading  # noqa: PLC0415
+    _sensor_reading = hostsensors._reading
 
     assert _sensor_reading(SimpleNamespace(currentReading=4500, unitModifier=-2)) == 45.0
     assert _sensor_reading(SimpleNamespace(currentReading=None, unitModifier=0)) is None
@@ -3915,3 +3915,67 @@ def test_a_scan_re_judges_a_vm_rebooted_inside_the_guest_from_its_vmware_log() -
     assert machine.boot_source == "vmware_log"
     assert verdicts["vm-7"].state == checks.BOOTING
     assert "1 had rebooted" in notes[0]
+
+
+def test_a_scan_names_hosts_whose_hardware_sensors_are_red() -> None:
+    fleet = [vm(moref=f"vm-{index}", host="esx-1", host_moref="host-1") for index in range(3)]
+    result = scan_of(fleet)
+    vscan = result.vcenters["vc-a"]
+    vscan.inventory.hosts["host-1"] = HostFacts("host-1", "esx-1", None, "connected", False, None, None, None)
+    vscan.hardware = {
+        "host-1": hostsensors.classify_sensors(
+            [
+                {"name": "Power Supply 2", "type": "power", "health": "red"},
+                {"name": "Fan 1", "health": "green"},
+            ]
+        )
+    }
+
+    summary = scan.summary(result, limit=10)
+
+    assert summary["hosts_with_hardware_problems"][0]["red"] == ["Power Supply 2"]
+    assert summary["hosts_with_hardware_problems"][0]["powered_on_vms"] == 3
+    assert any("Power Supply 2" in finding for finding in summary["findings"])
+
+
+def test_red_host_sensors_are_evidence_in_a_diagnosis() -> None:
+    machine = vm(cpu_mhz=3600.0)
+    result = diagnose.conclude(
+        checks.classify(machine, LIMITS),
+        vm=machine,
+        cpu={"findings": [], "starved": False},
+        disk={"findings": [], "slow": False, "datastores": []},
+        environment={"signals": []},
+        logs={"available": False},
+        serial={"available": False},
+        console={"available": False},
+        host_log={"available": False},
+        host_hardware=hostsensors.classify_sensors(
+            [{"name": "CPU1 Temp", "type": "temperature", "health": "red"}]
+        ),
+    )
+
+    hardware = next(cause for cause in result["causes"] if cause["cause"] == diagnose.HOST_HARDWARE)
+    assert "CPU1 Temp" in hardware["for"][0]
+
+
+def test_sensors_are_read_for_many_hosts_in_one_call() -> None:
+    calls = []
+    sensor = SimpleNamespace(
+        name="PSU 1",
+        sensorType="power",
+        healthState=SimpleNamespace(key="red"),
+        currentReading=1,
+        unitModifier=0,
+    )
+
+    def retrieve(_kind: object, paths: tuple, objects: list) -> list:
+        calls.append(objects)
+        return [{"moref": ref, hostsensors.SENSOR_PATHS[0]: [sensor]} for ref in objects]
+
+    session = SimpleNamespace(retrieve=retrieve, reference=lambda _kind, moref: moref)
+
+    found = hostsensors.read_sensors(session, ["host-1", "host-2"])
+
+    assert len(calls) == 1
+    assert found["host-2"][0]["health"] == "red"

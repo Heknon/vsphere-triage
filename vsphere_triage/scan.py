@@ -42,6 +42,7 @@ from vsphere_triage.checks import (
 from vsphere_triage.config import NotFoundError
 from vsphere_triage.contention import hosts_cpu, storage
 from vsphere_triage.diagnose import boot_from_vmware_log
+from vsphere_triage.hostsensors import classify_sensors, read_sensors
 from vsphere_triage.inventory import (
     HostFacts,
     Inventory,
@@ -104,6 +105,8 @@ class VCenterScan:
     hosts: dict[str, dict[str, Any]]
     storage: dict[str, Any] | None
     notes: list[str] = field(default_factory=list)
+    # Hardware sensor verdicts of the hosts read, by host moref.
+    hardware: dict[str, dict[str, Any]] = field(default_factory=dict)
 
 
 @dataclass
@@ -147,7 +150,7 @@ class ScanStore:
             raise NotFoundError(msg) from None
 
 
-def scan_vcenter(session: VCenterSession, settings: Settings) -> VCenterScan:
+def scan_vcenter(session: VCenterSession, settings: Settings) -> VCenterScan:  # noqa: C901 - one read per source, each optional
     """Read and judge one vCenter. Blocking: runs in a worker thread."""
     thresholds = settings.thresholds
     notes = []
@@ -191,6 +194,14 @@ def scan_vcenter(session: VCenterSession, settings: Settings) -> VCenterScan:
     except Exception as error:  # noqa: BLE001
         hosts = {}
         notes.append(f"host CPU not read ({type(error).__name__})")
+    hardware: dict[str, dict[str, Any]] = {}
+    try:
+        sensors = read_sensors(session, [host.moref for host in live_hosts])
+        hardware = {moref: classify_sensors(found) for moref, found in sensors.items()}
+    except vim.fault.NotAuthenticated:
+        raise  # the session expired: let the pool re-login and run the scan again
+    except Exception as error:  # noqa: BLE001
+        notes.append(f"host hardware sensors not read ({type(error).__name__})")
     store_report = None
     try:
         store_report = storage(
@@ -206,7 +217,7 @@ def scan_vcenter(session: VCenterSession, settings: Settings) -> VCenterScan:
         raise  # the session expired: let the pool re-login and run the scan again
     except Exception as error:  # noqa: BLE001
         notes.append(f"storage counters not read ({type(error).__name__})")
-    return VCenterScan(inventory, verdicts, hosts, store_report, notes)
+    return VCenterScan(inventory, verdicts, hosts, store_report, notes, hardware)
 
 
 # States that rest on uptime: a VM rebooted inside the guest looks long-stuck in
@@ -413,6 +424,33 @@ def summary(scan: Scan, *, states: Sequence[str] = FLAGGED, limit: int) -> dict[
         for host in vscan.inventory.hosts.values()
         if host.connection_state not in (None, "connected")
     ]
+    vms_on_host = Counter(
+        (name, vm.host_moref)
+        for name, vscan in scan.vcenters.items()
+        for vm in vscan.inventory.vms
+        if vm.powered_on
+    )
+    failing_hardware: list[dict[str, Any]] = [
+        {
+            "vcenter": name,
+            "name": vscan.inventory.hosts[moref].name if moref in vscan.inventory.hosts else moref,
+            "moref": moref,
+            "red": [sensor.get("name") for sensor in verdict["red"]][:10],
+            "yellow": [sensor.get("name") for sensor in verdict["yellow"]][:10],
+            "powered_on_vms": vms_on_host.get((name, moref), 0),
+        }
+        for name, vscan in scan.vcenters.items()
+        for moref, verdict in vscan.hardware.items()
+        if verdict["healthy"] is False
+    ]
+    # Red before yellow, then the hosts carrying the most VMs.
+    failing_hardware.sort(key=lambda host: (not host["red"], -int(host["powered_on_vms"])))
+    hardware_unjudged = sum(
+        1
+        for vscan in scan.vcenters.values()
+        for verdict in vscan.hardware.values()
+        if verdict["healthy"] is None
+    )
     flag_counts: Counter[str] = Counter(flag for _, verdict in everything for flag in verdict.flags)
     slow_storage = [
         finding
@@ -469,6 +507,23 @@ def summary(scan: Scan, *, states: Sequence[str] = FLAGGED, limit: int) -> dict[
                 for host in not_connected[:HOSTS_LISTED]
             )
         )
+    if failing_hardware:
+        listed = "; ".join(
+            f"{host['vcenter']}:{host['name']} ("
+            + (
+                f"red: {', '.join(map(str, host['red']))}"
+                if host["red"]
+                else f"yellow: {', '.join(map(str, host['yellow']))}"
+            )
+            + f"; {host['powered_on_vms']} VMs)"
+            for host in failing_hardware[:HOSTS_LISTED]
+        )
+        findings.append(f"{len(failing_hardware)} host(s) report hardware sensors red or yellow: {listed}")
+    if hardware_unjudged:
+        findings.append(
+            f"{hardware_unjudged} host(s) report no usable hardware sensor data (no CIM provider, or all "
+            "unknown): their hardware is not judged"
+        )
     findings.extend(
         f"{count} VM(s) flagged {flag}: {FLAG_MEANING[flag]}"
         for flag, count in flag_counts.most_common()
@@ -497,6 +552,7 @@ def summary(scan: Scan, *, states: Sequence[str] = FLAGGED, limit: int) -> dict[
         "hosts_over_cpu_threshold": overcommitted,
         "hosts_near_memory_capacity": memory_pressed,
         "hosts_not_connected": not_connected,
+        "hosts_with_hardware_problems": failing_hardware,
         "storage_findings": slow_storage,
         "vcenters": {
             name: {
@@ -520,6 +576,13 @@ def summary(scan: Scan, *, states: Sequence[str] = FLAGGED, limit: int) -> dict[
             "diagnose_vm on its representatives"
         ),
     }
+
+
+def _sensor_names(host: dict[str, Any]) -> str:
+    """The failing sensors of a host, red ones when it has any."""
+    red: list[Any] = host["red"]
+    yellow: list[Any] = host["yellow"]
+    return f"red: {', '.join(map(str, red))}" if red else f"yellow: {', '.join(map(str, yellow))}"
 
 
 def _window_since(boots: list[datetime], now: datetime) -> tuple[datetime, datetime]:

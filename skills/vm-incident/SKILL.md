@@ -98,7 +98,10 @@ Seven tools change a VM or run code in it: `run_in_guest`, `reboot_guest`,
 `investigate_linux_boot` and `read_crash_dump`. Use them only when the
 read-only evidence leaves a gap that matters to the verdict, and record in the
 verdict what you ran. They need VMware Tools running in the guest (except
-`hard_reset`) and, for the guest-command ones, guest credentials.
+`hard_reset`) and, for the guest-command ones, guest credentials. Each one
+needs the VM's name with its moref (or the environment id with the name) and
+refuses when the VM at that moref has another name: morefs repeat across
+vCenters.
 
 **`run_in_guest`** runs one command in the guest OS and returns its output and
 exit code. Use it for a question only the guest can answer: is it responsive,
@@ -117,8 +120,7 @@ on Windows, the bugcheck its next boot records. In this order:
    bring the VM back. If the current state is evidence (a pending question, a
    dump being written), capture the console, serial console and events first.
 
-Both power tools need the VM's name with its moref, and refuse a VM that is
-powered off; a powered-off VM is powered on by your orchestrator or in
+Both power tools refuse a VM that is powered off; a powered-off VM is powered on by your orchestrator or in
 vCenter. After the reboot, read `get_boot_timeline` and `read_serial_console`
 again. A reboot is a diagnostic step, not a fix: on a starved host or a
 saturated datastore the VM will stall again on the way up.

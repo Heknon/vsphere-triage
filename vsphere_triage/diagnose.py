@@ -49,6 +49,7 @@ from vsphere_triage.checks import (
 )
 from vsphere_triage.console import read_captures
 from vsphere_triage.contention import hosts_cpu, storage, vm_cpu
+from vsphere_triage.hostsensors import classify_sensors, read_sensors
 from vsphere_triage.inventory import (
     DEVICE_PATH,
     VM_PATHS,
@@ -95,6 +96,7 @@ PAUSED_CAUSE = "the VM is paused"
 MEMORY = "memory pressure (the host ballooning or swapping the VM)"
 DATASTORE_CAPACITY = "its datastore is full or unreachable (APD/PDL)"
 HOST_DISCONNECTED = "its ESXi host is not connected to vCenter"
+HOST_HARDWARE = "its ESXi host reports failing hardware"
 
 DIAGNOSE_PATHS = (
     *VM_PATHS,
@@ -205,8 +207,16 @@ def locate(  # noqa: C901, PLR0911, PLR0912 - one lookup, each way it can fail b
     `strict=True` is for the tools that act on a VM (a guest command, a reboot, a
     reset): a moref whose name differs from the `vm_name` given is refused rather
     than noted, and the environment folder and the VM name must match exactly, so
-    a typo never lands the action on a neighbouring VM.
+    a typo never lands the action on a neighbouring VM. A moref alone is refused
+    too: morefs repeat across vCenters (vm-1001 on each), so one paired with the
+    wrong vCenter would act on some other VM; its name must come with it.
     """
+    if strict and moref and not vm_name:
+        return {
+            "found": False,
+            "reason": "acting on a VM needs its name with its moref (morefs repeat across vCenters); "
+            "pass vm_name too, so the right VM is checked before anything is run or sent",
+        }
     layout = Layout.of(session)
     if moref:
         found = read_vms(session, layout, objects=[session.reference("VirtualMachine", moref)])
@@ -613,6 +623,7 @@ def conclude(  # noqa: C901, PLR0912, PLR0913, PLR0915 - one ordered list of cau
     host_log: dict[str, Any],
     snapshots: dict[str, Any] | None = None,
     consolidation_needed: bool = False,
+    host_hardware: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     """Weigh the evidence into causes, strongest first, with what argues against each."""
     causes: dict[str, dict[str, Any]] = {}
@@ -665,6 +676,15 @@ def conclude(  # noqa: C901, PLR0912, PLR0913, PLR0915 - one ordered list of cau
         evidence(MEMORY, weight=2, text=f"its host is at {values.get('host_memory_percent')}% of memory")
     if HOST_NOT_CONNECTED in verdict.flags:
         evidence(HOST_DISCONNECTED, weight=3, text="vCenter reports the host not connected")
+    hardware = host_hardware or {}
+    if hardware.get("red"):
+        # A red sensor (a power supply, a temperature, a DIMM) can throttle or stall
+        # every VM on the host while its CPU and memory numbers look normal.
+        names = ", ".join(sorted({str(sensor.get("name")) for sensor in hardware["red"]})[:5])
+        evidence(HOST_HARDWARE, weight=3, text=f"host hardware sensors red: {names}")
+    elif hardware.get("yellow"):
+        names = ", ".join(sorted({str(sensor.get("name")) for sensor in hardware["yellow"]})[:5])
+        evidence(HOST_HARDWARE, weight=1, text=f"host hardware sensors yellow: {names}")
     if HEARTBEAT_INTERMITTENT in verdict.flags:
         evidence(TOOLS_FLAPPING_CAUSE, weight=2, text="Tools runs but its heartbeat is intermittent (yellow)")
     if CPU_LIMITED in verdict.flags and verdict.state in (BUSY_NOT_UP, HUNG, BOOTED_NOT_UP):
@@ -1102,6 +1122,14 @@ def diagnose_vm(
         if host
         else {"available": False, "reason": "the VM's host is not known"}
     )
+    host_hardware = (
+        piece(
+            "host hardware",
+            lambda: classify_sensors(read_sensors(session, [host.moref]).get(host.moref, [])),
+        )
+        if host
+        else {"available": False, "reason": "the VM's host is not known"}
+    )
     serial = piece("serial console", lambda: read_serial_files(session, vm))
     console = (
         piece(
@@ -1126,6 +1154,7 @@ def diagnose_vm(
         host_log=host_log,
         snapshots=snapshots,
         consolidation_needed=vm.consolidation_needed,
+        host_hardware=host_hardware,
     )
     return {
         "found": True,
@@ -1155,6 +1184,7 @@ def diagnose_vm(
         "serial_console": serial,
         "console": console,
         "host_log": host_log,
+        "host_hardware": host_hardware,
         "snapshots": snapshots or {"count": 0},
         "events": summarize_events(raw_events) if "events" in events else events,
         # Stronger sources this diagnosis lacked: name them so a reader does not

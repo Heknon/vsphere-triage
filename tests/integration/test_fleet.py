@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import json
 from typing import TYPE_CHECKING, Any
 
 import pytest
@@ -506,11 +507,36 @@ def test_run_in_guest_refuses_a_guest_without_tools(
     result = call(
         server,
         "run_in_guest",
-        {"vcenter": "vc-a", "moref": moref, "command": "echo a", "username": "u", "password": "p"},
+        {
+            "vcenter": "vc-a",
+            "moref": moref,
+            "vm_name": "web-01",
+            "command": "echo a",
+            "username": "u",
+            "password": "p",
+        },
     )
 
     assert result["ran"] is False
     assert "Tools is not running" in result["reason"]
+
+
+@pytest.mark.parametrize(
+    "tool",
+    ["run_in_guest", "check_ems", "investigate_windows_boot", "investigate_linux_boot", "read_crash_dump"],
+)
+def test_a_guest_tool_refuses_a_moref_without_the_vm_name(
+    server: MCPServer, worlds: tuple[scenario.World, ...], tool: str
+) -> None:
+    moref = worlds[0].moref("environments/env-1001", "web-01")
+    arguments = {"vcenter": "vc-a", "moref": moref, "username": "u", "password": "p"}
+    if tool == "run_in_guest":
+        arguments["command"] = "echo a"
+
+    result = call(server, tool, arguments)
+
+    assert result.get("ran") is not True
+    assert "needs its name with its moref" in json.dumps(result)
 
 
 def test_guest_exec_never_dirties_the_read_only_surface(

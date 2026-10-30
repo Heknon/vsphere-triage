@@ -34,7 +34,7 @@ Each VM has exactly one state. The state is the symptom; the cause is below.
 | **Linked-clone boot storm** | many clones of one base disk stuck together, clones of other bases fine, the shared datastore slow | clones of the same base booted fine at the same time |
 | **Host memory pressure** | the host near memory capacity; the VM ballooned, swapped or compressed (`memory_reclaimed`) | host memory fine; nothing reclaimed |
 | **A configured memory limit** | the `memory_limited` flag, or `find_resource_limits`: a limit below the VM's RAM forces ballooning or swapping even when the host has memory | no limit, or a limit at or above the VM's RAM |
-| **A failing host** | `get_host_health` shows a red hardware sensor (power supply, fan, temperature, memory); or `cluster_events` shows the host failed, was isolated or lost its connection | sensors green; the host connected throughout |
+| **A failing host** | `scan`'s `hosts_with_hardware_problems`, `diagnose_vm`'s `host_hardware` or `get_host_health` shows a red hardware sensor (power supply, fan, temperature, memory): an overheating or power-limited host throttles its VMs while its CPU numbers look normal; or `cluster_events` shows the host failed, was isolated or lost its connection | sensors green; the host connected throughout |
 | **HA restarted the VMs** | `cluster_events` shows vSphere HA restarted them after a host failed; the VMs rebooting is expected | no HA restart in the window |
 | **Pending VM question** | `runtime.question` is set, with its choices | no question |
 | **A virtual device blocks the boot** | `get_vm_hardware` or `diagnose_vm`: a disconnected boot NIC (PXE/DHCP fails), an ISO left mounted, a device in error | every device connected and healthy |
