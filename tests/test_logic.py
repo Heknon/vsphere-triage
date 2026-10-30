@@ -3081,3 +3081,47 @@ def test_a_missing_minidump_folder_is_told_apart_from_no_dump() -> None:
 
     assert "does not exist" in crashdump.decode_dump({"found": False, "folder": False})["reason"]
     assert "could not be opened" in crashdump.decode_dump({"found": False, "unreadable": "x.dmp"})["reason"]
+
+
+# -- review of main, round three ----------------------------------------------------------------
+
+
+@pytest.mark.parametrize(
+    ("kind", "message", "bucket"),
+    [
+        (
+            "com.vmware.vc.HA.ClusterFailoverActionCompletedEvent",
+            "vSphere HA completed a failover action",
+            None,
+        ),
+        (
+            "com.vmware.vc.HA.ClusterFailoverActionInitiatedEvent",
+            "vSphere HA initiated a failover action",
+            None,
+        ),
+        ("AlarmStatusChangedEvent", "Alarm 'Host connection failure' on h1 changed from Green to Red", None),
+        (
+            "DasHostFailedEvent",
+            "A possible host failure has been detected by vSphere HA on esx-1",
+            "host_failure",
+        ),
+        ("DasHostIsolatedEvent", "Host esx-1 has been isolated from cluster c1", "host_isolation"),
+    ],
+)
+def test_a_completed_failover_and_alarms_are_not_failures(
+    kind: str, message: str, bucket: str | None
+) -> None:
+    from vsphere_triage import clusterevents  # noqa: PLC0415
+
+    hit = clusterevents.classify_event(kind, message)
+
+    assert (hit[0] if hit else None) == bucket
+
+
+def test_a_32_bit_dump_is_not_decoded_with_64_bit_offsets() -> None:
+    from vsphere_triage import crashdump  # noqa: PLC0415
+
+    decoded = crashdump.decode_dump({"found": True, "name": "x.dmp", "signature": "PAGEDUMP", "code": 0x1E})
+
+    assert decoded["bugcheck"] is None
+    assert "PAGEDU64" in decoded["note"]

@@ -205,17 +205,20 @@ async def check_ems(
     secret = password or settings.guest_password
 
     # Found first, in a read that may be retried; the guest command below never is.
-    pre_located = await pool.run(
-        name,
-        lambda session: locate(session, settings, env_id=env_id, vm_name=vm_name, moref=moref, strict=True),
-    )
+    def find(session: VCenterSession) -> tuple[dict[str, Any], dict[str, Any]]:
+        located = locate(session, settings, env_id=env_id, vm_name=vm_name, moref=moref, strict=True)
+        serial = read_serial_files(session, located["vm"]) if located["found"] else {}
+        return located, serial
+
+    # The VM and its serial files are reads, so they may be retried; only the guest
+    # command below never is.
+    pre_located, serial = await pool.run(name, find)
 
     def work(session: VCenterSession) -> dict[str, Any]:
         located = pre_located
         if not located["found"]:
             return {"found": False, "reason": located["reason"]}
         vm = located["vm"]
-        serial = read_serial_files(session, vm)
         ems_output_seen = any(
             file.get("ems_output_seen") for file in serial.get("files", []) if file.get("available")
         )

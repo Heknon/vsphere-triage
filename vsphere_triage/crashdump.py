@@ -58,7 +58,7 @@ def dump_probe_powershell() -> str:
     )
 
 
-def decode_dump(parsed: dict[str, Any]) -> dict[str, Any]:
+def decode_dump(parsed: dict[str, Any]) -> dict[str, Any]:  # noqa: PLR0911 - one answer per way the read can go
     """Decode the probe JSON: bugcheck code to its name and layer, parameters to hex. Pure."""
     if not parsed:
         return {
@@ -86,6 +86,16 @@ def decode_dump(parsed: dict[str, Any]) -> dict[str, Any]:
         }
     if not parsed.get("found"):
         return {"found": False, "reason": r"no minidump found in C:\Windows\Minidump"}
+    if parsed.get("signature") not in (None, "PAGEDU64"):
+        # The offsets read are DUMP_HEADER64's; a 32-bit (PAGEDUMP) header puts the
+        # bugcheck elsewhere, so decoding it would name a wrong stop code.
+        return {
+            "found": True,
+            "dump": parsed.get("name"),
+            "signature": parsed.get("signature"),
+            "bugcheck": None,
+            "note": "not a 64-bit kernel dump (PAGEDU64); its header is not decoded — open it in WinDbg",
+        }
     code = parsed.get("code")
     name, points_at = (None, None)
     if isinstance(code, int):

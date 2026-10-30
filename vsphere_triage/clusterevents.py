@@ -30,51 +30,59 @@ BUCKETS: tuple[tuple[str, str, re.Pattern[str]], ...] = (
         # vCenter 6.x-8 logs this as an EventEx, com.vmware.vc.ha.VmRestartedByHAEvent,
         # whose message reads "vSphere HA restarted virtual machine ...".
         re.compile(
-            r"(?i)(restarted by (vsphere )?ha|VmRestartedByHaEvent|ha restarted|das.*restart|"
-            r"VmRestartedOnAlternateHost)"
+            r"(?i)(\brestarted by (vsphere )?HA\b|\bVmRestartedByHAEvent\b|\bvSphere HA restarted\b|"
+            r"\bVmRestartedOnAlternateHostEvent\b)"
         ),
     ),
     (
         "ha_vm_monitoring_reset",
         "vSphere HA reset a VM whose guest heartbeat stopped (VM monitoring) — the guest hung",
-        re.compile(r"(?i)(VmDasBeingResetEvent|reset by (vsphere )?ha|ha.*vm.*monitoring.*reset)"),
+        re.compile(r"(?i)(\bVmDasBeingResetEvent\b|\breset by vSphere HA\b|\bvSphere HA reset\b)"),
     ),
     (
         # Before host_isolation: "failed restart after isolation" is a failover failure.
+        # Anchored phrases only: a *completed* failover ("ClusterFailoverActionCompleted",
+        # "completed a failover action") holds both "failover" and "fail".
         "vm_failover_failed",
         "a VM could not be restarted or powered on (HA failover may have failed)",
         re.compile(
-            r"(?i)(FailedToPowerOn|failover.*fail|insufficient.*failover|not.*enough.*resources|"
-            r"FailedRestartAfterIsolation|vmrestartedbyha.*fail)"
+            r"(?i)(\bVmFailedToPowerOnEvent\b|\bFailedRestartAfterIsolation\w*|\bVmFailoverFailed\b|"
+            r"\bfailover (was )?(failed|unsuccessful)\b|\bvSphere HA (could not|cannot|failed to) restart\b|"
+            r"\binsufficient (failover )?resources\b)"
         ),
     ),
     (
         # Before host_isolation: a missing redundant management link is a config warning.
         "host_no_redundant_management",
         "a host has no redundant management network (a configuration warning, not an outage)",
-        re.compile(r"(?i)(NoRedundantManagement|no.*redundan.*management)"),
+        re.compile(r"(?i)(NoRedundantManagement|\bno management network redundancy\b)"),
     ),
     (
         "host_isolation",
         "a host was isolated from the management network (HA may have acted)",
-        re.compile(r"(?i)(isolat|HostIsolated)"),
+        re.compile(r"(?i)(\bHostIsolated\w*|\bhost .* is isolated\b|\bnetwork isolation\b|\bisolated\b)"),
     ),
     (
         # Before host_failure: HostConnectionLostEvent's own message reads "Host X is
         # not responding", which is vCenter losing the host, not the host failing.
         "host_connection_lost",
         "a host lost its connection to vCenter",
-        re.compile(r"(?i)(connection.*lost|HostConnectionLost|host .*disconnected|not responding)"),
+        re.compile(
+            r"(?i)(\bHostConnectionLostEvent\b|\bHostDisconnectedEvent\b|\bconnection .*lost\b|"
+            r"\bis not responding\b|\bdisconnected from\b)"
+        ),
     ),
     (
         "host_failure",
         "a host failed (vSphere HA declared it failed)",
-        re.compile(r"(?i)(HostFailed|DasHostFailed|ha.*host.*fail)"),
+        re.compile(
+            r"(?i)(\bDasHostFailedEvent\b|\bHostFailedEvent\b|\bvSphere HA detected .*host .*failed\b)"
+        ),
     ),
     (
         "host_maintenance",
         "a host entered maintenance mode (its VMs were migrated or powered off)",
-        re.compile(r"(?i)(entered maintenance|EnteredMaintenanceMode|EnteringMaintenance)"),
+        re.compile(r"(?i)(\bentered maintenance mode\b|\bEnteredMaintenanceModeEvent\b)"),
     ),
     (
         "drs_migration",
@@ -84,10 +92,15 @@ BUCKETS: tuple[tuple[str, str, re.Pattern[str]], ...] = (
         re.compile(r"(?i)\b(DrsVmMigratedEvent|VmMigratedEvent)\b"),
     ),
 )
+# Alarm transitions quote the alarm's own name ("Host connection failure ... Green
+# to Red"); they are alarms, not cluster events, and are not bucketed here.
+_SKIPPED_TYPES = re.compile(r"(?i)\bAlarm\w*Event\b")
 
 
 def classify_event(type_name: str, message: str) -> tuple[str, str] | None:
     """The (bucket, meaning) a cluster event falls in, or None if it is not one we track."""
+    if _SKIPPED_TYPES.search(type_name):
+        return None
     text = f"{type_name} {message}"
     for name, meaning, pattern in BUCKETS:
         if pattern.search(text):
