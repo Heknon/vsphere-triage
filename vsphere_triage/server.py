@@ -208,6 +208,17 @@ def _clock(moment: datetime | None) -> str:
     return moment.strftime("%Y-%m-%d %H:%M:%SZ") if moment else "unknown"
 
 
+CAP_NOTE = (
+    "even split into {n} reads, part of the window still held over 1000 events, so the oldest events "
+    "of that part are missing: narrow the window for a complete count"
+)
+
+
+def _event_type(event: Any) -> str:
+    """An event's type as vCenter names it: an EventEx's eventTypeId, else its class."""
+    return getattr(event, "eventTypeId", None) or type(event).__name__.rsplit(".", 1)[-1]
+
+
 def _ordered(begin: datetime, end: datetime) -> tuple[datetime, datetime]:
     """A window whose start is before its end, or an error that says so."""
     if begin >= end:
@@ -416,14 +427,16 @@ def _register_fleet_tools(  # noqa: C901, PLR0915 - one closure per tool
         """
         name = fleet.resolve(vcenter)
 
+        minutes = int(_ago(minutes=minutes).total_seconds() // 60)
+
         def run(session: VCenterSession) -> dict[str, Any]:
             now = session.now()
-            events = session.events(
+            events, cut = session.events_covering(
                 begin=now - timedelta(minutes=minutes), end=now, types=connhistory.SESSION_EVENT_TYPES
             )
             rows = [
                 {
-                    "type": type(event).__name__,
+                    "type": _event_type(event),
                     "time": getattr(event, "createdTime", None),
                     "user": getattr(event, "userName", None),
                     "source": getattr(event, "ipAddress", None),
@@ -431,6 +444,8 @@ def _register_fleet_tools(  # noqa: C901, PLR0915 - one closure per tool
                 for event in events
             ]
             summary = connhistory.summarize_session_events(rows, now=now, window_minutes=minutes)
+            if cut:
+                summary["findings"] = [*summary.get("findings", []), CAP_NOTE.format(n=16)]
             return {"vcenter": session.vcenter.name, "live_sessions": session.session_count()} | summary
 
         result = await fleet.run(name, run)
@@ -454,13 +469,16 @@ def _register_fleet_tools(  # noqa: C901, PLR0915 - one closure per tool
 
         """
         names = _names(fleet, vcenters)
+        minutes = int(_ago(minutes=minutes).total_seconds() // 60)
 
         def run(session: VCenterSession) -> dict[str, Any]:
             now = session.now()
-            events = session.events(begin=now - timedelta(minutes=minutes), end=now)
+            # Every event type is read (HA's are EventEx ids that vary by version), so
+            # a busy vCenter fills one QueryEvents answer fast: read it in pieces.
+            events, cut = session.events_covering(begin=now - timedelta(minutes=minutes), end=now)
             rows = [
                 {
-                    "type": type(event).__name__,
+                    "type": _event_type(event),
                     "time": getattr(event, "createdTime", None),
                     "message": getattr(event, "fullFormattedMessage", "") or "",
                     "host": getattr(getattr(event, "host", None), "name", None),
@@ -468,13 +486,15 @@ def _register_fleet_tools(  # noqa: C901, PLR0915 - one closure per tool
                 }
                 for event in events
             ]
-            return {"vcenter": session.vcenter.name} | clusterevents.summarize_cluster_events(
-                rows, now=now, window_minutes=minutes
-            )
+            summary = clusterevents.summarize_cluster_events(rows, now=now, window_minutes=minutes)
+            if cut:
+                summary["findings"] = [*summary["findings"], CAP_NOTE.format(n=16)]
+            return {"vcenter": session.vcenter.name, "events_read": len(rows), "events_cut": cut} | summary
 
         results = await asyncio.gather(*(fleet.run(name, run) for name in names), return_exceptions=True)
         rows = [
-            result if not isinstance(result, BaseException) else {"error": str(result)} for result in results
+            result if not isinstance(result, BaseException) else {"vcenter": name, "error": str(result)}
+            for name, result in zip(names, results, strict=True)
         ]
         return {"vcenters": rows}
 
@@ -493,10 +513,13 @@ def _register_fleet_tools(  # noqa: C901, PLR0915 - one closure per tool
 
         """
         name = fleet.resolve(vcenter)
+        minutes = int(_ago(minutes=minutes).total_seconds() // 60)
 
         def run(session: VCenterSession) -> dict[str, Any]:
             now = session.now()
-            events = session.events(begin=now - timedelta(minutes=minutes), end=now, types=("TaskEvent",))
+            events, cut = session.events_covering(
+                begin=now - timedelta(minutes=minutes), end=now, types=("TaskEvent",)
+            )
             rows = []
             for event in events:
                 info = getattr(event, "info", None)
@@ -512,9 +535,10 @@ def _register_fleet_tools(  # noqa: C901, PLR0915 - one closure per tool
                         "user": getattr(reason, "userName", None) or getattr(event, "userName", None),
                     }
                 )
-            return {"vcenter": session.vcenter.name} | taskhistory.summarize_tasks(
-                rows, now=now, window_minutes=minutes
-            )
+            summary = taskhistory.summarize_tasks(rows, now=now, window_minutes=minutes)
+            if cut:
+                summary["findings"] = [*summary["findings"], CAP_NOTE.format(n=16)]
+            return {"vcenter": session.vcenter.name} | summary
 
         return await fleet.run(name, run)
 
@@ -1956,6 +1980,15 @@ def _register_powerflex_tools(  # noqa: C901, PLR0915 - one closure per tool
         }
 
 
+def _sensor_reading(sensor: Any) -> float | None:
+    """A numeric sensor's reading in its base units, applying its unitModifier."""
+    raw = getattr(sensor, "currentReading", None)
+    if not isinstance(raw, (int, float)) or isinstance(raw, bool):
+        return None
+    modifier = getattr(sensor, "unitModifier", 0) or 0
+    return round(raw * (10**modifier), 3) if isinstance(modifier, int) else float(raw)
+
+
 def _read_host_sensors(session: VCenterSession, host_moref: str) -> list[dict[str, Any]]:
     """A host's hardware sensors, flattened to {name, type, health, reading}. Read-only."""
     paths = (
@@ -1970,7 +2003,9 @@ def _read_host_sensors(session: VCenterSession, host_moref: str) -> list[dict[st
             "name": getattr(sensor, "name", None),
             "type": getattr(sensor, "sensorType", None),
             "health": getattr(getattr(sensor, "healthState", None), "key", None),
-            "reading": getattr(sensor, "currentReading", None),
+            # currentReading is scaled by 10^unitModifier: 4500 with modifier -2 is 45.0.
+            "reading": _sensor_reading(sensor),
+            "unit": getattr(sensor, "baseUnits", None) or None,
         }
         for sensor in rows[0].get("runtime.healthSystemRuntime.systemHealthInfo.numericSensorInfo") or []
     ]

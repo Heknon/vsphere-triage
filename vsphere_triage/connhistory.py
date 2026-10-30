@@ -28,8 +28,10 @@ SESSION_EVENT_TYPES = (
     "ServerStartedSessionEvent",
     "SessionTerminatedEvent",
     "AlreadyAuthenticatedSessionEvent",
+    # vCenter 6.5+ logs SSO login failures as an EventEx with this type id.
+    "com.vmware.sso.LoginFailure",
 )
-_FAILED = {"BadUsernameSessionEvent", "NoAccessUserEvent"}
+_FAILED = {"BadUsernameSessionEvent", "NoAccessUserEvent", "com.vmware.sso.LoginFailure"}
 _LOGIN = "UserLoginSessionEvent"
 
 

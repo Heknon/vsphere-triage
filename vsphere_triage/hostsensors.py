@@ -42,7 +42,8 @@ def classify_sensors(sensors: list[dict[str, Any]]) -> dict[str, Any]:
             "no hardware sensor data from this host (it reports none, or the host is a simulator)"
         )
     return {
-        "healthy": not red and not yellow,
+        # No sensors is no evidence: unknown, not healthy.
+        "healthy": False if (red or yellow) else (None if not sensors else True),
         "sensors_total": len(sensors),
         "red": red[:20],
         "yellow": yellow[:20],

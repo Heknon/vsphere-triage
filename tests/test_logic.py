@@ -2749,7 +2749,7 @@ def test_host_sensors_flag_red_and_yellow() -> None:
 
 def test_host_sensors_no_data_is_said_not_assumed_healthy() -> None:
     verdict = hostsensors.classify_sensors([])
-    assert verdict["healthy"] is True
+    assert verdict["healthy"] is None
     assert any("no hardware sensor data" in finding for finding in verdict["findings"])
 
 
@@ -2960,3 +2960,67 @@ def test_the_windows_boot_probe_cuts_messages_by_their_collapsed_length() -> Non
     assert "$m.Substring(0,[Math]::Min(300,$m.Length))" in script
     assert "($_.Message).Length" not in script
     assert "$o.srttrail=$(if" in script
+
+
+# -- review of main: the new read tools ---------------------------------------------------------
+
+
+def test_an_eventex_ha_restart_is_recognised() -> None:
+    from vsphere_triage import clusterevents  # noqa: PLC0415
+
+    hit = clusterevents.classify_event(
+        "com.vmware.vc.ha.VmRestartedByHAEvent",
+        "vSphere HA restarted virtual machine web-01 on host esx-2 in cluster c1",
+    )
+
+    assert hit is not None
+    assert hit[0] == "ha_vm_restart"
+
+
+def test_a_lost_connection_is_not_a_failed_host_and_one_vmotion_counts_once() -> None:
+    from vsphere_triage import clusterevents  # noqa: PLC0415
+
+    lost = clusterevents.classify_event("HostConnectionLostEvent", "Host esx-1 is not responding")
+    being = clusterevents.classify_event("VmBeingHotMigratedEvent", "Migrating web-01 from esx-1 to esx-2")
+    task = clusterevents.classify_event("TaskEvent", "Task: Migrate virtual machine")
+    done = clusterevents.classify_event("VmMigratedEvent", "Migration of web-01 from esx-1 completed")
+
+    assert lost is not None
+    assert lost[0] == "host_connection_lost"
+    assert being is None
+    assert task is None
+    assert done is not None
+    assert done[0] == "drs_migration"
+
+
+class _EventsSession:
+    """A session whose QueryEvents answers at most 1000 events, the newest, like vCenter."""
+
+    def __init__(self, stamps: list[datetime]) -> None:
+        self.stamps = stamps
+        self.queries = 0
+
+    def events(self, **kwargs: object) -> list:
+        self.queries += 1
+        begin, end = kwargs["begin"], kwargs["end"]
+        inside = [s for s in self.stamps if begin <= s <= end]  # type: ignore[operator]
+        return [SimpleNamespace(key=s.timestamp(), createdTime=s) for s in inside[-1000:]]
+
+
+def test_a_busy_window_is_read_in_pieces_not_cut_to_its_last_minutes() -> None:
+    begin = NOW - timedelta(hours=2)
+    stamps = [begin + timedelta(seconds=3 * n) for n in range(2400)]  # 2400 events over 2 h
+    session = _EventsSession(stamps)
+
+    events, cut = VCenterSession.events_covering(session, begin=begin, end=NOW)  # type: ignore[arg-type]
+
+    assert len(events) == 2400
+    assert cut is False
+    assert events[0].createdTime == stamps[0]  # the oldest is there, not only the newest 1000
+
+
+def test_no_sensor_data_is_unknown_and_readings_are_scaled() -> None:
+    from vsphere_triage.server import _sensor_reading  # noqa: PLC0415
+
+    assert _sensor_reading(SimpleNamespace(currentReading=4500, unitModifier=-2)) == 45.0
+    assert _sensor_reading(SimpleNamespace(currentReading=None, unitModifier=0)) is None

@@ -27,7 +27,9 @@ BUCKETS: tuple[tuple[str, str, re.Pattern[str]], ...] = (
     (
         "ha_vm_restart",
         "vSphere HA restarted a VM after its host failed — a host problem, not a per-VM one",
-        re.compile(r"(?i)(restarted by (vsphere )?ha|VmRestartedByHaEvent|das.*restart)"),
+        # vCenter 6.x-8 logs this as an EventEx, com.vmware.vc.ha.VmRestartedByHAEvent,
+        # whose message reads "vSphere HA restarted virtual machine ...".
+        re.compile(r"(?i)(restarted by (vsphere )?ha|VmRestartedByHaEvent|ha restarted|das.*restart)"),
     ),
     (
         "host_isolation",
@@ -35,19 +37,24 @@ BUCKETS: tuple[tuple[str, str, re.Pattern[str]], ...] = (
         re.compile(r"(?i)(isolat|HostIsolated|no.*management network|HostNoRedundantManagement)"),
     ),
     (
-        "host_failure",
-        "a host failed or stopped responding",
-        re.compile(r"(?i)(HostFailed|DasHostFailed|host .*not responding|NotResponding)"),
-    ),
-    (
+        # Before host_failure: HostConnectionLostEvent's own message reads "Host X is
+        # not responding", which is vCenter losing the host, not the host failing.
         "host_connection_lost",
         "a host lost its connection to vCenter",
-        re.compile(r"(?i)(connection.*lost|HostConnectionLost|host .*disconnected)"),
+        re.compile(r"(?i)(connection.*lost|HostConnectionLost|host .*disconnected|not responding)"),
+    ),
+    (
+        "host_failure",
+        "a host failed (vSphere HA declared it failed)",
+        re.compile(r"(?i)(HostFailed|DasHostFailed|ha.*host.*fail)"),
     ),
     (
         "vm_failover_failed",
         "a VM could not be restarted or powered on (HA failover may have failed)",
-        re.compile(r"(?i)(FailedToPowerOn|failover.*fail|insufficient.*failover|not.*enough.*resources)"),
+        re.compile(
+            r"(?i)(FailedToPowerOn|failover.*fail|insufficient.*failover|not.*enough.*resources|"
+            r"ha\.FailedRestartAfterIsolation|vmrestartedbyha.*fail)"
+        ),
     ),
     (
         "host_maintenance",
@@ -56,8 +63,10 @@ BUCKETS: tuple[tuple[str, str, re.Pattern[str]], ...] = (
     ),
     (
         "drs_migration",
-        "DRS migrated a VM between hosts (load balancing or evacuation)",
-        re.compile(r"(?i)(migrat|vmotion|DrsVm|relocat)"),
+        "a VM was migrated between hosts (DRS load balancing, an evacuation, or by hand)",
+        # The completed migration only: one vMotion also logs a 'being migrated'
+        # event and a task, which would count each move two or three times.
+        re.compile(r"(?i)\b(DrsVmMigratedEvent|VmMigratedEvent)\b"),
     ),
 )
 
@@ -116,7 +125,7 @@ def summarize_cluster_events(
     migration = buckets.get("drs_migration")
     if migration and migration["count"] >= 10:  # noqa: PLR2004 - a wave, not a stray balance move
         findings.append(
-            f"{migration['count']} DRS migrations in the window — a migration wave (an evacuation or "
+            f"{migration['count']} VM migrations in the window — a migration wave (an evacuation or "
             "heavy rebalancing) can slow the VMs involved while it runs"
         )
     return {

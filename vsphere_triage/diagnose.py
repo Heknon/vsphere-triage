@@ -1086,7 +1086,11 @@ def diagnose_vm(
         # turn on. Empty when nothing better was missing. The PowerFlex backend is
         # named only when storage is actually implicated, so it does not nag on a
         # VM whose trouble has nothing to do with the datastore.
-        "evidence_gaps": _gaps_for(settings, vm, storage_implicated=bool(disk.get("slow"))),
+        # Latency, or a datastore full or unreachable (APD/PDL): either way the backend
+        # behind it is in question.
+        "evidence_gaps": _gaps_for(
+            settings, vm, storage_implicated=bool(disk.get("slow") or disk.get("capacity_findings"))
+        ),
     }
 
 

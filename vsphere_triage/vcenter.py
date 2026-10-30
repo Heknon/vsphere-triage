@@ -682,6 +682,42 @@ class VCenterSession:
         found = self.content.eventManager.QueryEvents(criteria) or []
         return sorted(found, key=lambda event: event.createdTime)
 
+    def events_covering(
+        self,
+        *,
+        begin: datetime,
+        end: datetime,
+        types: Sequence[str] = (),
+        entity: Any = None,
+        recursion: str = "self",
+        max_queries: int = 16,
+    ) -> tuple[list[Any], bool]:
+        """The events over a window even when it holds more than one QueryEvents answers.
+
+        QueryEvents returns at most QUERY_EVENTS_CAP events, the newest; a busy
+        window is otherwise silently cut to its last minutes. A window that hits
+        the cap is split in half and each half read, up to `max_queries` reads.
+        Returns the events, oldest first, and whether some part was still cut.
+        """
+        found: list[Any] = []
+        still_cut = False
+        pending = [(begin, end)]
+        queries = 0
+        while pending:
+            start, stop = pending.pop()
+            batch = self.events(entity=entity, begin=start, end=stop, types=types, recursion=recursion)
+            queries += 1
+            if len(batch) >= QUERY_EVENTS_CAP and stop - start > timedelta(seconds=2):
+                if queries + 2 <= max_queries:
+                    middle = start + (stop - start) / 2
+                    pending.extend([(start, middle), (middle, stop)])
+                    continue
+                still_cut = True
+            found.extend(batch)
+        # Halves meet at their boundary: one event can come back from both.
+        unique = {getattr(event, "key", id(event)): event for event in found}
+        return sorted(unique.values(), key=lambda event: event.createdTime), still_cut
+
     # -- performance ---------------------------------------------------------
 
     def counters(self) -> dict[str, Any]:

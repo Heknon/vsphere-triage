@@ -84,5 +84,12 @@ def summarize_tasks(rows: list[dict[str, Any]], *, now: datetime, window_minutes
         "by_family": dict(sorted(families.items(), key=lambda item: -item[1])),
         "by_user": dict(sorted(by_user.items(), key=lambda item: -item[1])[:5]),
         "failures": failures[:20],
-        "findings": findings or ["no notable tasks in the window"],
+        "findings": findings
+        or [
+            (
+                "no notable tasks in the window (each task's state is as recorded when it was created, "
+                "so a task that failed later may not show as failed here; check the VM's or host's events)"
+            )
+        ],
+        "note": "task states come from TaskEvents, a snapshot taken when each task was created",
     }
