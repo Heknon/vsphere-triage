@@ -15,7 +15,7 @@ from typing import Any
 
 import pytest
 
-from vsphere_triage import checks
+from vsphere_triage import checks, diagnose, vmlog
 from vsphere_triage.config import Settings
 from vsphere_triage.server import INSTRUCTIONS, build_server
 
@@ -102,3 +102,31 @@ def test_the_skill_names_only_flags_that_exist() -> None:
     flag_like = set(re.findall(r"`([a-z]+(?:_[a-z]+)+)` flag", words))
 
     assert flag_like <= set(checks.FLAG_MEANING), flag_like - set(checks.FLAG_MEANING)
+
+
+def test_every_cause_a_diagnosis_can_name_is_explained_in_the_skill() -> None:
+    table = (ROOT / "skills" / "vm-incident" / "core" / "causes.md").read_text()
+
+    unexplained = [cause for cause in diagnose.CAUSES if f"| {cause} |" not in table]
+
+    assert not unexplained, unexplained
+
+
+def test_every_cause_the_conclusion_weighs_is_a_declared_cause() -> None:
+    source = (ROOT / "vsphere_triage" / "diagnose.py").read_text()
+    named = set(re.findall(r"evidence\(\s*([A-Z_]+),", source))
+    declared = {name for name in dir(diagnose) if getattr(diagnose, name) in diagnose.CAUSES}
+
+    assert named, "no evidence() calls found"
+    assert named <= declared, named - declared
+
+
+def test_every_stop_code_with_a_storage_or_cpu_layer_is_in_the_skills_list() -> None:
+    table = (ROOT / "skills" / "vm-incident" / "core" / "causes.md").read_text()
+    layered = [
+        code for code, (_, hint) in vmlog.STOP_CODES.items() if hint and hint.startswith(("storage", "CPU"))
+    ]
+
+    missing = [f"0x{code:X}" for code in layered if f"`0x{code:X}`" not in table]
+
+    assert not missing, missing

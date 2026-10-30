@@ -12,7 +12,7 @@ Each VM has exactly one state. The state is the symptom; the cause is below.
 | --- | --- | --- |
 | `hung` | booted over 10 min ago, Tools not running, CPU at or below 100 MHz | the console (frozen?) and `vmware.log` (how far did the boot get?) |
 | `busy_not_up` | booted over 10 min ago, Tools not running, CPU at or above half its vCPUs | CPU starvation, or Windows still working: see "Starved or hung" |
-| `booted_not_up` | booted over 10 min ago, Tools not running, CPU in between | the boot timeline; Tools may be stuck running its startup scripts |
+| `booted_not_up` | booted over 10 min ago, Tools not running, CPU in between, **or CPU not reported** (then CPU is a gap, not a reading) | the boot timeline; Tools may be stuck running its startup scripts |
 | `blocked_on_question` | a VM question is pending | the question text; often caused by a full datastore or lost storage paths |
 | `paused` | powered on but not running | why it was paused; a full thin datastore pauses VMs |
 | `no_tools` | Tools not installed | **not stuck by itself**; judge by CPU, console and boot log |
@@ -46,6 +46,42 @@ Each VM has exactly one state. The state is the symptom; the cause is below.
 | **Guest hung early in boot** | near-zero CPU; console black and unchanged across two captures; `vmware.log` stops after the firmware or the first disk I/O; host and storage healthy | the console changes; the boot reached the drivers or Tools |
 | **Guest booted, Tools did not start** | a logon or login prompt on the console, or a guest IP reported; Tools not running; host and storage healthy | Tools running |
 | **Something reset or moved the VM** | HA, migration or reset events not ordered by the orchestrator (rung 2) in the window | no such event |
+| **A boot loop** | the `boot_loop` flag: several resets or guest reboots in a short window; `vmware.log` shows "Guest-initiated reset" for the guest's own. Each boot stopping early is one turn of the loop, not a separate hang | the resets were ordered by the orchestrator or a person (rung 2, `cluster_events`) |
+| **The guest kernel reported an error** | a Linux panic, soft lockup, hung task, I/O or filesystem error on the serial console; its `points_at` names the layer (a soft lockup: CPU; a hung `jbd2` task or I/O error: storage) | the finding is from an earlier boot (`linux_findings_earlier_boots`) |
+| **The guest cannot boot** | the console shows Automatic Repair, a boot-manager error, "no boot device", a Linux emergency shell or a panic screen: the guest itself refuses, whatever the host does | the console shows progress past it |
+| **The virtual machine faulted** | `vmware.log` reports a VMX fault during the boot: the hypervisor's process for this VM failed, not the guest | no fault line in the log |
+| **Tools flapping** | Tools runs but its heartbeat is intermittent (yellow), or several Tools state changes in `vmware.log`: Tools is crashing or restarting in a running guest | heartbeat green and steady |
+| **vCenter cannot reach the VM / its host is not connected / it is paused** | the `inaccessible` or `paused` state, the `host_not_connected` flag: the VM's host or its storage is out of vCenter's reach, or the hypervisor paused it (a full thin datastore pauses VMs) | the host connected, the datastore reachable, the VM running |
+
+### Cause names in `diagnose_vm` results
+
+`conclusion.causes[].cause` uses these exact names; each maps to a row above.
+
+| `cause` | Row |
+| --- | --- |
+| CPU starvation (ESXi overcommit) | ESXi CPU overcommit |
+| throttled by a configured CPU limit (not host starvation) | A configured CPU limit |
+| storage latency (datastore / PowerFlex) | Storage saturation, or PowerFlex backend trouble |
+| its datastore is full or unreachable (APD/PDL) | Datastore full, over-provisioned or unreachable |
+| linked-clone boot storm on a shared base disk | Linked-clone boot storm |
+| memory pressure (the host ballooning or swapping the VM) | Host memory pressure |
+| a configured memory limit is forcing reclamation | A configured memory limit |
+| its ESXi host reports failing hardware | A failing host |
+| a pending VM question blocks it | Pending VM question |
+| a virtual device is blocking or breaking the boot | A virtual device blocks the boot |
+| snapshots are consuming disk and slowing I/O | Snapshots filling the datastore or slowing I/O |
+| Windows crashed (stop error) | Windows crashed |
+| Windows still working through boot (slow, not hung) | Windows still working (slow, not hung) |
+| the guest hung early in boot | Guest hung early in boot |
+| the guest booted; Tools did not start | Guest booted, Tools did not start |
+| the VM is in a boot loop (it keeps resetting) | A boot loop |
+| the guest kernel reported an error | The guest kernel reported an error |
+| the guest cannot boot | The guest cannot boot |
+| the virtual machine faulted | The virtual machine faulted |
+| Tools flapping | Tools flapping |
+| vCenter cannot reach the VM | vCenter cannot reach the VM / its host is not connected / it is paused |
+| its ESXi host is not connected to vCenter | vCenter cannot reach the VM / its host is not connected / it is paused |
+| the VM is paused | vCenter cannot reach the VM / its host is not connected / it is paused |
 
 ## Starved or hung
 
@@ -71,8 +107,11 @@ different verdicts with different fixes.
 When the serial console, the console OCR or `investigate_windows_boot` gives a
 Windows stop code, the server maps it to a layer. Treat the layer as a hint:
 
-- `0x7A`, `0x77` (paging I/O failed or timed out), `0x7B`, `0xF4`: storage.
-- `0x101` (clock watchdog), `0x133` (DPC watchdog): CPU starvation.
+- `0x7A`, `0x77` (paging I/O failed or timed out), `0x7B` (boot disk not
+  reachable), `0xF4`, `0x24` (NTFS), `0xED` (boot volume will not mount): storage.
+- `0x101` (clock watchdog): CPU starvation.
+- `0x133` (DPC watchdog): CPU **or** storage: a deferred call ran too long,
+  which a starved vCPU or a stalled disk can each cause. Check both.
 
 A storage stop code on a VM whose datastore also shows high latency is two
 pieces of evidence for one cause. On a VM whose datastore is clean, it points

@@ -46,10 +46,11 @@ boot, check those too.
 
 ## 3. Interpret
 
-- A **bugcheck with a storage layer** (`0x7A`, `0x7B`, `0xF4`) points back at
-  the datastore: a saturated datastore can starve the boot disk. A **CPU
-  layer** (`0x101` clock watchdog, `0x133` DPC watchdog) points at host
-  overcommit. Confirm either against the host and datastore evidence before
+- A **bugcheck with a storage layer** (`0x7A`, `0x77`, `0x7B`, `0xF4`, `0x24`,
+  `0xED`) points back at the datastore: a saturated datastore can starve the
+  boot disk. A **CPU layer** (`0x101` clock watchdog) points at host
+  overcommit; `0x133` (DPC watchdog) can be either. The full list is in
+  `core/causes.md`. Confirm against the host and datastore evidence before
   writing it as the cause.
 - A **service timeout** (7011, 7009) means a service hung the boot, not the
   kernel. Name the service; it is a guest-software problem.

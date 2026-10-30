@@ -137,8 +137,10 @@ the guest or its power state:
 - run_in_guest runs a command in the guest, for a diagnostic a read cannot answer.
 - check_ems, investigate_windows_boot, investigate_linux_boot and read_crash_dump
   run fixed read-only queries in the guest.
-All but the two reboots need VMware Tools and guest credentials; none of the
-seven is a first step.
+run_in_guest, the investigate_* tools and read_crash_dump need VMware Tools and
+guest credentials; reboot_guest needs Tools; hard_reset needs neither; check_ems
+reads the serial port without Tools (only its Windows BCD check needs them).
+None of the seven is a first step.
 
 When the symptom is SSL EOF / reset / timeout against a vCenter that many
 clients hit (this server included), start with check_vcenters: a high session
@@ -1026,7 +1028,7 @@ def _register_machine_tools(  # noqa: C901, PLR0915 - one closure per tool
         reboot or power-on you are investigating) when you have it: a guest reboot
         does not move vCenter's power-on time, so without it a warm-rebooted VM
         can look up for days and be misjudged as stuck. The result's
-        machine.values.boot_time_source says what uptime was measured from
+        machine.boot_time_source says what uptime was measured from
         (reported_reboot, reboot_event or power_on).
 
         Args:

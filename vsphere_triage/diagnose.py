@@ -102,6 +102,32 @@ MEMORY = "memory pressure (the host ballooning or swapping the VM)"
 DATASTORE_CAPACITY = "its datastore is full or unreachable (APD/PDL)"
 HOST_DISCONNECTED = "its ESXi host is not connected to vCenter"
 HOST_HARDWARE = "its ESXi host reports failing hardware"
+# Every cause a diagnosis can name; core/causes.md explains each.
+CAUSES = (
+    CPU,
+    STORAGE,
+    BOOT_STORM,
+    WINDOWS_CRASH,
+    KERNEL_ERROR,
+    STILL_WORKING,
+    CANNOT_BOOT,
+    TOOLS_DID_NOT_START,
+    EARLY_HANG,
+    BOOT_LOOP_CAUSE,
+    VM_FAULT,
+    TOOLS_FLAPPING_CAUSE,
+    INACCESSIBLE_CAUSE,
+    QUESTION,
+    HARDWARE,
+    SNAPSHOT,
+    CPU_LIMIT_CAUSE,
+    MEMORY_LIMIT_CAUSE,
+    PAUSED_CAUSE,
+    MEMORY,
+    DATASTORE_CAPACITY,
+    HOST_DISCONNECTED,
+    HOST_HARDWARE,
+)
 
 DIAGNOSE_PATHS = (
     *VM_PATHS,
