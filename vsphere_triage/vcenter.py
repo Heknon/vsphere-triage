@@ -242,6 +242,16 @@ class VCenterSession:
         except (OSError, ssl.SSLError) as error:
             msg = f"vCenter {self.vcenter.name} ({self.vcenter.host}) unreachable: {error}"
             raise VSphereError(msg) from error
+        except vmodl.MethodFault:
+            raise
+        except Exception as error:
+            # pyVmomi's version probe raises a bare Exception ("... is down or is not
+            # a VIM server") for an unreachable network, a proxy's error page, or a
+            # web server that is not a vCenter: that is an unreachable vCenter too.
+            if type(error) is not Exception:
+                raise
+            msg = f"vCenter {self.vcenter.name} ({self.vcenter.host}) unreachable: {error}"
+            raise VSphereError(msg) from error
         self.last_login_seconds = round(time.monotonic() - started, 2)
         self.last_login_at = datetime.now(UTC)
         self._teardown()
@@ -1108,10 +1118,12 @@ class VCenterPool:
             )
             raise VSphereError(msg) from None
         try:
-            await self._bounded(session.connect, slot=slot)
+            await self._bounded(session.connect, slot=slot, what=f"vCenter {name}: connecting")
             generation = session.generation
             try:
-                return await self._bounded(lambda: work(session), deadline, slot=slot)
+                return await self._bounded(
+                    lambda: work(session), deadline, slot=slot, what=f"vCenter {name}: the read"
+                )
             except DeadlineError as error:
                 if retry:
                     raise
@@ -1123,22 +1135,34 @@ class VCenterPool:
             except vim.fault.NotAuthenticated:
                 # The session expired. Reconnect (a no-op if a sibling call already
                 # did, so we never log its new session out), then retry once.
-                await self._bounded(lambda: session.reconnect(generation), slot=slot)
+                await self._bounded(
+                    lambda: session.reconnect(generation), slot=slot, what=f"vCenter {name}: reconnecting"
+                )
                 if not retry:
                     raise _not_retried(name, "the session expired") from None
-                return await self._bounded(lambda: work(session), deadline, slot=slot)
+                return await self._bounded(
+                    lambda: work(session), deadline, slot=slot, what=f"vCenter {name}: the read"
+                )
             except (ssl.SSLError, ConnectionError, HTTPException) as dropped:
                 # A dropped or reset connection — under load often the vCenter at
                 # its connection or session limit. Reconnect and retry once; if it
                 # happens again, say so plainly rather than as a bare socket error.
                 if not retry:
                     with contextlib.suppress(Exception):
-                        await self._bounded(lambda: session.reconnect(generation), slot=slot)
+                        await self._bounded(
+                            lambda: session.reconnect(generation),
+                            slot=slot,
+                            what=f"vCenter {name}: reconnecting",
+                        )
                     why = f"the connection dropped ({type(dropped).__name__})"
                     raise _not_retried(name, why) from dropped
                 try:
-                    await self._bounded(lambda: session.reconnect(generation), slot=slot)
-                    return await self._bounded(lambda: work(session), deadline, slot=slot)
+                    await self._bounded(
+                        lambda: session.reconnect(generation), slot=slot, what=f"vCenter {name}: reconnecting"
+                    )
+                    return await self._bounded(
+                        lambda: work(session), deadline, slot=slot, what=f"vCenter {name}: the read"
+                    )
                 except (ssl.SSLError, ConnectionError, HTTPException) as again:
                     msg = (
                         f"vCenter {name} dropped the connection twice ({type(again).__name__}: {again}). "
@@ -1158,7 +1182,12 @@ class VCenterPool:
         return await self.run(name, work, timeout_seconds=self.settings.scan_timeout_seconds)
 
     async def _bounded(
-        self, work: Callable[[], T], timeout_seconds: float | None = None, *, slot: _Slot | None = None
+        self,
+        work: Callable[[], T],
+        timeout_seconds: float | None = None,
+        *,
+        slot: _Slot | None = None,
+        what: str = "vCenter read",
     ) -> T:
         deadline = timeout_seconds or self.settings.timeout_seconds
         future = asyncio.ensure_future(asyncio.to_thread(work))
@@ -1169,7 +1198,7 @@ class VCenterPool:
             # it ends, so stalled reads cannot pile up past the per-vCenter limit.
             if slot is not None:
                 slot.hand_off(future)
-            msg = f"vCenter read exceeded its deadline ({deadline:g}s)"
+            msg = f"{what} exceeded its deadline ({deadline:g}s)"
             raise DeadlineError(msg) from error
         except asyncio.CancelledError:
             if slot is not None:

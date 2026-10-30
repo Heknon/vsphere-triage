@@ -723,7 +723,7 @@ def test_a_large_result_is_cut_and_says_so() -> None:
     result = formatting.bounded({"findings": ["a"], "rows": [{"text": "x" * 500} for _ in range(2000)]})
 
     assert "truncated" in result
-    assert len(json.dumps(result)) <= formatting.MAX_RESPONSE_CHARACTERS
+    assert formatting.size(result) <= formatting.MAX_RESPONSE_CHARACTERS
     assert result["findings"] == ["a"]
 
 
@@ -1879,7 +1879,7 @@ def test_the_last_resort_cut_still_fits_the_budget() -> None:
 
     result = formatting.bounded(huge)
 
-    assert len(json.dumps(result)) <= formatting.MAX_RESPONSE_CHARACTERS
+    assert formatting.size(result) <= formatting.MAX_RESPONSE_CHARACTERS
 
 
 # -- the pool under stalls, and the smaller reads ---------------------------------------------
@@ -3439,3 +3439,141 @@ def test_the_perf_rollup_matches_the_windows_age() -> None:
     assert perf_interval(timedelta(days=3)) == 1800
     assert perf_interval(timedelta(days=20)) == 7200
     assert perf_interval(timedelta(days=200)) == 86400
+
+
+# -- review against real screens and logs -------------------------------------------------------
+
+
+def _screen(colour: tuple[int, int, int], spots: list[tuple[int, int, int, int]] = ()) -> bytes:
+    image = Image.new("RGB", (1024, 768), colour)
+    for left, top, width, height in spots:
+        image.paste((255, 255, 255), (left, top, left + width, top + height))
+    out = io.BytesIO()
+    image.save(out, format="PNG")
+    return out.getvalue()
+
+
+def test_a_moving_boot_spinner_is_not_a_frozen_screen() -> None:
+    dots_then = [(500 + 12 * index, 600, 6, 6) for index in range(5)]
+    dots_now = [(506, 590 + 10 * index, 6, 6) for index in range(5)]
+
+    result = console.read_captures(
+        [_screen((0, 0, 0), dots_then), _screen((0, 0, 0), dots_now)],
+        black_fraction=0.98,
+        frozen_difference=0.5,
+    )
+
+    assert result["mean_difference"] < 0.5
+    assert result["frozen"] is False
+
+
+def test_a_blinking_cursor_alone_does_not_unfreeze_a_screen() -> None:
+    text = [(20, 20 + 18 * row, 300, 10) for row in range(4)]
+
+    result = console.read_captures(
+        [_screen((0, 0, 0), [*text, (20, 100, 8, 16)]), _screen((0, 0, 0), text)],
+        black_fraction=0.9,
+        frozen_difference=0.5,
+    )
+
+    assert result["frozen"] is True
+
+
+def test_a_still_blue_screen_without_ocr_is_crash_evidence() -> None:
+    result = conclude(
+        console={"available": True, "frozen": True, "blue_screen_colour": True, "screen_states": []}
+    )
+
+    assert any(cause["cause"] == diagnose.WINDOWS_CRASH for cause in result["causes"])
+
+
+def test_still_text_on_black_on_windows_is_a_crash_not_a_login_prompt() -> None:
+    machine = vm(cpu_mhz=3600.0, os_family="windows")
+    result = diagnose.conclude(
+        checks.classify(machine, LIMITS),
+        vm=machine,
+        cpu={"findings": [], "starved": False},
+        disk={"findings": [], "slow": False, "datastores": []},
+        environment={"signals": []},
+        logs={"available": False},
+        serial={"available": False},
+        console={"available": True, "frozen": True, "black": True, "text_on_black": True},
+        host_log={"available": False},
+    )
+
+    causes = [cause["cause"] for cause in result["causes"]]
+    assert diagnose.WINDOWS_CRASH in causes
+    assert diagnose.TOOLS_DID_NOT_START not in causes
+
+
+def test_a_guest_reboot_in_the_same_log_starts_a_new_boot() -> None:
+    rows = [
+        "2026-10-29T02:00:00.000Z In(05) vmx - Powering on the virtual machine",
+        "2026-10-29T02:00:01.000Z In(05) vmx - EFI ROM loaded",
+        "2026-10-29T02:00:40.000Z In(05) vmx - Tools: Changing running status: 0 => 1.",
+        (
+            "2026-10-29T03:00:00.000Z In(05) vcpu-0 - Chipset: The guest has requested that the "
+            "virtual machine be hard reset."
+        ),
+        "2026-10-29T03:00:00.010Z In(05) vcpu-0 - CPU reset: hard (mode Emulation)",
+        "2026-10-29T03:00:00.020Z In(05) vcpu-1 - CPU reset: hard (mode Emulation)",
+        "2026-10-29T03:00:01.000Z In(05) vmx - EFI boot device order read",
+    ]
+    log = "\n".join(rows)
+
+    timeline = vmlog.boot_timeline(vmlog.parse_lines(log))
+
+    assert timeline["boot_started"] == datetime(2026, 10, 29, 3, 0, 0, 10000, tzinfo=UTC)
+    assert timeline["last_stage"] == "firmware"
+
+
+def test_routine_snapshot_stuns_and_tools_rpc_timeouts_are_not_storage() -> None:
+    rows = [
+        "2026-10-29T02:00:00.000Z In(05) vmx - Powering on the virtual machine",
+        "2026-10-29T02:10:00.000Z In(05) vmx - Checkpoint_Unstun: vm stopped for 412 us",
+        "2026-10-29T02:11:00.000Z In(05) vmx - GuestRpcSendTimedOut: message to toolbox timed out.",
+        "2026-10-29T02:12:00.000Z Wa(03) vmx - AIOGNRC: Failed to issue IO to file /vmfs/x.vmdk",
+    ]
+    log = "\n".join(rows)
+
+    storage = vmlog.boot_timeline(vmlog.parse_lines(log))["annotations"]["storage"]
+
+    assert storage["count"] == 1
+    assert "AIOGNRC" in storage["examples"][0]["message"]
+
+
+def test_continuation_lines_parse_and_old_ones_stay_out_of_a_since_window() -> None:
+    rows = [
+        "2026-10-29T01:00:00.000Z In(05) vmx - Msg_Question:",
+        "2026-10-29T01:00:00.000Z In(05)+ vmx - The datastore is full.",
+        "an unparsed body line of the question",
+        "2026-10-29T03:00:00.000Z In(05) vmx - Msg_Question: later",
+    ]
+    log = "\n".join(rows)
+    lines = vmlog.parse_lines(log)
+
+    kept, _ = vmlog.grep(lines, "question", since=datetime(2026, 10, 29, 2, tzinfo=UTC), limit=10)
+
+    assert lines[1].time is not None
+    assert [line.number for line in kept] == [4]
+
+
+def test_a_vcenter_that_is_not_a_vim_server_is_reported_unreachable(monkeypatch: pytest.MonkeyPatch) -> None:
+    def refuse(**_: object) -> None:
+        msg = "10.255.255.1:443 is down or is not a VIM server"
+        raise Exception(msg)  # noqa: TRY002 - what pyVmomi raises
+
+    from vsphere_triage.vcenter import VSphereError  # noqa: PLC0415
+
+    monkeypatch.setattr("vsphere_triage.vcenter.SmartConnect", refuse)
+    settings = Settings.from_environment(
+        {
+            "VSPHERE_VCENTERS": '[{"name": "vc-a", "host": "10.255.255.1"}]',
+            "VSPHERE_USERNAME": "u",
+            "VSPHERE_PASSWORD": "p",
+        }
+    )
+    session = VCenterSession(settings.vcenters[0], settings)
+
+    with pytest.raises(VSphereError, match="unreachable"):
+        session.connect()

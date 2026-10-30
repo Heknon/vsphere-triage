@@ -152,6 +152,35 @@ def difference(first: bytes, second: bytes) -> float:
     return round(ImageStat.Stat(ImageChops.difference(a, b)).mean[0], 2)
 
 
+# A pixel this much brighter or darker has changed; a region this many pixels, and
+# wider and taller than a text cursor, is something moving on screen.
+CHANGED_PIXEL_LEVEL = 40
+MOVING_PIXELS = 40
+CURSOR_SIZE = 24
+
+
+def moving_region(first: bytes, second: bytes) -> dict[str, Any] | None:
+    """The box where two screenshots differ, if it is bigger than a blinking cursor.
+
+    A boot or update spinner moves a few hundred pixels of a screen of hundreds of
+    thousands: the mean difference stays near zero, so it alone reads a progressing
+    boot as frozen. A blinking cursor changes too, but the guest need not be
+    running for that, so a change no bigger than a cursor does not count.
+    """
+    with Image.open(io.BytesIO(first)) as one, Image.open(io.BytesIO(second)) as two:
+        a = one.convert("L")
+        b = two.convert("L").resize(a.size)
+    mask = ImageChops.difference(a, b).point(lambda value: 255 if value >= CHANGED_PIXEL_LEVEL else 0)
+    box = mask.getbbox()
+    if box is None:
+        return None
+    changed = mask.histogram()[255]
+    width, height = box[2] - box[0], box[3] - box[1]
+    if changed < MOVING_PIXELS or (width <= CURSOR_SIZE and height <= CURSOR_SIZE):
+        return None
+    return {"changed_pixels": changed, "box": list(box)}
+
+
 def ocr(data: bytes) -> tuple[str | None, str]:
     """The text on a screenshot, if an OCR engine is installed; why not, otherwise."""
     try:
@@ -188,8 +217,10 @@ def read_captures(
     result: dict[str, Any] = {"captures": len(captures), "analysis": analyses}
     if len(captures) > 1:
         change = difference(captures[0], captures[-1])
+        moving = moving_region(captures[0], captures[-1])
         result["mean_difference"] = change
-        result["frozen"] = change < frozen_difference
+        result["moving_region"] = moving
+        result["frozen"] = change < frozen_difference and moving is None
         findings.append(
             "the screen did not change between captures"
             if result["frozen"]
@@ -201,15 +232,20 @@ def read_captures(
     result["text_on_black"] = text_on_black
     if text_on_black:
         findings.append(
-            "the screen is dark with text on it: a text console or login prompt, not a blank display"
+            "the screen is dark with text on it, not a blank display: on Linux a text console or "
+            "login prompt; on Windows a boot error or the black stop-error screen of Windows 11 24H2+"
         )
     elif black:
         findings.append(
             "the screen is black: early boot before the display is set up, a hang, "
             "or a blanked display; the CPU and disk counters tell these apart"
         )
-    if last["blue_screen_colour_fraction"] > 0.6:  # noqa: PLR2004
-        findings.append("the screen is mostly blue-screen blue: likely a Windows stop error")
+    result["blue_screen_colour"] = last["blue_screen_colour_fraction"] > 0.6  # noqa: PLR2004
+    if result["blue_screen_colour"]:
+        findings.append(
+            "the screen is mostly Windows blue: a stop error, or the Windows Update or recovery "
+            "screen, which use the same blue; the words on it (OCR) or a moving spinner tell them apart"
+        )
     text, engine = ocr(captures[-1])
     result["ocr_engine"] = engine
     if text is not None:

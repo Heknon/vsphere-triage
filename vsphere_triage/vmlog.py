@@ -30,12 +30,12 @@ import regex
 # ESXi 7 and later: `2026-10-29T20:13:05.123Z In(05) vmx - message`
 NEW_LINE = re.compile(
     r"^(?P<ts>\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d+)?(?:Z|[+-]\d{2}:?\d{2})?)\s+"
-    r"(?P<level>[A-Z][a-z])\(\d+\)\s+(?P<thread>\S+)\s+-?\s*(?P<message>.*)$"
+    r"(?P<level>[A-Z][a-z])\(\d+\)\+?\s+(?P<thread>\S+)\s+-?\s*(?P<message>.*)$"
 )
 # ESXi 6.x: `2026-10-29T20:13:05.123Z| vmx| I125: message`
 OLD_LINE = re.compile(
     r"^(?P<ts>\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d+)?(?:Z|[+-]\d{2}:?\d{2})?)\|\s*"
-    r"(?P<thread>[^|]+?)\s*\|\s*(?P<level>[A-Z])\d*:\s?(?P<message>.*)$"
+    r"(?P<thread>[^|]+?)\s*\|\s*(?P<level>[A-Z])\d*\+?:\s?(?P<message>.*)$"
 )
 LEVELS = {
     "In": "info",
@@ -59,7 +59,10 @@ STAGES: tuple[tuple[str, str, re.Pattern[str]], ...] = (
         re.compile(
             r"(?i)(powering on|transitioned vmx/execstate/val to poweredon|vmx_poweron|"
             r"resetting (the )?(vm|virtual machine)|guest[- ]initiated reset|reset request|"
-            r"vmx_reset|soft reset|requested a reset)"
+            r"vmx_reset|soft reset|requested a reset|vmautomation_reset|"
+            # A guest reboot or a vCenter reset continues the same log: the chipset
+            # line, and the boot CPU's reset (each vCPU logs one; vcpu-0 is the boot CPU).
+            r"requested that the virtual machine be (hard )?reset|^cpu reset: (soft|hard))"
         ),
     ),
     (
@@ -110,8 +113,10 @@ ANNOTATIONS: tuple[tuple[str, re.Pattern[str]], ...] = (
         "storage",
         re.compile(
             r"(?i)(scsi\d*:\s*(reset|abort)|aborted? command|\bapd\b|\bpdl\b|all paths down|"
-            r"permanent device loss|lost access|i/o error|stun|checkpoint_unstun|"
-            r"aiomgr.*(error|fail)|disklib.*(error|fail)|timed out)"
+            r"permanent device loss|lost access|i/o error|failed to issue io|"
+            # Not the stun/unstun of every snapshot and backup, nor a Tools RPC timeout.
+            r"aiomgr.*(error|fail)|aiognrc.*fail|disklib.*(error|fail)|"
+            r"(scsi|disk|device|\bio\b|aio).*timed out)"
         ),
     ),
     ("question", re.compile(r"(?i)(msg_question|msg_hint|\bquestion\b)")),
@@ -265,19 +270,23 @@ def grep(
 
     Returns the lines kept and how many matched in all.
     """
+    # A line with no time of its own (an unparsed continuation) belongs to the
+    # entry above it, and is as old as that entry.
+    old: set[int] = set()
+    if since is not None:
+        current = None
+        for line in lines:
+            current = line.time or current
+            if current is not None and current < since:
+                old.add(line.number)
     if pattern is None:
-        matched = [
-            line
-            for line in lines
-            if DEFAULT_GREP.search(line.message)
-            and (since is None or line.time is None or line.time >= since)
-        ]
+        matched = [line for line in lines if line.number not in old and DEFAULT_GREP.search(line.message)]
         return matched[-limit:], len(matched)
     expression = caller_pattern(pattern)
     deadline = time.monotonic() + CALLER_PATTERN_SECONDS
     matched = []
     for line in lines:
-        if since is not None and line.time is not None and line.time < since:
+        if line.number in old:
             continue
         left = deadline - time.monotonic()
         try:
@@ -306,11 +315,17 @@ def caller_pattern(pattern: str) -> Any:  # regex.Pattern, which the regex stubs
     return regex.compile(pattern, regex.IGNORECASE | regex.VERSION0)
 
 
+def _other_cpu_reset(line: LogLine) -> bool:
+    """A reset line from a vCPU other than the boot CPU: the same reset, logged again."""
+    thread = (line.thread or "").lower()
+    return line.message.lower().startswith("cpu reset") and thread.startswith("vcpu-") and thread != "vcpu-0"
+
+
 def boot_timeline(lines: list[LogLine], *, max_examples: int = 3) -> dict[str, Any]:
     """How far the last boot in this log got, and what happened along the way."""
     start_index = None
     for index, line in enumerate(lines):
-        if STAGES[0][2].search(line.message):
+        if STAGES[0][2].search(line.message) and not _other_cpu_reset(line):
             start_index = index
     if start_index is None:
         return {

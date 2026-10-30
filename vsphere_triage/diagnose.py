@@ -759,7 +759,30 @@ def conclude(  # noqa: C901, PLR0912, PLR0913, PLR0915 - one ordered list of cau
                 evidence(CANNOT_BOOT, weight=4, text=f"console: {state['meaning']}")
             elif name in ("windows_logon", "linux_login"):
                 evidence(TOOLS_DID_NOT_START, weight=4, text=f"console: {state['meaning']}")
-        if console.get("frozen") and console.get("text_on_black"):
+        read_words = bool(console.get("screen_states") or console.get("stop_codes"))
+        if console.get("frozen") and console.get("blue_screen_colour") and not read_words:
+            # Without the words, a still blue screen is most likely a stop error: the
+            # update and recovery screens on the same blue carry a moving spinner.
+            evidence(
+                WINDOWS_CRASH,
+                weight=2,
+                text="console mostly Windows blue and unchanged across captures (no OCR to confirm)",
+            )
+        if (
+            console.get("frozen")
+            and console.get("text_on_black")
+            and vm.os_family == "windows"
+            and not read_words
+        ):
+            # Windows has no text console to log in at: still text on black is a boot
+            # error or the black stop-error screen of 24H2+.
+            evidence(
+                WINDOWS_CRASH,
+                weight=2,
+                text="console shows still text on a black screen on a Windows guest: a stop error "
+                "(the 24H2+ black screen) or a boot error (no OCR to confirm)",
+            )
+        elif console.get("frozen") and console.get("text_on_black"):
             # A text console or login prompt, which is mostly black but not blank:
             # the guest got far enough to print, so this is no early hang.
             evidence(

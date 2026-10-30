@@ -286,7 +286,8 @@ def test_a_blue_console_is_read_as_a_stop_error(
         server, "get_vm_console", {"vcenter": "vc-a", "moref": moref, "captures": 1, "include_image": True}
     )
 
-    assert any("blue-screen blue" in finding for finding in result["findings"])
+    assert result["blue_screen_colour"] is True
+    assert any("Windows blue" in finding for finding in result["findings"])
     assert result["image_jpeg_base64"]
 
 
