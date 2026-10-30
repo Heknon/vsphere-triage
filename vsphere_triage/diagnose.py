@@ -513,9 +513,9 @@ def environment_pattern(
     `vm` only names the folder and no finding speaks of "this VM".
     """
     # Healthy is the complement of abnormal, not a separate HEALTHY/BOOTING test:
-    # a VM that is HEALTHY but carries an attention flag (long_running, an alarm)
-    # is abnormal, and must not also be counted among the healthy, or one VM lands
-    # on both sides and "5 of 5 abnormal" hides the "only this one is stuck" signal.
+    # a VM that is HEALTHY but carries a trouble flag (a boot loop, a lost host) is
+    # abnormal, and must not also be counted among the healthy, or one VM lands on
+    # both sides. Context flags (long_running, an alarm) leave a VM healthy here.
     abnormal = [(peer, verdict) for peer, verdict in peers if verdict.abnormal]
     healthy = [(peer, verdict) for peer, verdict in peers if not verdict.abnormal]
     result: dict[str, Any] = {

@@ -72,7 +72,13 @@ def classify_datastore(row: dict[str, Any], thresholds: Thresholds) -> dict[str,
         )
         if value is None
     ]
-    if row.get("accessible") is False:
+    mounts = row.get("mounts") or []
+    every_host_down = bool(mounts) and all(mount.get("host_up") is False for mount in mounts)
+    if row.get("accessible") is False and every_host_down:
+        # vCenter judges a datastore through its hosts: with all of them down it
+        # cannot tell, which is unknown, not unreachable.
+        unread.append("accessibility (every host mounting it is down)")
+    elif row.get("accessible") is False:
         findings.append(f"datastore {name} is not accessible from vCenter")
     if exact_free is not None and exact_free <= thresholds.datastore_full_percent:
         findings.append(f"nearly full: {free_percent}% free — a thin disk on it stalls on write")

@@ -108,6 +108,8 @@ class Scan:
     vcenters: dict[str, VCenterScan]
     errors: dict[str, str]
     host_memory_percent: float = 95.0
+    # What the scan was asked for, so explain_group drills into the groups it showed.
+    states: tuple[str, ...] = FLAGGED
 
     def all_vms(self) -> list[tuple[VmFacts, Verdict]]:
         """Every VM read, with its verdict."""
@@ -489,9 +491,8 @@ async def explain_group(  # noqa: C901 - one comparison, then one check per vCen
     inside = [
         (vm, verdict) for vm, verdict in scan.all_vms() if value in values_of(vm) and verdict.state != OFF
     ]
-    # As scan's groups count them; a group from a scan for context flags alone
-    # (long_running) is made of those, so fall back to them.
-    counted = STUCK if any(_counts(verdict, STUCK) for _, verdict in inside) else FLAGGED
+    # As the scan's groups counted them, from the states the scan was asked for.
+    counted = grouping_states(scan.states)
     members = [vm for vm, verdict in inside if _counts(verdict, counted)]
     healthy = [vm for vm, verdict in inside if not _counts(verdict, counted)]
     if not members:

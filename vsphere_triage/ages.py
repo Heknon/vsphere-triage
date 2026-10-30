@@ -87,7 +87,7 @@ def environments(
             "root_vm_folder": bool(folder and folder.parent_moref and folder.parent_name is None),
             "vms": len(vms),
             "powered_on": sum(1 for vm in vms if vm.powered_on),
-            # As everywhere else: an abnormal state or an attention flag.
+            # As everywhere else: an abnormal state or a trouble flag, not a context flag.
             "abnormal": sum(1 for verdict in verdicts.values() if verdict.abnormal),
             "states": dict(states),
             "age_unknown_vms": len(vms) - len(ages),

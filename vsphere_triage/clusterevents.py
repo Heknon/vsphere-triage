@@ -95,7 +95,9 @@ BUCKETS: tuple[tuple[str, str, re.Pattern[str]], ...] = (
         "a host failed (vSphere HA declared it failed)",
         re.compile(
             r"(?i)(\bDasHostFailedEvent\b|\bHostFailedEvent\b|\bvSphere HA detected .*host .*failed\b|"
-            r"\bpossible host failure\b|\b(state|state of the host .*) (has )?changed .* ?to Dead\b)"
+            r"\bpossible host failure\b|"
+            # HA's host state going Dead, not a storage path's ("path state changed to Dead").
+            r"^(?!.*\bpath\b).*\bstate (of the host .* )?(has )?changed\b.*\bto Dead\b)"
         ),
     ),
     (

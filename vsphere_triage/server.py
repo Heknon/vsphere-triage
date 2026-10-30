@@ -59,6 +59,7 @@ from vsphere_triage.checks import (
     BLOCKED_ON_QUESTION,
     BOOTED_NOT_UP,
     BUSY_NOT_UP,
+    CONTEXT_FLAGS,
     HUNG,
     INACCESSIBLE,
     LOST_HEARTBEAT,
@@ -629,14 +630,15 @@ def _register_fleet_tools(  # noqa: C901, PLR0915 - one closure per tool
             msg = f"unknown states or flags {unknown}; choose from {list(scanning.SELECTABLE)}"
             raise ValueError(msg)
         result = await scanning.run_scan(fleet, resolved, names)
+        result.states = wanted
         scans.put(result)
         # The VM rows are the bulk of a scan: list fewer of them before the
         # generic cut would trim the groups and findings along with them.
-        keep = max(1, min(limit, MAX_LIMIT))
-        summary = scanning.summary(result, states=wanted, limit=keep)
-        while keep > 1 and size(jsonable(summary)) > MAX_RESPONSE_CHARACTERS:
-            keep //= 2
-            summary = scanning.summary(result, states=wanted, limit=keep)
+        summary = scanning.summary(result, states=wanted, limit=max(1, min(limit, MAX_LIMIT)))
+        rows = summary["abnormal_vms"]
+        while len(summary["abnormal_vms"]) > 1 and size(jsonable(summary)) > MAX_RESPONSE_CHARACTERS:
+            summary["abnormal_vms"] = summary["abnormal_vms"][: len(summary["abnormal_vms"]) // 2]
+        summary["abnormal_vms_truncated"] += len(rows) - len(summary["abnormal_vms"])
         return summary
 
     @tool()
@@ -1621,6 +1623,13 @@ def _register_infrastructure_tools(tool: Callable[..., Any], fleet: VCenterPool,
                     for vm in vms
                     if verdicts[vm.moref].abnormal
                 ][:50],
+                # Not in trouble, but carrying a flag about this host or datastore
+                # (memory reclaimed, host memory pressure, a vCenter alarm).
+                "context_flagged_vms": [
+                    vm.identity() | {"flags": verdicts[vm.moref].flags}
+                    for vm in vms
+                    if not verdicts[vm.moref].abnormal and set(verdicts[vm.moref].flags) & set(CONTEXT_FLAGS)
+                ][:50],
             }
 
         return await fleet.run(name, run)
@@ -1669,6 +1678,13 @@ def _register_infrastructure_tools(tool: Callable[..., Any], fleet: VCenterPool,
                     vm.identity() | {"verdict": verdicts[vm.moref].as_dict()}
                     for vm in vms
                     if verdicts[vm.moref].abnormal
+                ][:50],
+                # Not in trouble, but carrying a flag about this host or datastore
+                # (memory reclaimed, host memory pressure, a vCenter alarm).
+                "context_flagged_vms": [
+                    vm.identity() | {"flags": verdicts[vm.moref].flags}
+                    for vm in vms
+                    if not verdicts[vm.moref].abnormal and set(verdicts[vm.moref].flags) & set(CONTEXT_FLAGS)
                 ][:50],
             }
 

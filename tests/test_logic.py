@@ -3770,3 +3770,32 @@ def test_a_vm_needing_consolidation_with_no_snapshot_tree_is_listed() -> None:
     assert [item["moref"] for item in found] == ["vm-9"]
     assert found[0]["consolidation_needed"] is True
     assert found[0]["delta_bytes"] == 12 * gb
+
+
+def test_a_storage_path_going_dead_is_not_a_host_failure() -> None:
+    path = clusterevents.classify_event("EsxCommonEvent", "Device naa.600 path state changed to Dead")
+    host = clusterevents.classify_event(
+        "com.vmware.vc.HA.HostStateChangedEvent",
+        "The vSphere HA availability state of the host esx-1 in cluster C1 has changed to Dead",
+    )
+
+    assert path is None or path[0] != "host_failure"
+    assert host is not None
+    assert host[0] == "host_failure"
+
+
+def test_a_datastore_whose_every_host_is_down_is_unknown_not_unreachable() -> None:
+    mounts = [
+        {
+            "host_moref": "host-1",
+            "mounted": True,
+            "accessible": False,
+            "inaccessible_reason": None,
+            "host_up": False,
+        }
+    ]
+
+    verdict = storagehealth.classify_datastore(_store(accessible=False, mounts=mounts), LIMITS)
+
+    assert verdict["healthy"] is None
+    assert verdict["findings"] == []
