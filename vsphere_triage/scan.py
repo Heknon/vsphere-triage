@@ -436,8 +436,9 @@ def explain_on_vcenter(
     hosts = [vscan.inventory.hosts[moref] for moref in host_ids if moref in vscan.inventory.hosts]
     cpu, unknown = hosts_cpu(session, hosts, begin=begin, end=end, thresholds=thresholds)
     member_hosts = {vm.host_moref for vm in members}
-    names = {name for vm in members for name in vm.datastores}
-    stores = [store for store in vscan.inventory.datastores.values() if store.get("name") in names]
+    # By moref: a datastore name can repeat across datacenters of one vCenter.
+    morefs = {moref for vm in members for moref in vm.datastore_morefs}
+    stores = [store for moref, store in vscan.inventory.datastores.items() if moref in morefs]
     disk = storage(
         session,
         {host.moref: host.name for host in hosts if host.moref in member_hosts},
