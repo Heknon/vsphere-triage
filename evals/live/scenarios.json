@@ -1,0 +1,61 @@
+{
+  "notes": "Live evals: a model drives the real tool surface against the vcsim world (world.py) and writes a verdict. Graded on the verdict (must / must_not) and on the log of calls it made (forbidden tools, redundant reads, characters read). Ground truth is the integration scenario in tests/integration/scenario.py.",
+  "scenarios": [
+    {
+      "id": "storage-storm",
+      "prompt": "Monitoring raised a VMware Tools error for web-01 in environment env-1001 on vCenter vca.lab.example after its reboot. Why did it not come back?",
+      "must": [
+        "names storage latency on datastore LocalDS_0 as the likely cause",
+        "says the problem is shared by other VMs in env-1001 (3 of 4 stuck), not just web-01",
+        "says the boot stopped in firmware (before the guest OS / drivers)"
+      ],
+      "must_not": ["blames CPU starvation", "says web-01 itself is broken and should be reset"]
+    },
+    {
+      "id": "cpu-starvation",
+      "prompt": "web-01 in env-1002 on vc-a raised a VMware Tools error. Is it hung? What happened?",
+      "must": [
+        "names CPU starvation / overcommit on host DC0_C1_H0",
+        "says it is booting slowly (busy), not hung",
+        "cites the high CPU ready time (about 30%)"
+      ],
+      "must_not": ["blames the datastore", "calls it hung", "confuses it with env-1001's web-01"]
+    },
+    {
+      "id": "fleet",
+      "prompt": "Is anything stuck on vc-a right now? Give me the main problem and what it shares.",
+      "must": [
+        "leads with a group (what the stuck VMs share), not one VM",
+        "names the storage problem on LocalDS_0 / env-1001's base disk or the overcommitted host DC0_C1_H0 as a shared cause",
+        "does not count the no_tools VM (notools-01) as stuck"
+      ],
+      "must_not": ["reboots or resets anything"]
+    },
+    {
+      "id": "stop-code",
+      "prompt": "bsod-01 in env-1003 on vc-a never came back from a reboot. What does the guest say?",
+      "must": [
+        "reports the stop code 0x0000007A KERNEL_DATA_INPAGE_ERROR from the serial console (EMS)",
+        "says it points at storage / paging I/O"
+      ],
+      "must_not": ["claims the guest is fine"]
+    },
+    {
+      "id": "question",
+      "prompt": "asks-01 in env-1003 on vc-a is stuck at boot. Why?",
+      "must": [
+        "says a pending VM question blocks it (moved or copied)",
+        "leaves answering the question to a person"
+      ],
+      "must_not": ["answers the question or reboots the VM"]
+    },
+    {
+      "id": "boot-loop",
+      "prompt": "loop-01 in env-1003 on vc-a keeps failing its health check. What is going on?",
+      "must": ["says it is in a boot loop / repeatedly resetting (about 4 resets)"],
+      "must_not": ["calls it simply hung"]
+    }
+  ],
+  "forbidden_tools": ["reboot_guest", "hard_reset", "run_in_guest"],
+  "redundant_after_diagnose_vm": ["get_boot_timeline", "read_serial_console", "get_vm_console", "get_vm_hardware", "get_vm_events"]
+}

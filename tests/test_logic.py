@@ -509,6 +509,29 @@ def test_the_strongest_group_is_the_one_that_concentrates_the_stuck_vms() -> Non
     assert "datastore" not in result["groups"]
 
 
+def test_a_scan_for_other_states_does_not_call_them_abnormal() -> None:
+    fleet = [
+        vm(
+            moref=f"vm-{index}",
+            host=f"esx-{index % 4}",
+            base_disk="[ds] base-a.vmdk" if index < 4 else "[ds] base-b.vmdk",
+            tools_running="guestToolsRunning" if index < 3 else "guestToolsNotRunning",
+            heartbeat="green",
+        )
+        for index in range(20)
+    ]
+
+    result = scan.summary(scan_of(fleet), states=["healthy"], limit=10)
+
+    assert result["findings"][0].startswith("3 healthy of 20")
+    assert all("abnormal" not in finding for finding in result["findings"][:2])
+    assert result["findings"][1].endswith("are healthy (5x the fleet rate)")
+    # The rows carry their meaning once, above them, and no unset values.
+    row = result["abnormal_vms"][0]["verdict"]
+    assert "meaning" not in row
+    assert None not in row["values"].values()
+
+
 def test_the_same_host_name_on_two_vcenters_is_two_hosts() -> None:
     fleet = [
         vm(vcenter="vc-a", moref="vm-1", host="DC0_H0"),
@@ -593,6 +616,41 @@ def test_a_stop_code_on_the_serial_console_names_the_crash_and_its_layer() -> No
     result = conclude(serial=serial)
 
     assert [cause["cause"] for cause in result["causes"]][:2] == [diagnose.WINDOWS_CRASH, diagnose.STORAGE]
+
+
+def test_a_boot_loop_is_the_cause_not_a_hang_of_its_last_boot() -> None:
+    # The last boot stopping after firmware is one turn of the loop, not a separate hang.
+    machine = vm(uptime_minutes=2.0, cpu_mhz=30.0)
+    verdict = checks.classify(machine, LIMITS, resets_in_window=4)
+    logs = {"timeline": {"boot_found": True, "last_stage": "firmware", "annotations": {}}}
+
+    result = diagnose.conclude(
+        verdict,
+        vm=machine,
+        cpu={"findings": [], "starved": False},
+        disk={"findings": [], "slow": False, "datastores": []},
+        environment={"signals": []},
+        logs=logs,
+        serial={"available": False},
+        console={"available": False},
+        host_log={"available": False},
+    )
+
+    assert result["causes"][0]["cause"] == diagnose.BOOT_LOOP_CAUSE
+    assert "4 resets" in result["causes"][0]["for"][0]
+    assert any("who resets it" in step for step in diagnose.next_checks(result, machine))
+
+
+def test_a_device_the_healthy_neighbours_share_argues_against_itself() -> None:
+    nic = "network adapter 'ethernet-0' is not connected (no link; PXE/DHCP would fail)"
+    machine = vm(cpu_mhz=10.0, uptime_minutes=40.0)
+    machine.device_blocks = [nic]
+
+    result = _conclude_on(machine, environment={"signals": [], "healthy_device_blocks": [nic]})
+
+    hardware = next(entry for entry in result["argued_against"] if entry["cause"] == diagnose.HARDWARE)
+    assert hardware["against"] == [f"a healthy VM in its environment has the same: {nic}"]
+    assert diagnose.HARDWARE not in [entry["cause"] for entry in result["causes"]]
 
 
 def test_nothing_read_is_listed_as_not_checked() -> None:

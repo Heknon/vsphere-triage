@@ -480,8 +480,11 @@ def summary(scan: Scan, *, states: Sequence[str] = FLAGGED, limit: int) -> dict[
     abnormal_on = sum(1 for _, verdict in abnormal if verdict.state != OFF)
     context_only = len(flagged) - len(abnormal)
     flagged_off = sum(1 for _, verdict in abnormal if verdict.state == OFF)
+    # Asked for other states (healthy, no_tools), the groups hold those VMs: say so,
+    # or "3 of 3 on a base disk are abnormal" would send a reader after healthy VMs.
+    word = "abnormal" if tuple(states) == FLAGGED else " or ".join(stuck)
     findings.append(
-        f"{abnormal_on} abnormal of {considered} powered-on VMs across {len(scan.vcenters)} vCenter(s)"
+        f"{abnormal_on} {word} of {considered} powered-on VMs across {len(scan.vcenters)} vCenter(s)"
         + (f"; {flagged_off} powered-off VM(s) also flagged" if flagged_off else "")
         + (
             f"; {context_only} more carry only context flags (long_running, memory_reclaimed, ...), "
@@ -491,7 +494,7 @@ def summary(scan: Scan, *, states: Sequence[str] = FLAGGED, limit: int) -> dict[
         )
     )
     findings.extend(
-        f"{row['abnormal']} of {row['population']} VMs on {row['dimension']} {row['value']!r} are abnormal "
+        f"{row['abnormal']} of {row['population']} VMs on {row['dimension']} {row['value']!r} are {word} "
         f"({row['times_fleet_rate']:g}x the fleet rate)"
         for row in strongest
     )
@@ -583,7 +586,8 @@ def summary(scan: Scan, *, states: Sequence[str] = FLAGGED, limit: int) -> dict[
         "abnormal_vms_total": len(abnormal),
         "context_flagged_vms_total": context_only,
         "abnormal_vms": [
-            vm.identity() | {"verdict": verdict.as_dict(), "notes": vm.notes} for vm, verdict in rows[:limit]
+            vm.identity() | {"verdict": _row_verdict(verdict), "notes": vm.notes}
+            for vm, verdict in rows[:limit]
         ],
         "abnormal_vms_truncated": max(0, len(rows) - limit),
         "next": (
@@ -591,6 +595,14 @@ def summary(scan: Scan, *, states: Sequence[str] = FLAGGED, limit: int) -> dict[
             "diagnose_vm on its representatives"
         ),
     }
+
+
+def _row_verdict(verdict: Verdict) -> dict[str, Any]:
+    """A verdict as a scan row shows it: the legend once, above the rows; unset values left out."""
+    shown = verdict.as_dict()
+    del shown["meaning"], shown["flags_meaning"]
+    shown["values"] = {key: value for key, value in verdict.values.items() if value not in (None, [], {})}
+    return shown
 
 
 def _sensor_names(host: dict[str, Any]) -> str:

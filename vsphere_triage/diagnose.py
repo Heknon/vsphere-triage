@@ -27,6 +27,7 @@ from pyVmomi import vim, vmodl
 from vsphere_triage import capabilities
 from vsphere_triage.checks import (
     BLOCKED_ON_QUESTION,
+    BOOT_LOOP,
     BOOTED_NOT_UP,
     BUSY_NOT_UP,
     CPU_LIMITED,
@@ -84,6 +85,7 @@ STILL_WORKING = "Windows still working through boot (slow, not hung)"
 CANNOT_BOOT = "the guest cannot boot"
 TOOLS_DID_NOT_START = "the guest booted; Tools did not start"
 EARLY_HANG = "the guest hung early in boot"
+BOOT_LOOP_CAUSE = "the VM is in a boot loop (it keeps resetting)"
 VM_FAULT = "the virtual machine faulted"
 TOOLS_FLAPPING_CAUSE = "Tools flapping"
 INACCESSIBLE_CAUSE = "vCenter cannot reach the VM"
@@ -579,6 +581,8 @@ def environment_pattern(
         "healthy_datastores": dict(Counter(ds for peer, _ in healthy for ds in peer.datastores)),
         "abnormal_base_disks": dict(Counter(peer.base_disk for peer, _ in abnormal if peer.base_disk)),
         "healthy_base_disks": dict(Counter(peer.base_disk for peer, _ in healthy if peer.base_disk)),
+        # What a device check flags on the healthy VMs too cannot be what stops this one.
+        "healthy_device_blocks": sorted({text for peer, _ in healthy for text in peer.device_blocks}),
         "vm_list": [
             {
                 "name": peer.name,
@@ -654,11 +658,27 @@ def conclude(  # noqa: C901, PLR0912, PLR0913, PLR0915 - one ordered list of cau
         evidence(INACCESSIBLE_CAUSE, weight=4, text=verdict.reasons[0])
     if verdict.state == BLOCKED_ON_QUESTION:
         evidence(QUESTION, weight=5, text=verdict.reasons[0])
+    if BOOT_LOOP in verdict.flags:
+        # Repeated resets are the finding whatever the last boot then did: each boot
+        # that stops early is one turn of the loop, not a separate hang.
+        evidence(
+            BOOT_LOOP_CAUSE,
+            weight=3,
+            text=f"{verdict.values.get('resets_in_window')} resets or guest reboots in the boot-loop window",
+        )
+    shared_devices = set(environment.get("healthy_device_blocks", []))
     for finding in vm.device_blocks:
         # A hint: a disconnected NIC or a device error can matter (PXE, a stuck
         # device), but rarely stops a boot from completing, so it is weighed
         # below a CPU or storage cause rather than above it.
         evidence(HARDWARE, weight=1, text=finding)
+        if finding in shared_devices:
+            evidence(
+                HARDWARE,
+                weight=2,
+                against=True,
+                text=f"a healthy VM in its environment has the same: {finding}",
+            )
     if snapshots and snapshots["count"]:
         gb = snapshots["total_bytes"] / (1024**3)
         if gb >= 1:
@@ -980,6 +1000,11 @@ def next_checks(conclusion: dict[str, Any], vm: VmFacts) -> list[str]:
         steps.append("powerflex_health (if configured): is a rebuild/rebalance running on the backend?")
     if leading & {EARLY_HANG, CANNOT_BOOT, VM_FAULT}:
         steps.append("does the same base disk boot fine on another host or datastore right now?")
+    if BOOT_LOOP_CAUSE in leading:
+        steps.append(
+            "who resets it: vCenter events name the user or HA, vmware.log says 'Guest-initiated reset' "
+            "for the guest's own; the serial console or console after a reset shows why"
+        )
     if leading & {WINDOWS_CRASH, KERNEL_ERROR}:
         steps.append("the stop code or kernel message: does it point at storage or CPU (points_at)?")
     if STILL_WORKING in leading:

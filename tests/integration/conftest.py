@@ -80,8 +80,14 @@ class Plan:
         for name in ("web-01", "db-01"):
             moref = a.moref("environments/env-1002", name)
             self.set(a, moref, "cpu.ready.summation", {"": 0.30 * 20_000 * 2})
-        # The storage incident: LocalDS_0 slow from the hosts env-1001 runs on.
-        for host in ("DC0_C0_H0", "DC0_C0_H1", "DC0_C0_H2"):
+        # The storage incident: LocalDS_0 slow from the hosts env-1001's clones run on,
+        # and so their own disks too. vcsim backs both datastores with one device, so
+        # DC0_C0_H2 (app-02, on LocalDS_1) stays healthy or the device would read slow there too.
+        for name in ("web-01", "db-01", "app-01"):
+            moref = a.moref("environments/env-1001", name)
+            self.set(a, moref, "virtualDisk.totalReadLatency.average", {"scsi0:0": 90.0})
+            self.set(a, moref, "virtualDisk.totalWriteLatency.average", {"scsi0:0": 160.0})
+        for host in ("DC0_C0_H0", "DC0_C0_H1"):
             self.set(
                 a,
                 a.hosts[host],
