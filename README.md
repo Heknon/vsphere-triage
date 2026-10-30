@@ -1,143 +1,42 @@
 # vsphere-triage
 
-A read-only vSphere MCP server that triages VMs which are stuck, did not come
-back after a reboot, or keep losing VMware Tools — across a fleet of vCenters
-where VMs are short-lived and their names are reused. It sweeps the fleet,
-groups the abnormal VMs by what they share, weighs the causes, and ends in a
-verdict. It discovers each vCenter's layout rather than assuming it, so it is
-not tied to any one platform; it plugs into whatever orchestrator creates your
-VMs through configuration and a skill (see [Using it with an
-orchestrator](docs/orchestrator-integration.md)).
+An MCP server for diagnosing VMware VMs that are stuck: VMs that did not come
+back after a boot or reboot, keep losing VMware Tools, wait on a question, or
+are starved by their host or storage. It reads from one or more vCenters,
+judges every VM, groups the abnormal ones by what they share (host, datastore,
+linked-clone base disk, environment folder), and gives a likely cause with the
+evidence for and against it.
 
-This repo ships two things: the **MCP server** (the `vsphere_triage` package,
-installed as the `vsphere-triage` command) and a **diagnosis skill** under
-[`skills/vm-incident/`](skills/vm-incident/) — the step-by-step incident
-procedure for a Claude Code agent driving the server. The server is delivered
-through PyPI; the skill through your Claude Code plugin / skills channel.
+It is built for fleets of short-lived VMs whose names are reused (CI or lab
+environments created by an orchestrator). It works against vCenter alone;
+vROps and Dell PowerFlex are optional extra sources.
 
-vROps (Aria / VCF Operations) is an **optional** integration: configure
-`VSPHERE_VROPS_URL` and it adds a handful of history tools (longer and finer
-than vCenter keeps). Everything else — the whole diagnosis — runs on vCenter
-alone, so the server is fully useful with no vROps at all.
+The repo contains:
 
-It is read-only with deliberate exceptions that act on a VM: `run_in_guest`
-executes a command inside a guest OS for a diagnostic a read cannot answer,
-`reboot_guest` / `hard_reset` reboot a wedged VM so it writes a fresh boot log,
-and `check_ems` / `investigate_windows_boot` read the guest's BCD and event log
-(so they too run a command in the guest). All are marked not-read-only and
-routed outside the read-only guard on purpose (see below); nothing else can
-change a VM.
+- **The MCP server**: the `vsphere_triage` Python package, installed as the
+  `vsphere-triage` command and published to PyPI.
+- **The `vm-incident` skill** ([`skills/vm-incident/`](skills/vm-incident/)):
+  the incident procedure a Claude Code agent follows when it drives the server.
+- **A Claude Code plugin** ([`.claude-plugin/`](.claude-plugin/)) that installs
+  both at once.
 
-It answers two kinds of question:
+[docs/orchestrator-integration.md](docs/orchestrator-integration.md) covers
+wiring it to the system that creates your VMs.
 
-- **From a VMware Tools error your monitoring raised** (which names the vCenter,
-  the machine and the environment id): `diagnose_vm(vcenter, env_id, vm_name)`
-  runs every check in a fixed order and ends in the likely cause.
-- **About the fleet** ("anything stuck on these vCenters?"): `scan` judges
-  every VM, groups the abnormal ones by what they share (host, datastore,
-  linked-clone base disk, environment, ...) against their population, and
-  `explain_group` says why a group is abnormal.
-
-## Read-only, by construction (with marked exceptions)
-
-The accounts it may run with can write, so the guarantee is in the code, not
-the account:
-
-- Every vSphere call goes through `readonly.ReadOnlyStub`, which refuses any
-  method not on a short `ALLOWED_METHODS` allowlist before a byte is sent:
-  login and logout, the clock, property reads, container views, `QueryEvents`,
-  `QueryPerf`, `BrowseDiagnosticLog` / `QueryDescriptions`, `QueryDateTime` (a
-  host's clock) and `SearchDatastore_Task` (which only lists files).
-- Every HTTP request (`vmware.log` and serial files over `/folder`, the
-  console over `/screen`) goes through `ensure_read_request`: GET only.
-- The console is read through `/screen`, never `CreateScreenshot_Task`, which
-  writes a PNG into the VM's folder.
-- A test drives every read-only tool against simulated vCenters and asserts
-  that the methods sent are a subset of the allowlist; another tries power,
-  reset, answer, reconfigure, destroy and screenshot-to-datastore through a
-  live session and expects each to be refused.
-
-**The exceptions are the three tools that act on a VM**, enabled deliberately
-and all routed outside the guard on the session's raw stub, never through
-`ReadOnlyStub`; a test proves that invoking each one never adds a method to the
-read-only (guarded) surface:
-
-- **`run_in_guest`** runs a command inside a guest OS through VMware Tools, for a
-  diagnostic a read cannot answer. It needs Tools running and guest-OS
-  credentials (per call, or `VSPHERE_GUEST_USERNAME` / `VSPHERE_GUEST_PASSWORD`),
-  and captures output via a temp file in the guest that it downloads and deletes.
-- **`reboot_guest`** asks the guest to reboot gracefully through Tools — no data
-  loss, but needs Tools and a responsive guest. Try it first.
-- **`hard_reset`** power-cycles the VM (`ResetVM_Task`) with no Tools, so it can
-  reboot a fully hung VM — but it is destructive: the guest is never asked, so
-  in-flight writes and in-guest evidence (an unwritten crash dump, update
-  progress) can be lost. Both exist because a wedged VM often has to be rebooted
-  before it writes a fresh boot log; prefer the graceful one.
-
-Everything else is read-only: nothing is created, changed, answered or deleted,
-and the server runs nothing in the background.
-
-## Concepts, not constants
-
-Nothing hard-codes a folder path, a log field or a naming pattern:
-
-- An environment is a folder named by its environment id. `find_environment`
-  looks for it (exact name first, then names containing it) and reports where it
-  found it and under which parent (environments, projects, anything). Several
-  matches are reported, never guessed between.
-  `VSPHERE_ENV_PARENT_HINTS` only orders the search.
-- A VM is identified by `(vcenter, moref)`. Its name is looked up only inside
-  its environment folder, since later environments reuse it.
-- A vCenter answers to its name, host, the host's first label and any
-  configured alias, so whatever spelling an upstream log uses resolves.
-- Group values carry their vCenter (`vc-a:DC0_H0`): two vCenters' hosts of the
-  same name are different hosts.
-- Every check returns the numbers it judged, beside its verdict; thresholds
-  are defaults in `VSPHERE_THRESHOLDS`, tuned on real incidents.
-
-## Install and configure
+## Quick start
 
 ```sh
-uvx vsphere-triage                           # run straight from PyPI, no install
-uv tool install vsphere-triage               # or install the command
-uv tool install .                             # or from a checkout; add [ocr] for console OCR (needs tesseract)
-pipx install vsphere-triage                   # or with pipx / pip
+uvx vsphere-triage                 # run from PyPI without installing
+uv tool install vsphere-triage     # or install the command
+pipx install vsphere-triage        # or with pipx
+uv tool install '.[ocr]'           # from a checkout, with console OCR (also needs the tesseract binary)
 ```
 
-**Internal / air-gapped:** the package need not come from public PyPI. Point uv
-at an internal mirror — `UV_INDEX_URL=https://pypi.internal/simple uvx
-vsphere-triage` — or install it straight from the git repo with no index at
-all: `uvx --from git+https://git.internal/vsphere-triage.git vsphere-triage`.
+Without public PyPI, point uv at a mirror
+(`UV_INDEX_URL=https://pypi.internal/simple uvx vsphere-triage`) or install
+from git (`uvx --from git+https://git.internal/vsphere-triage.git vsphere-triage`).
 
-Configure it entirely through `VSPHERE_`-prefixed environment variables — only
-`VSPHERE_VCENTERS` plus credentials are required; everything else has a default.
-
-| Variable | Default | Meaning |
-| --- | --- | --- |
-| `VSPHERE_VCENTERS` | none | JSON list: `[{"name": "vc-04", "host": "vc04.example", "port": 443, "aliases": ["vc04-old"]}]`; per-vCenter `username` / `password` override the shared ones |
-| `VSPHERE_USERNAME`, `VSPHERE_PASSWORD` | none | shared credentials |
-| `VSPHERE_CA_BUNDLE` | system | PEM bundle for an internal CA |
-| `VSPHERE_TLS_VERIFY` | `1` | `0` only against a simulator; warned about |
-| `VSPHERE_ENV_PARENT_HINTS` | none | folder names to look under first, e.g. `environments,projects` |
-| `VSPHERE_THRESHOLDS` | see `config.Thresholds` | JSON object overriding any threshold |
-| `VSPHERE_SCAN_BASE_DISKS` | `1` | read disk chains in a scan, to group linked clones by base disk |
-| `VSPHERE_TIMEOUT_SECONDS` | `60` | deadline per vCenter read |
-| `VSPHERE_SCAN_TIMEOUT_SECONDS` | `300` | deadline for a whole-vCenter sweep (`scan`, `diagnose_window`, the fleet reports), which is many reads in a row |
-| `VSPHERE_MAX_CONCURRENT_TOOLS` | `4` | tool calls at once |
-| `VSPHERE_MAX_CONCURRENT_PER_VCENTER` | `4` | reads at once per vCenter |
-| `VSPHERE_MAX_LOG_BYTES` | 4 MiB | how much of the end of a log is read |
-| `VSPHERE_MAX_DOWNLOAD_BYTES` | 128 MiB | ceiling on one datastore file when vCenter ignores a Range request |
-| `VSPHERE_MAX_LOG_LINES` | `400` | most lines one result returns |
-| `VSPHERE_MAX_SCREENSHOT_BYTES` | 16 MiB | ceiling on one console screenshot |
-| `VSPHERE_MAX_SCANS_KEPT` | `10` | how many recent scans stay available for `explain_group` (history depth, not a per-vCenter count) |
-| `VSPHERE_GUEST_USERNAME`, `VSPHERE_GUEST_PASSWORD` | none | **default guest-OS credentials for `run_in_guest`** — the one tool that is not read-only; omit to require them per call |
-| `VSPHERE_GUEST_EXEC_OVER_HTTP` | `0` | also offer the tools that act on a VM (guest commands, reboots, resets) over the HTTP transport, which has no authentication of its own; stdio always offers them |
-| `VSPHERE_GUEST_EXEC_TIMEOUT_SECONDS` | `30` | how long `run_in_guest` waits for a command to finish |
-| `VSPHERE_GUEST_EXEC_MAX_OUTPUT_BYTES` | 1 MiB | most command output `run_in_guest` returns |
-| `VSPHERE_VROPS_URL`, `VSPHERE_VROPS_USERNAME`, `VSPHERE_VROPS_PASSWORD`, `VSPHERE_VROPS_AUTH_SOURCE` | none | **optional** vROps (Aria / VCF Operations); its 5 history tools appear only when the URL is set |
-| `VSPHERE_POWERFLEX_URL`, `VSPHERE_POWERFLEX_USERNAME`, `VSPHERE_POWERFLEX_PASSWORD` | none | **optional** Dell PowerFlex (ScaleIO / VxFlex) Gateway; its backend-health tools appear only when the URL is set |
-
-An MCP client config, over stdio:
+The minimum configuration is the vCenter list and a login:
 
 ```json
 {
@@ -146,7 +45,7 @@ An MCP client config, over stdio:
       "command": "vsphere-triage",
       "env": {
         "VSPHERE_VCENTERS": "[{\"name\": \"vc-01\", \"host\": \"vc01.example\"}]",
-        "VSPHERE_USERNAME": "svc-readonly@vsphere.local",
+        "VSPHERE_USERNAME": "svc-triage@vsphere.local",
         "VSPHERE_PASSWORD": "...",
         "VSPHERE_CA_BUNDLE": "/etc/pki/internal-ca.pem",
         "VSPHERE_ENV_PARENT_HINTS": "environments,projects"
@@ -156,255 +55,396 @@ An MCP client config, over stdio:
 }
 ```
 
-Or shared over HTTP, alongside your other MCP servers:
-`vsphere-triage --transport streamable-http --host 0.0.0.0 --port 8000 --allowed-host vsphere-triage.example`
-(`/healthz` for probes). Over HTTP every caller shares the configured
-credential, and the HTTP transport has no authentication of its own, so
-the tools that act on a VM (`run_in_guest`, `reboot_guest`, `hard_reset`, `check_ems`, `investigate_windows_boot`, `investigate_linux_boot`, `read_crash_dump`) are **not offered over HTTP** unless
-`VSPHERE_GUEST_EXEC_OVER_HTTP=1` is set (do that only behind an authenticating
-proxy); every other tool only reads. Over stdio, the default, they are always offered.
+The server speaks MCP over stdio by default. Python 3.12 or later.
 
-A dedicated vCenter role is still worth creating where the account allows it,
-so the guarantee holds twice: read inventory, console screen read (confirm
-the privilege `/screen` needs on your version), datastore browse and file
-read, and diagnostics (host logs).
+## Two ways to start
 
-## Install into Claude Code as a plugin (server + skill)
+**From an alert about one VM.** A monitoring alert usually names the vCenter,
+the environment id and the machine. Pass them to `diagnose_vm`:
 
-`.mcp.json` registers the server but not the skill. To get **both** the MCP
-server and the `vm-incident` skill in one step, this repo is also a Claude Code
-plugin marketplace (`.claude-plugin/`). Add the marketplace and install:
+```
+diagnose_vm(vcenter="vc-01", env_id="env-1042", vm_name="web-01")
+```
+
+It runs every check in a fixed order (machine state, CPU, storage, the rest of
+the environment, events, boot timeline from `vmware.log`, serial console,
+console screen, snapshots, hardware) and returns a `finding`, the ranked
+causes with the evidence for and against each, what it could not read
+(`not_checked`), and the next checks to run. If your orchestrator knows when it
+rebooted the VM, pass `rebooted_at`; vCenter does not move `runtime.bootTime`
+on an in-guest reboot.
+
+**From a question about the fleet.** `scan` judges every VM on some or all
+vCenters and groups the abnormal ones. Each group is compared with its
+population, e.g. "29 of 210 VMs on ds-17 are abnormal, 6x the fleet rate".
+Then:
+
+1. `explain_group(scan_id, dimension, value)` on the strongest group: what its
+   abnormal VMs share that the healthy VMs beside them do not, plus host CPU
+   and datastore latency over their boot window.
+2. `diagnose_vm` on the representatives that `explain_group` returns.
+
+For an incident that has already passed (the VMs may be gone),
+`diagnose_window(since, until)` reads resets, failed power-ons, host CPU and
+storage for that window. `cluster_events` explains a mass reboot from vSphere
+HA restarts, host failures and migration waves.
+
+## How VMs, environments and vCenters are found
+
+- **Environments.** An environment is a VM folder named by its environment id,
+  under any parent folder (`environments/`, `projects/team-x/`, or anything
+  else). `find_environment` looks for a folder with exactly that name first,
+  then for names that contain it. It returns the path and the parent of every
+  match; when several match, it lists them and asks you to choose.
+  `VSPHERE_ENV_PARENT_HINTS` sets which parents are searched first.
+- **VMs.** Every result identifies a VM by `vcenter` and `moref` (e.g.
+  `vm-1042`). A VM name is looked up only inside its environment folder,
+  because later environments reuse the same names. A moref is unique on one
+  vCenter only, so always pass the vCenter with it.
+- **vCenter names.** A vCenter can be named by its configured `name`, its
+  `host`, any of its `aliases`, or the first label of its host (`vc01` for
+  `vc01.example`), so the spelling in an alert resolves. A name that matches
+  two vCenters is refused rather than guessed.
+- **Group values** carry their vCenter (`vc-a:esx-07`), so hosts or datastores
+  with the same name on two vCenters stay separate.
+- **Thresholds.** Every check returns the raw numbers it judged next to its
+  verdict. The thresholds are defaults (see [States and flags](#states-and-flags))
+  that you can override with `VSPHERE_THRESHOLDS`.
+
+## Configuration
+
+Everything is set through `VSPHERE_*` environment variables. Only
+`VSPHERE_VCENTERS` and credentials are required.
+
+| Variable | Default | Meaning |
+| --- | --- | --- |
+| `VSPHERE_VCENTERS` | none | JSON list of `{"name", "host", "port", "aliases", "username", "password"}`; `port` defaults to 443, per-vCenter credentials override the shared ones |
+| `VSPHERE_USERNAME`, `VSPHERE_PASSWORD` | none | shared vCenter credentials |
+| `VSPHERE_CA_BUNDLE` | system store | PEM bundle for an internal CA; also used for vROps and PowerFlex |
+| `VSPHERE_TLS_VERIFY` | `1` | set `0` only against a simulator; a warning is logged |
+| `VSPHERE_ENV_PARENT_HINTS` | none | parent folders searched first for an environment, e.g. `environments,projects` |
+| `VSPHERE_THRESHOLDS` | see below | JSON object overriding any threshold, e.g. `{"booted_not_up_minutes": 15}` |
+| `VSPHERE_SCAN_BASE_DISKS` | `1` | read each VM's disk chain during `scan`, so linked clones group by base disk; `0` makes large scans faster |
+| `VSPHERE_TIMEOUT_SECONDS` | `60` | deadline for one vCenter read |
+| `VSPHERE_SCAN_TIMEOUT_SECONDS` | `300` | deadline for a whole-vCenter sweep (`scan`, `diagnose_window`, the fleet reports, event history) |
+| `VSPHERE_MAX_CONCURRENT_TOOLS` | `4` | tool calls running at once |
+| `VSPHERE_MAX_CONCURRENT_PER_VCENTER` | `4` | reads running at once against one vCenter |
+| `VSPHERE_MAX_LOG_BYTES` | 4 MiB | how much of the end of a log file is read |
+| `VSPHERE_MAX_DOWNLOAD_BYTES` | 128 MiB | most bytes pulled for one datastore file when vCenter ignores the Range request |
+| `VSPHERE_MAX_LOG_LINES` | `400` | most log lines in one result |
+| `VSPHERE_MAX_SCREENSHOT_BYTES` | 16 MiB | largest console screenshot accepted |
+| `VSPHERE_MAX_SCANS_KEPT` | `10` | how many past scans `explain_group` can refer to |
+| `VSPHERE_GUEST_USERNAME`, `VSPHERE_GUEST_PASSWORD` | none | default guest-OS account for the tools that run a command in a guest; when unset, pass credentials per call |
+| `VSPHERE_GUEST_EXEC_TIMEOUT_SECONDS` | `30` | how long a guest command may run before it is terminated |
+| `VSPHERE_GUEST_EXEC_MAX_OUTPUT_BYTES` | 1 MiB | most guest-command output returned |
+| `VSPHERE_GUEST_EXEC_OVER_HTTP` | `0` | also offer the tools that act on a VM over the HTTP transport (see [Transports](#transports)) |
+| `VSPHERE_VROPS_URL`, `VSPHERE_VROPS_USERNAME`, `VSPHERE_VROPS_PASSWORD`, `VSPHERE_VROPS_AUTH_SOURCE` | none | optional vROps (Aria / VCF Operations); the `vrops_*` tools are registered only when the URL is set |
+| `VSPHERE_POWERFLEX_URL`, `VSPHERE_POWERFLEX_USERNAME`, `VSPHERE_POWERFLEX_PASSWORD` | none | optional Dell PowerFlex (ScaleIO / VxFlex) Gateway, 3.x API; the `powerflex_*` tools are registered only when the URL is set |
+
+## Transports
+
+**stdio** (the default) serves one MCP client and offers every tool.
+
+**Streamable HTTP** shares one server between several clients:
+
+```sh
+vsphere-triage --transport streamable-http --host 0.0.0.0 --port 8000 --allowed-host vsphere-triage.example
+```
+
+`/healthz` answers health probes. The HTTP transport has no authentication of
+its own, and every caller uses the configured vCenter and guest credentials.
+For that reason the seven tools that act on a VM (listed under
+[Tools that act on a VM](#tools-that-act-on-a-vm)) are not registered over
+HTTP unless `VSPHERE_GUEST_EXEC_OVER_HTTP=1`. Set it only behind a proxy that
+authenticates callers.
+
+## Install as a Claude Code plugin
+
+The plugin installs the server and the `vm-incident` skill together:
 
 ```
 /plugin marketplace add Heknon/vsphere-triage
 /plugin install vsphere-triage@vsphere-triage
 ```
 
-The install prompts for the vCenters JSON, username and password (kept in the
-OS secure store), and optionally the environment parent-folder hints, a CA
-bundle, vROps URL/credentials, `run_in_guest` credentials, and the package
-index (public PyPI, or an internal mirror for air-gapped installs). Leave any
-optional field blank to disable it. Anything not prompted here — thresholds,
-timeouts, `VSPHERE_TLS_VERIFY`, and the rest of the `VSPHERE_*` table above —
-is read from the environment the server inherits, so you can set those the
-usual way. The server runs via `uvx` and auto-starts; the skill is invoked as
-`/vsphere-triage:vm-incident`. Nothing is published to npm — the plugin is
-served straight from the git repo, and the Python package from PyPI or your
-internal index.
+The install asks for:
+
+- the vCenters JSON, username and password;
+- optionally: environment parent-folder hints, a CA bundle path, vROps URL and
+  credentials, PowerFlex URL and credentials, and guest-OS credentials;
+- the Python package index (public PyPI, or your internal mirror).
+
+Passwords are kept in the OS credential store. Leave an optional field blank to
+turn it off. Settings the install does not ask for (thresholds, timeouts,
+`VSPHERE_TLS_VERIFY`, ...) are read from the environment the server inherits.
+
+The plugin runs the server with `uvx vsphere-triage==<plugin version>`, so the
+server always matches the skill. Invoke the skill as
+`/vsphere-triage:vm-incident`.
 
 ## Tools
 
-| Tool | Answers |
+### Fleet
+
+| Tool | What it returns |
 | --- | --- |
-| `list_vcenters` | which vCenters, reachable, version, clock |
-| `check_vcenters` | reachability, login time and open-session count per vCenter, for when the vCenter API itself is failing (SSL EOF, resets) — the sign of connection/session exhaustion |
-| `vcenter_sessions` | a vCenter's open sessions grouped by user, source IP and client, with idle counts and the oldest — finds the client leaking sessions behind the exhaustion |
-| `vcenter_history` | a vCenter's session/login events over a past window (login surge, failed logins, one source churning) — for an SSL EOF or exhaustion that has since cleared, which the live `check_vcenters` cannot see |
-| `cluster_events` | cluster-level events over a window: vSphere HA restarts, host isolation/failure/connection-lost, DRS migration waves — names a mass-reboot cause above the VMs instead of inferring it |
-| `recent_tasks` | what was *done* on a vCenter in a window (migrations, reconfigures, snapshots, failures), grouped and wave-flagged — the "someone did X" cause that shows in no single VM |
-| `scan` | abnormal VMs on some or all vCenters, grouped by what they share; hosts over the CPU threshold and slow storage right now |
-| `explain_group` | what a scan group's abnormal VMs share that the healthy ones beside them do not; CPU and storage over its boot window |
-| `find_old_environments` | environments older than N hours (the age of their oldest VM), optionally only under `projects`, `environments`, `projects/team-x` or any other path segments, oldest first, with their VMs' states |
-| `diagnose_window` | resets, failed power-ons, host CPU and storage over a past window, when VMs may be gone |
-| `find_environment` | where an environment's folder is, on which vCenter(s), and its VMs |
-| `diagnose_vm` | one VM: machine, CPU, storage, environment, boot timeline, serial console (EMS), console; the likely cause with evidence for and against |
-| `diagnose_environment` | every VM of an environment, grouped, with CPU and storage |
-| `run_in_guest` | **not read-only** — runs a command inside a guest OS (needs VMware Tools and guest credentials) and returns its output and exit code, for a diagnostic a read cannot answer |
-| `reboot_guest` | **not read-only** — asks the guest to reboot gracefully through VMware Tools (no data loss, needs Tools); try this before `hard_reset` to make a wedged VM write a fresh boot log |
-| `hard_reset` | **not read-only, destructive** — power-cycles the VM (`ResetVM_Task`, no Tools needed) to reboot a fully hung VM; the guest is not asked, so in-flight writes and in-guest evidence can be lost |
-| `check_ems` | **not read-only** (reads the BCD in-guest) — whether the serial console (EMS on Windows) can carry the guest's boot words: serial-port hardware, output seen, and the `bcdedit` EMS state; says why it is unavailable and how to enable it |
-| `investigate_windows_boot` | **not read-only** (reads the guest) — the Windows boot picture from the guest's own event log: last bugcheck (WER 1001, decoded), unclean shutdowns, service/driver timeouts, slow-boot components, crash dumps and repair/update logs |
-| `investigate_linux_boot` | **not read-only** (reads the guest) — the Linux boot picture: dmesg (panics, soft-lockups, hung tasks, device timeouts, filesystem errors), systemd-analyze blame/critical-chain, journalctl -b, mapped to the layer each points at |
-| `read_crash_dump` | **not read-only** (reads the guest) — decodes the newest Windows minidump's header: the bugcheck code (to its layer) and the 4 parameters the event log omits; no WinDbg/symbols, so it does not name the faulting driver |
-| `powerflex_health` | **optional** (PowerFlex configured) — Dell PowerFlex backend health: SDS/device state and any rebuild/rebalance in progress, the usual cause of a PowerFlex-backed datastore going slow |
-| `powerflex_protection_domains` | **optional** — protection domains ranked by traffic (read/write IOPS + throughput), flagging a hot PD carrying a disproportionate share — the busy-PD pattern behind datastores on it going slow |
-| `powerflex_find_volume` | **optional** — map a slow datastore to its PowerFlex volume by name, id, or ESXi device id (naa/eui) |
-| `powerflex_affected_vms` | **optional** — the top-down flow: find troubled/hot protection domains, map their volumes back to vSphere datastores, and report the VMs on them split into suffering and healthy |
-| `get_boot_timeline` | how far the last boot got, from `vmware.log`, plus the serial console |
-| `read_vm_log` | `vmware.log` / `vmware-N.log` lines, filtered on the server |
-| `read_serial_console` | Windows EMS or a Linux kernel console, when the VM has a serial port to a file; stop codes with the layer each points at |
-| `get_vm_console` | the screen in words: black, frozen or changing, blue screen, OCR text and the boot screen it shows |
-| `get_vm_events` | a VM's events, by moref (a destroyed VM is reported as such) |
-| `get_vm_hardware` | the VM's virtual devices (adapters, controllers, disks, CD-ROM, sound, serial, USB, video) and vCenter's connection view; flags a down boot NIC, a mounted ISO or a device error |
-| `find_vms_by_device` | every VM across the vCenters that has, or lacks, a device — by category (sound, ethernet, usb, ...) or a kind substring (Vmxnet3, HdAudioCard); scoped with vcenters/under |
-| `hardware_profile` | the whole fleet's virtual hardware generically: counts per category and kind, NIC-type breakdown, and the VMs that differ from their environment's norm |
-| `find_vms_by_snapshot` | VMs with snapshots across the vCenters, biggest first — delta + memory-state size, oldest age, redo-chain depth, and consolidation-needed; the fleet view that catches a forgotten 50 GB snapshot |
-| `find_resource_limits` | VMs throttled or constrained by a configured CPU/memory limit or reservation — a CPU limit mimics host starvation, a memory limit forces balloon/swap; templates marked, since a linked clone inherits the template's limit |
-| `check_host_time` | each ESXi host's NTP configuration and clock skew from vCenter — drift breaks TLS and Kerberos/AD auth, a root of the SSL/handshake errors separate from session exhaustion |
-| `check_datastores` | every datastore's fill, thin over-provisioning and per-host reachability (APD/PDL); datastores holding a template's base disk are marked, since they take every clone down with them |
-| `get_host_health` | a host's CPU demand against capacity, its storage, its **hardware sensors** (PSU/fan/temperature/memory — a failing host stalls its VMs), and its VMs |
-| `get_datastore_health` | a datastore's latency and IOPS from every host mounting it, its VMs |
-| `read_host_log` | `vmkernel` / `hostd` / `vpxa` lines, filtered |
-| `vrops_*` | find a resource, list its stat keys, read stats, compare a window with previous days, alerts |
+| `list_vcenters` | each configured vCenter: reachable or not, version, clock |
+| `scan` | every VM judged; abnormal VMs grouped by vCenter, cluster, host, datastore, environment folder, its parent folder, base disk and OS, each group against its population; hosts over the CPU threshold, hosts near memory capacity, slow storage |
+| `explain_group` | for one group from a scan: what its abnormal VMs share that the healthy ones do not, and host CPU and storage over their boot window |
+| `diagnose_window` | resets, failed power-ons, host CPU and storage over a past window |
+| `cluster_events` | vSphere HA restarts and VM-monitoring resets, host failures, isolations and lost connections, failed failovers, maintenance mode and migration waves over a window; names the failed host and the hosts VMs restarted onto |
+| `recent_tasks` | tasks over a window grouped by kind (migration, reconfigure, snapshot, clone, power, destroy), flagging 10 or more migrations, reconfigures or snapshot operations as a wave. Task states are as recorded when each task started, so later failures may not show |
+| `find_old_environments` | environment folders older than N hours (age of their oldest VM), optionally under given path segments, oldest first |
+| `hardware_profile` | device counts per category and kind across the fleet, NIC types, and VMs whose devices differ from the rest of their environment |
+| `find_vms_by_device` | VMs that have, or lack, a device category (`sound`, `usb`, `ethernet`, ...) or kind (`Vmxnet3`, `HdAudioCard`) |
+| `find_vms_by_snapshot` | VMs with snapshots, largest first: delta and memory-state size, oldest age, redo-chain depth, consolidation needed; rolled up per template |
+| `find_resource_limits` | VMs with a CPU or memory limit or reservation, tightest limit first, templates marked (linked clones inherit a template's limit) |
+| `check_datastores` | each datastore's free space, thin over-provisioning ratio and per-host reachability (APD/PDL); datastores holding a template's base disk are marked |
+| `check_host_time` | each host's NTP configuration and clock skew from vCenter |
 
-### States and flags
+### One environment or VM
 
-Every VM gets exactly one state, from the bulk read alone:
-
-| State | Means |
+| Tool | What it returns |
 | --- | --- |
-| `inaccessible` | vCenter cannot reach or account for it |
-| `blocked_on_question` | waiting on a VM question |
-| `paused` | powered on, but the hypervisor is not running it |
-| `hung` | booted over 10 min ago, Tools never up, almost no CPU |
-| `busy_not_up` | the same, but burning CPU: starved, spinning or still working |
-| `booted_not_up` | booted over 10 min ago, Tools never up (or stuck running its startup scripts) |
-| `lost_heartbeat` | Tools runs, heartbeat red |
-| `no_boot_time` | powered on, no boot time reported |
-| `no_tools` | Tools not installed: not counted as stuck; judged by CPU, console and boot log |
-| `booting` | booted recently, normal so far |
-| `healthy`, `suspended`, `off` | as named |
+| `find_environment` | the folder(s) matching an environment id, on which vCenter, and their VMs |
+| `diagnose_environment` | every VM of one environment judged, with host CPU and storage for their hosts and datastores |
+| `diagnose_vm` | the full diagnosis of one VM, ending in ranked causes (see [Two ways to start](#two-ways-to-start)) |
+| `get_boot_timeline` | how far the last boot got according to `vmware.log` (power-on, firmware, first disk I/O, drivers, Tools), plus the serial console |
+| `read_vm_log` | `vmware.log` or `vmware-N.log` lines, filtered by a regex on the server (2 s match budget) |
+| `read_serial_console` | the serial-port file (Windows EMS, a Linux kernel console) with stop codes and the layer each points at |
+| `get_vm_console` | the console screen in words: black, frozen or changing, blue screen, OCR text and the boot screen it shows; optionally a thumbnail |
+| `get_vm_events` | a VM's events by moref; a destroyed VM is reported as destroyed |
+| `get_vm_hardware` | virtual devices and vCenter's connection state for each; flags a disconnected boot NIC, a mounted ISO or a device error |
 
-Flags ride beside the state. Those that matter alone (counted as abnormal):
-`boot_loop`, `tools_flapping`, `heartbeat_intermittent` (yellow heartbeat:
-Tools may be crashing), `memory_reclaimed` (ballooned, swapped or compressed),
-`host_memory_pressure`, `vcenter_alarm` (a red alarm, by name),
-`host_not_connected`, `long_running` (older than `long_running_hours`, 24 by
-default), `consolidation_needed`. Those that only add detail:
-`host_in_maintenance`, `tools_outdated`, `cpu_limited` (a CPU limit caps it
-below full speed — apparent starvation that is configured, not the host) and
-`memory_limited` (a memory limit below its RAM forces balloon/swap).
-`scan(states=[...])` selects any state or flag, for example `["no_tools"]` or
+### Hosts, datastores and vCenter
+
+| Tool | What it returns |
+| --- | --- |
+| `get_host_health` | a host's CPU demand against capacity, its storage, its hardware sensors (power supplies, fans, temperature, memory) and its VMs |
+| `get_datastore_health` | a datastore's latency and IOPS from every host that mounts it, and its VMs |
+| `read_host_log` | `vmkernel`, `hostd` or `vpxa` lines, regex-filtered |
+| `check_vcenters` | per vCenter: reachable, the server's last login time, a round-trip time and the open-session count, for SSL EOFs and resets caused by session exhaustion |
+| `vcenter_sessions` | a vCenter's open API sessions grouped by user, source IP and client, with idle counts and the oldest |
+| `vcenter_history` | login, logout and failed-login events over a past window, in 10-minute buckets, with the busiest sources |
+
+### Tools that act on a VM
+
+These seven change state or run code in a guest. Each one finds the VM
+strictly: an exact environment name, a matching VM name, and with a moref the
+name must match too. Each sends its action once and does not resend it if the
+vCenter session drops mid-call (the error then says the action may have run).
+
+| Tool | What it does |
+| --- | --- |
+| `run_in_guest` | runs a command in the guest OS through VMware Tools and returns its output and exit code; needs Tools running and guest credentials. Output goes to a temp file in the guest, which is downloaded and deleted |
+| `reboot_guest` | asks the guest OS to restart through Tools (a clean shutdown and boot); needs Tools. Requires the VM name together with a moref |
+| `hard_reset` | power-cycles the VM (`ResetVM_Task`) without asking the guest; works on a fully hung VM, but in-flight writes and unwritten crash dumps are lost. Use it only when `reboot_guest` cannot. Requires the VM name together with a moref |
+| `check_ems` | whether the serial console can carry the guest's boot output: serial-port hardware, output already seen, and on Windows the `bcdedit` EMS setting |
+| `investigate_windows_boot` | reads the guest's event log: the last bugcheck (WER 1001, decoded), Kernel-Power 41 / EventLog 6008 unclean shutdowns, service and driver start timeouts (SCM 7000/7009/7011/7026), slow-boot components, crash dumps, Startup Repair and Panther logs. Only events from a day before the latest boot onward count; older ones are listed separately |
+| `investigate_linux_boot` | reads `dmesg` (panics, soft lockups, hung tasks, I/O errors, filesystem errors), `systemd-analyze blame` and `critical-chain`, and the journal for the current and the previous boot. Says when the journal is not persistent, so the boot before a reboot was not read |
+| `read_crash_dump` | decodes the newest Windows minidump header: bugcheck code, its four parameters and when the dump was written. It does not name the faulting driver (that needs WinDbg and symbols) |
+
+The usual order for a wedged VM: read everything first, then `reboot_guest`, and
+`hard_reset` only if that fails or Tools is down. Then run the
+`investigate_*` tools on the fresh boot. A powered-off VM must be powered on by
+your orchestrator or in vCenter; the server has no power-on tool.
+
+### Optional: vROps
+
+`vrops_find_resource`, `vrops_list_stat_keys`, `vrops_get_stats`,
+`vrops_compare_window` (a window against the same hours on previous days) and
+`vrops_get_alerts`. vROps keeps longer and finer history than vCenter, which
+keeps 20-second samples for about an hour and 5-minute rollups for about a
+day.
+
+### Optional: PowerFlex
+
+| Tool | What it returns |
+| --- | --- |
+| `powerflex_health` | SDS and device state, rebuild and rebalance activity, and failed capacity, across every system the Gateway manages |
+| `powerflex_protection_domains` | protection domains ranked by read/write IOPS and throughput; one carrying over half the IOPS and 1.5x its even share is marked hot |
+| `powerflex_find_volume` | the PowerFlex volume behind a datastore, by volume name, id or ESXi device id (`eui.` / `naa.`) |
+| `powerflex_affected_vms` | troubled or hot protection domains, the datastores on their volumes, and the VMs on those datastores, split into suffering and not |
+
+## States and flags
+
+Every VM gets one state from the bulk property read, checked in this order:
+
+| State | Condition |
+| --- | --- |
+| `inaccessible` | connection state is not `connected` (orphaned, inaccessible, invalid) |
+| `blocked_on_question` | a VM question is pending |
+| `suspended` | power state is suspended |
+| `off` | powered off |
+| `paused` | powered on but paused |
+| `lost_heartbeat` | Tools running, heartbeat red |
+| `healthy` | Tools running |
+| `no_tools` | Tools not installed; not counted as stuck, judged by CPU, console and boot log |
+| `no_boot_time` | powered on, Tools not running, no boot time reported |
+| `booting` | booted less than `booted_not_up_minutes` (10) ago |
+| `hung` | booted longer ago, Tools not running, CPU at or below `hung_cpu_mhz` (100 MHz) |
+| `busy_not_up` | the same, but CPU at or above `busy_cpu_fraction` (50%) of its vCPUs |
+| `booted_not_up` | booted longer ago, Tools not running, CPU in between |
+
+Uptime is measured from the latest reset or guest-reboot event when there is
+one, because `runtime.bootTime` only changes on a power cycle.
+
+Flags appear next to the state. These count as abnormal on their own:
+`boot_loop` (3 resets in 30 minutes), `tools_flapping`,
+`heartbeat_intermittent` (yellow heartbeat), `memory_reclaimed` (ballooned,
+swapped or compressed), `host_memory_pressure` (host at 95% memory or more),
+`vcenter_alarm` (a red alarm on the VM), `host_not_connected`, `long_running`
+(older than 24 hours) and `consolidation_needed`. These add detail only:
+`host_in_maintenance`, `tools_outdated`, `cpu_limited` (a CPU limit at or
+below 90% of the VM's full speed) and `memory_limited` (a memory limit below
+its RAM).
+
+`scan(states=[...])` selects any state or flag, e.g. `["no_tools"]` or
 `["long_running"]`.
 
-The bulk read asks for about 35 properties per VM. A property an older vCenter
-does not have is dropped and the read retried, rather than failing the scan,
-and the result names what was dropped.
+Other default thresholds: CPU ready 10% per vCPU, co-stop 3%, host CPU demand
+100% of capacity, datastore and device latency 50 ms, kernel queue latency
+10 ms, snapshots 20 GB or 24 hours old or a chain 4 deep, clock skew 60 s,
+datastore 5% free, thin over-provisioning 2x, console black at 98% dark
+pixels.
 
-Results lead with `finding` / `findings`, keep the raw values, say what was
-not read (`not_checked`, `available: false` with a reason), and are bounded to
-fit a context window.
+## What the diagnosis measures
 
-## What the diagnoses rest on
+- **CPU starvation.** The VM's `cpu.ready.summation` as a percentage per vCPU,
+  and the host's `cpu.demand.average` against cores × core MHz. Demand over
+  100% is overcommit. When only `cpu.usagemhz` is available, overcommit is
+  reported as unknown, because usage cannot exceed capacity.
+- **Storage.** Per host, `datastore.totalReadLatency` /
+  `totalWriteLatency` for the VM's datastores, and
+  `disk.deviceLatency` / `kernelLatency` / `queueLatency` with aborts and
+  resets per device. High device latency points at the array; high queue
+  latency points at the host's own queue. A full or unreachable datastore is
+  reported as a separate cause from latency.
+- **The environment.** Whether the healthy VMs in the same environment share
+  the stuck VM's host, datastore or base disk. If they do, that argues against
+  the shared object being the cause.
+- **The boot.** `vmware.log` is written by the hypervisor, so it shows how far
+  a boot got but never the guest kernel's messages. Those come from the serial
+  console (when the VM has a serial port writing to a file), the console
+  screen, and the guest probes.
+- **Missing data** is listed as missing (`not_checked`, `available: false`
+  with a reason, `healthy: null`), never treated as healthy. Counters that
+  vCenter has already rolled up for an old window are reported as gaps.
 
-- **CPU starvation**: the VM's `cpu.ready.summation` as a percent per vCPU,
-  and the host's `cpu.demand.average` against cores x MHz. Demand over 100% is
-  overcommit; usage alone is reported as such, since it cannot exceed 100%.
-- **Storage**: the hosts' `datastore.total{Read,Write}Latency` for the VM's
-  datastores, `disk.{device,kernel,queue}Latency`, aborts and resets per
-  device. High device latency points at the storage array (e.g. PowerFlex),
-  high queue latency at the host's own queue.
-- **The environment**: whether the healthy VMs beside a stuck one share its
-  host, datastore and base disk (which argues against them) or not.
-- **The boot**: `vmware.log` is the hypervisor's log, not the guest's. It shows
-  how far a boot got (power-on or reset, firmware, first disk I/O, drivers,
-  Tools), never the guest kernel's own words.
-- **The guest's words**, when present: a serial port writing to a file
-  (Windows EMS, a Linux kernel console) and the console screen. A VM without
-  them is normal and the result says so.
+Results start with `finding` or `findings`, keep the raw values, and are cut
+to 120,000 characters, saying what was cut.
 
-## Developing and testing
+## What can change vSphere
 
-The project is managed with [uv](https://docs.astral.sh/uv/); `uv.lock` is
-committed, so `uv sync` reproduces the exact dev environment (the `dev`
-dependency group — pytest, ruff, ty — installs by default). CI runs `uv sync
---frozen`.
+Every vSphere API call from the read-only tools goes through
+`readonly.ReadOnlyStub`, which refuses any method not on `ALLOWED_METHODS`
+before it is sent. The list is: `RetrieveServiceContent`, `Login`, `Logout`,
+`CurrentTime`, `Fetch`, `RetrievePropertiesEx`, `ContinueRetrievePropertiesEx`,
+`CreateContainerView`, `DestroyView`, `QueryEvents`, `QueryPerf`,
+`QueryDescriptions`, `BrowseDiagnosticLog`, `QueryDateTime`, `QueryOptions` and
+`SearchDatastore_Task` (which only lists files).
+
+HTTP reads (`vmware.log` and serial files over `/folder`, the console over
+`/screen`) are GET only, and redirects are not followed. The console is read
+through `/screen`; `CreateScreenshot_Task` is not used, because it writes a PNG
+into the VM's folder. The vROps and PowerFlex clients send only GET requests,
+apart from vROps's token request.
+
+The seven tools that act on a VM use the session's unguarded stub. Tests check
+that every read-only tool, run against the simulators, sends only allowed
+methods; that power, reset, answer, reconfigure, destroy and
+screenshot-to-datastore are refused through a live session; and that the acting
+tools never add a method to the guarded surface.
+
+Running with a dedicated vCenter role limits the account as well. The
+read-only tools need inventory read, datastore browse and file download,
+diagnostics (host logs), the console-screen privilege (confirm which one
+`/screen` needs on your version) and `Sessions.View` for the global session
+list. The acting tools also need `VirtualMachine.GuestOperations.Query`,
+`.Modify` and `.Execute` for guest commands, and `VirtualMachine.Interact.Reset`
+for both `RebootGuest` and `ResetVM_Task`.
+
+## Development
+
+The project uses [uv](https://docs.astral.sh/uv/). `uv.lock` is committed and
+`uv sync` installs the dev tools (pytest, ruff, ty).
 
 ```sh
-uv sync                                        # set up the dev environment from the lock
-uv run python -m pytest -m "not integration"   # the fast unit suite (what CI runs)
-uv run python -m pytest                         # everything, including the vcsim integration tests
+uv sync                                        # dev environment from the lock
+uv run python -m pytest -m "not integration"   # unit tests, about 5 s (what CI runs)
+uv run python -m pytest                         # unit + integration (needs Docker)
 uv run ruff check . && uv run ruff format --check .
-uv run ty check vsphere_triage                  # type check (Astral's ty)
+uv run ty check vsphere_triage                  # type check, package only
 ```
 
-Lint is `ruff` with `select = ["ALL"]` (a short, documented ignore list in
-`pyproject.toml`); types are checked with `ty`, scoped to the package — the
-tests use deliberately loose fixture typing. Python 3.12+.
+Ruff runs with `select = ["ALL"]` and a short ignore list in `pyproject.toml`.
+`ty` checks the `vsphere_triage` package; the tests are not type-checked.
 
-CI (`.github/workflows/ci.yml`) runs lint, format, type check and the unit
-suite on every push, Linux only. The Docker-backed integration suite is not run per-commit — dispatch it by
-hand (Actions → CI → Run workflow → integration = true) or run it locally.
+`.github/workflows/ci.yml` runs lint, format, type check and the unit tests on
+every push and pull request. The integration suite runs by hand: Actions → CI
+→ Run workflow → `integration = true`, or locally.
 
-The integration tests build two simulated vCenters in Docker with
-`vmware/vcsim:v0.52.0` and `vmware/govc:v0.52.0`. One uses the environments
-layout and one the projects layout. They hold linked clones, stuck Windows
-and Linux VMs, a pending question, a boot loop, an EMS stop code, an
-environment id present on both vCenters and machine names reused across
-environments. For an air-gapped machine, `docker save` both images and
-`docker load` them there.
+### Integration tests
 
-What the simulator cannot do, and how the tests deal with it:
+`tests/integration/` builds two simulated vCenters in Docker with
+`vmware/vcsim:v0.52.0` and `vmware/govc:v0.52.0`, one with an `environments/`
+layout and one with `projects/`. They hold linked clones, stuck Windows and
+Linux VMs, a pending question, a boot loop, an EMS stop code, one environment
+id on both vCenters and machine names reused across environments. On an
+air-gapped machine, `docker save` both images and `docker load` them there.
 
-- Its performance counters are random, so CPU and storage numbers come from a
-  controlled fake of `VCenterSession.perf`. Everything else (inventory,
-  folders, disk chains, serial ports, events, files) is read from vcsim.
-- It has no `/screen` endpoint. The 404 path is tested against it; the image
-  analysis is tested with generated screenshots.
-- It has no host logs. That path is tested as "unavailable, said so".
+The simulator's limits, and how the tests handle them:
 
-## To confirm on a real vCenter
+- Performance counters are random, so CPU and storage numbers come from a
+  controlled fake of `VCenterSession.perf`.
+- There is no `/screen` endpoint: the 404 path is tested against vcsim, and the
+  image analysis against generated screenshots.
+- There are no host logs: tested as "unavailable".
+- Guest operations, snapshot sizes, NTP state, thin provisioning, APD/PDL and
+  HA events are not modelled: that logic is unit-tested only.
+
+### To confirm on a real vCenter
 
 - The privilege `/screen` needs, and what it returns for a black console.
-- The statistics level: what `QueryPerf` keeps past the realtime hour.
-- The datastore counter instances (volume id from `ds:///vmfs/volumes/<id>/`).
-  The datastore name and the last part of the URL are tried after it.
-- The `vmware.log` lines a real stuck boot, a stun and an APD leave. The
-  patterns in `vmlog.py` are heuristics, and every match is returned with
-  its line.
-- What EMS writes to the serial port on the Windows versions in the fleet.
-- The vROps stat keys on your version. `vrops_list_stat_keys` reads them.
-- Snapshot sizes: the simulator reports them as 0, so the delta/memory-state
-  accounting from `layoutEx` is unit-tested only; confirm the GB figures and the
-  `Sessions.View` privilege for sessions against a real vCenter.
-- Host clock skew: `QueryDateTime` per host and the `config.dateTimeInfo`/
-  `config.service` fields `check_host_time` reads — the simulator does not model
-  NTP state or a drifting clock, so the classification is unit-tested only.
-  Confirm the exact NTP service key (`ntpd` vs `chronyd`) and the skew at which
-  your AD auth breaks.
-- Datastore over-provisioning and APD/PDL: `summary.uncommitted` for thin space,
-  and a host mount that is `mounted` but `accessible: false` with an
-  `inaccessibleReason`. The simulator does not model either, so `check_datastores`
-  is unit-tested only; confirm the exact `inaccessibleReason` values your arrays
-  raise.
-- Resource limits: a VM's `config.cpuAllocation.limit` / `memoryAllocation.limit`
-  are read on the simulator, but confirm that a linked clone made from a template
-  with a limit actually inherits it (the clone-inheritance note in
-  `find_resource_limits` rests on that).
-- `run_in_guest`: the simulator does not implement guest operations, so the
-  guest-command path is unit-tested only (command shaping, the `*`-host transfer
-  URL). Confirm against a real vCenter: the guest-operation privileges the
-  account needs, that output capture via a redirected temp file and
-  `InitiateFileTransferFromGuest` works for your Windows and Linux guests, and
-  that the credentials behave as expected. `run_in_guest` is the one tool that
-  changes a VM; keep its credentials scoped accordingly.
-- That a guest reboot in your fleet logs a reset or guest-reboot event (so
-  uptime is measured from the reboot, not power-on); if some reboots are
-  silent to vCenter, pass `rebooted_at` from your orchestrator. The simulator
-  cannot exercise this — the logic is covered by unit tests only.
-- The `dcPath` for a datacenter that sits inside a folder, and a datastore
-  name shared across two datacenters. The simulator has one flat datacenter,
-  so these paths (full datacenter inventory path, datastore identity by moref)
-  are correct by construction but unverified live.
-- Whether `/folder` honours a suffix `Range` request; when it does not, a log
-  larger than `VSPHERE_MAX_DOWNLOAD_BYTES` is reported as un-tailable rather
-  than pulled whole.
+- Which counters your statistics level keeps past the realtime hour, and how
+  `/folder` handles a suffix `Range` request.
+- The datastore counter instance names (the volume id from
+  `ds:///vmfs/volumes/<id>/` is tried first, then the name).
+- The `vmware.log` lines your ESXi version writes for a stuck boot, a stun and
+  an APD. The patterns in `vmlog.py` are heuristics, and each match is
+  returned with its line.
+- What EMS writes on your Windows versions, and the vROps stat keys on your
+  version (`vrops_list_stat_keys` lists them).
+- The privilege that lets an account list every session (`Sessions.View` is
+  assumed), and snapshot sizes from `layoutEx` (the simulator reports 0).
+- Guest exec: the guest-operation privileges, and that output capture works on
+  your Windows and Linux guests.
+- That an in-guest reboot logs a reset or guest-reboot event. If yours are
+  silent, pass `rebooted_at` to `diagnose_vm`.
+- The HA event ids and messages your vCenter version writes, which
+  `cluster_events` matches by pattern.
+- A datacenter inside a folder, and one datastore name in two datacenters (the
+  simulator has one flat datacenter).
 
-## Releasing to PyPI
+## Releasing
 
-`.github/workflows/release.yml` publishes with **PyPI Trusted Publishing** — no
-token lives in the repo. One-time setup at
-[pypi.org/manage/account/publishing](https://pypi.org/manage/account/publishing):
-add a publisher for project `vsphere-triage`, owner `Heknon`, repository
+`.github/workflows/release.yml` publishes to PyPI with Trusted Publishing; no
+token is stored in the repo. The one-time setup at
+[pypi.org/manage/account/publishing](https://pypi.org/manage/account/publishing)
+is a publisher for project `vsphere-triage`, owner `Heknon`, repository
 `vsphere-triage`, workflow `release.yml`, environment `pypi` (and the same on
-test.pypi.org if you use the `testpypi` dispatch). Reserve the name first by
-publishing `0.0.0`, since PyPI names are first-come.
+test.pypi.org for the `testpypi` dispatch).
 
-Then releasing is a version bump:
+To release:
 
-1. raise `version` in `pyproject.toml` and, to the same value, `version` and the
-   pinned `vsphere-triage==X.Y.Z` in `.claude-plugin/plugin.json` (a unit test
-   keeps the three in step); commit, merge to `main`;
-2. the workflow sees the new version has no `vX.Y.Z` tag, runs the CI gate
-   (lint, types, unit tests), builds the sdist +
-   wheel, verifies the wheel installs and imports, publishes to PyPI, then tags
-   the commit and makes the GitHub release.
+1. Raise `version` in `pyproject.toml`, and set the same version and the
+   `vsphere-triage==X.Y.Z` pin in `.claude-plugin/plugin.json`. A unit test
+   fails if they differ.
+2. Merge to `main`. The workflow sees a version with no `vX.Y.Z` tag, runs the
+   CI gate, builds the sdist and wheel, installs and smoke-tests the wheel,
+   publishes to PyPI, tags the commit and creates the GitHub release.
 
-A merge that does not change the version stops at the gate. Tagging by hand
-(`git tag v0.2.0 && git push origin v0.2.0`) still works, and
-`workflow_dispatch` can publish the current branch to TestPyPI first.
-
-Both workflows are Linux-only and single-job by design — a pure-Python package
-needs no cross-platform matrix, which keeps the Actions bill small. The
-Docker-backed integration suite is never on the per-commit path; dispatch it
-when you want it.
+A merge that does not change the version publishes nothing. Pushing a tag by
+hand (`git tag vX.Y.Z && git push origin vX.Y.Z`) also releases, and a manual
+dispatch can publish the current branch to TestPyPI first. Run the integration
+suite before a release.
