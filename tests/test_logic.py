@@ -749,6 +749,16 @@ def test_a_boot_loop_whose_boots_look_hung_is_still_a_boot_loop() -> None:
     assert any(text.startswith("each boot stops early") for text in result["causes"][0]["for"])
 
 
+def test_a_busy_linux_guest_is_never_windows_still_working() -> None:
+    busy = vm(cpu_mhz=3600.0, uptime_minutes=40.0, os_family="linux", guest_os="Red Hat Enterprise Linux 8")
+
+    result = _conclude_on(busy)
+
+    assert diagnose.STILL_WORKING not in [
+        entry["cause"] for entry in [*result["causes"], *result["argued_against"]]
+    ]
+
+
 def test_nothing_read_is_listed_as_not_checked() -> None:
     result = conclude(cpu={"available": False, "reason": "x"})
 

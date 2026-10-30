@@ -986,6 +986,10 @@ def conclude(  # noqa: C901, PLR0912, PLR0913, PLR0915 - one ordered list of cau
     if verdict.state == BUSY_NOT_UP:
         evidence(STILL_WORKING, weight=1, text=verdict.reasons[-1])
 
+    if vm.os_family == "linux":
+        # The busy and console evidence above is phrased for Windows' long boots;
+        # a Linux guest is never "Windows still working".
+        causes.pop(STILL_WORKING, None)
     if BOOT_LOOP_CAUSE in causes and EARLY_HANG in causes:
         # Each boot of a loop stops early, then resets: what reads as an early hang
         # (a black console, a log that stops at firmware) is one turn of the loop.
