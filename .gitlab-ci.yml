@@ -1,0 +1,86 @@
+# Release pipeline for self-hosted GitLab — the internal counterpart to
+# .github/workflows/release.yml (which publishes to public PyPI from GitHub).
+#
+# Supports both deployment modes:
+#   - fully internal: publishes the wheel + sdist to THIS project's GitLab
+#     Package Registry (PyPI-compatible), using the built-in CI job token. No
+#     secrets to configure. Installers point uvx at that registry's simple
+#     index (see the plugin's `index_url` / README).
+#   - external: an optional, MANUAL job publishes the same artifacts to public
+#     PyPI when a PYPI_API_TOKEN CI variable is set.
+#
+# Triggered by pushing a version tag:  git tag v0.1.2 && git push origin v0.1.2
+# (GitHub auto-tags on a version bump; on GitLab you tag to release, which
+# avoids giving CI a token that can push tags back.)
+#
+# Air-gapped note: the runner must be able to pull the image below and resolve
+# build dependencies — mirror this image and point uv at your internal index
+# (UV_INDEX_URL) on the runner if the internet is not reachable.
+
+default:
+  image: ghcr.io/astral-sh/uv:python3.12-bookworm-slim
+
+stages: [build, publish]
+
+workflow:
+  rules:
+    - if: '$CI_COMMIT_TAG =~ /^v[0-9]+\.[0-9]+\.[0-9]+/'
+
+build:
+  stage: build
+  script:
+    # The tag must match pyproject's version — a vX.Y.Z tag that builds a
+    # different version uploads the wrong thing under the right name.
+    - version=$(uv run --no-project python -c "import pathlib,tomllib;print(tomllib.loads(pathlib.Path('pyproject.toml').read_text())['project']['version'])")
+    - test "v$version" = "$CI_COMMIT_TAG" || { echo "tag $CI_COMMIT_TAG != pyproject $version"; exit 1; }
+    - uv build
+    - uvx twine check --strict dist/*
+  artifacts:
+    paths: [dist/]
+    expire_in: 1 week
+
+verify:
+  stage: build
+  needs: [build]
+  script:
+    # Test the built artifact, not the checkout: install the wheel and import.
+    - uv venv /tmp/venv
+    - uv pip install --python /tmp/venv "$(ls dist/*.whl)"
+    - |
+      /tmp/venv/bin/python - <<'PY'
+      import vsphere_triage
+      from vsphere_triage.config import Settings
+      from vsphere_triage.server import build_server
+      assert "site-packages" in vsphere_triage.__file__.replace("\\", "/")
+      build_server(Settings.from_environment({
+          "VSPHERE_VCENTERS": '[{"name":"vc","host":"h"}]',
+          "VSPHERE_USERNAME": "u", "VSPHERE_PASSWORD": "p",
+      }))
+      print("wheel imports and the server wires up")
+      PY
+    - /tmp/venv/bin/vsphere-triage --help > /dev/null
+
+# Internal: always, to this project's GitLab Package Registry. No secrets.
+publish:internal:
+  stage: publish
+  needs: [build, verify]
+  variables:
+    TWINE_USERNAME: gitlab-ci-token
+    TWINE_PASSWORD: $CI_JOB_TOKEN
+  script:
+    - uvx twine upload --repository-url "${CI_API_V4_URL}/projects/${CI_PROJECT_ID}/packages/pypi" --skip-existing dist/*
+
+# External: opt-in and manual. Set a PYPI_API_TOKEN CI variable (or switch this
+# to GitLab OIDC trusted publishing) and click to run it.
+publish:pypi:
+  stage: publish
+  needs: [build, verify]
+  rules:
+    - if: '$PYPI_API_TOKEN'
+      when: manual
+      allow_failure: true
+  variables:
+    TWINE_USERNAME: __token__
+    TWINE_PASSWORD: $PYPI_API_TOKEN
+  script:
+    - uvx twine upload --skip-existing dist/*

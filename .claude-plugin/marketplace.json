@@ -1,0 +1,12 @@
+{
+  "name": "vsphere-triage",
+  "owner": { "name": "Heknon" },
+  "description": "Marketplace for the vsphere-triage plugin (MCP server + vm-incident skill)",
+  "plugins": [
+    {
+      "name": "vsphere-triage",
+      "source": "./",
+      "description": "vSphere VM incident triage: read-only MCP server plus the vm-incident diagnosis skill"
+    }
+  ]
+}

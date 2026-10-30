@@ -86,10 +86,17 @@ Nothing hard-codes a folder path, a log field or a naming pattern:
 ## Install and configure
 
 ```sh
-uv tool install vsphere-triage               # from PyPI once published
+uvx vsphere-triage                           # run straight from PyPI, no install
+uv tool install vsphere-triage               # or install the command
 uv tool install .                             # or from a checkout; add [ocr] for console OCR (needs tesseract)
 pipx install vsphere-triage                   # or with pipx / pip
 ```
+
+**Internal / air-gapped:** the package need not come from public PyPI. Point uv
+at an internal mirror (e.g. a GitLab Package Registry simple index) —
+`UV_INDEX_URL=https://gitlab.example/api/v4/projects/<id>/packages/pypi/simple uvx vsphere-triage`
+— or install it straight from the git repo with no index at all:
+`uvx --from git+https://gitlab.example/group/vsphere-triage.git vsphere-triage`.
 
 Configure it entirely through `VSPHERE_`-prefixed environment variables — only
 `VSPHERE_VCENTERS` plus credentials are required; everything else has a default.
@@ -144,6 +151,26 @@ A dedicated vCenter role is still worth creating where the account allows it,
 so the guarantee holds twice: read inventory, console screen read (confirm
 the privilege `/screen` needs on your version), datastore browse and file
 read, and diagnostics (host logs).
+
+## Install into Claude Code as a plugin (server + skill)
+
+`.mcp.json` registers the server but not the skill. To get **both** the MCP
+server and the `vm-incident` skill in one step, this repo is also a Claude Code
+plugin marketplace (`.claude-plugin/`). Add the marketplace and install:
+
+```
+/plugin marketplace add Heknon/vsphere-triage          # GitHub
+/plugin marketplace add https://gitlab.example/group/vsphere-triage.git   # or self-hosted GitLab
+/plugin install vsphere-triage@vsphere-triage
+```
+
+The install prompts for the vCenters JSON, username, password (kept in the OS
+secure store), and a **package index** — left at public PyPI for connected
+installs, or set to your internal mirror for air-gapped ones. The server then
+runs via `uvx` and auto-starts; the skill is invoked as
+`/vsphere-triage:vm-incident`. Nothing is published to npm — the plugin is
+served straight from the git repo, and the Python package from PyPI or your
+internal index.
 
 ## Tools
 
@@ -345,3 +372,16 @@ Both workflows are Linux-only and single-job by design — a pure-Python package
 needs no cross-platform matrix, which keeps the Actions bill small. The
 Docker-backed integration suite is never on the per-commit path; dispatch it
 when you want it.
+
+### Self-hosted GitLab / internal
+
+`.gitlab-ci.yml` is the internal counterpart for when the repo lives on
+self-hosted GitLab. Push a version tag (`git tag v0.1.2 && git push origin
+v0.1.2`) and it builds, verifies the wheel, and publishes to **this project's
+GitLab Package Registry** (PyPI-compatible) using the built-in CI job token —
+no secrets to configure, works air-gapped. Installers point `uvx` at that
+registry's simple index (the plugin's **package index** field, or
+`UV_INDEX_URL`). An optional **manual** job publishes the same artifacts to
+public PyPI when a `PYPI_API_TOKEN` CI variable is set — so one pipeline covers
+both internal and external. (GitHub auto-tags on a version bump; on GitLab you
+tag to release, which avoids handing CI a token that can push tags.)

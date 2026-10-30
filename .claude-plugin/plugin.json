@@ -1,0 +1,52 @@
+{
+  "name": "vsphere-triage",
+  "version": "0.1.1",
+  "description": "vSphere VM incident triage: read-only MCP server plus the vm-incident diagnosis skill",
+  "author": { "name": "Heknon" },
+  "license": "MIT",
+  "repository": "https://github.com/Heknon/vsphere-triage",
+  "keywords": ["mcp", "vsphere", "vcenter", "esxi", "triage", "diagnostics"],
+  "userConfig": {
+    "vcenters": {
+      "type": "string",
+      "title": "vCenters (JSON)",
+      "description": "VSPHERE_VCENTERS: a JSON list, e.g. [{\"name\":\"vc-01\",\"host\":\"vc01.example\"}]"
+    },
+    "username": {
+      "type": "string",
+      "title": "vCenter username",
+      "description": "A read-only service account (shared across vCenters unless overridden per-vCenter in the JSON)"
+    },
+    "password": {
+      "type": "string",
+      "title": "vCenter password",
+      "description": "Stored in the OS secure credential store",
+      "sensitive": true
+    },
+    "index_url": {
+      "type": "string",
+      "title": "Python package index",
+      "description": "Where uvx fetches vsphere-triage from. Leave as public PyPI for internet-connected installs; set to your internal PyPI mirror (e.g. a GitLab Package Registry simple index) for air-gapped installs.",
+      "default": "https://pypi.org/simple"
+    },
+    "ca_bundle": {
+      "type": "string",
+      "title": "CA bundle path (optional)",
+      "description": "VSPHERE_CA_BUNDLE: a PEM bundle for an internal CA; leave blank to use the system trust store",
+      "default": ""
+    }
+  },
+  "mcpServers": {
+    "vsphere-triage": {
+      "command": "uvx",
+      "args": ["vsphere-triage"],
+      "env": {
+        "UV_INDEX_URL": "${user_config.index_url}",
+        "VSPHERE_VCENTERS": "${user_config.vcenters}",
+        "VSPHERE_USERNAME": "${user_config.username}",
+        "VSPHERE_PASSWORD": "${user_config.password}",
+        "VSPHERE_CA_BUNDLE": "${user_config.ca_bundle}"
+      }
+    }
+  }
+}
