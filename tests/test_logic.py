@@ -3305,3 +3305,28 @@ def test_a_power_operation_by_moref_alone_is_refused() -> None:
 
     assert result["found"] is False
     assert "needs the VM's name" in result["reason"]
+
+
+# -- review against the PowerFlex SDKs ----------------------------------------------------------
+
+
+def test_a_degraded_pool_with_no_rebuild_running_is_not_healthy() -> None:
+    sds = [{"name": "sds-1", "sdsState": "Normal", "mdmConnectionState": "Connected"}]
+    devices = [{"id": "d1", "deviceState": "Normal", "errorState": "None"}]
+
+    degraded = powerflex.summarize_health(sds, devices, {"semiProtectedCapacityInKb": 4096})
+    unreachable = powerflex.summarize_health(sds, devices, {"inaccessibleCapacityInKb": 10})
+
+    assert degraded["healthy"] is False
+    assert degraded["rebuild_active"] is True
+    assert unreachable["data_unavailable"] is True
+
+
+def test_an_sds_state_field_that_is_null_is_not_a_down_sds() -> None:
+    sds = [{"name": "sds-1", "sdsState": "Normal", "mdmConnectionState": None, "membershipState": "Joined"}]
+    devices = [{"id": "d1", "deviceState": "Normal", "errorState": "None"}]
+
+    summary = powerflex.summarize_health(sds, devices, {"semiProtectedCapacityInKb": 0})
+
+    assert summary["sds_down"] == []
+    assert summary["healthy"] is True

@@ -141,34 +141,43 @@ def rank_protection_domains(rows: list[dict[str, Any]]) -> dict[str, Any]:
     }
 
 
-# Statistics that mean a rebuild, a rebalance or lost redundancy. The PowerFlex 3.x
-# names (pending*/activeMovingIn*), plus the older spellings some versions report.
+# Statistics that mean a rebuild, lost redundancy, a rebalance, or data with no
+# copy left. Names as Dell's own SDKs and 3.6 samples report them (goscaleio,
+# ansible-powerflex), plus older spellings kept for earlier releases; a key a
+# release does not report simply never matches.
 _REBUILD_KEYS = (
+    # Data down to one copy: degraded whether or not a rebuild is running (no
+    # spare capacity, or a rebuild that has not started or has stalled).
+    "semiProtectedCapacityInKb",
+    "semiProtectedVacInKb",
+    "degradedHealthyCapacityInKb",
+    "degradedHealthyVacInKb",
+    "degradedFailedCapacityInKb",
+    "degradedFailedVacInKb",
+    # A rebuild in progress or queued.
+    "fwdRebuildCapacityInKb",
+    "bckRebuildCapacityInKb",
+    "normRebuildCapacityInKb",
     "pendingFwdRebuildCapacityInKb",
     "pendingBckRebuildCapacityInKb",
-    "pendingNormRebuildCapacityInKb",
     "activeFwdRebuildCapacityInKb",
     "activeBckRebuildCapacityInKb",
-    "activeNormRebuildCapacityInKb",
     "activeMovingInFwdRebuildJobs",
     "activeMovingInBckRebuildJobs",
-    "activeMovingInNormRebuildJobs",
     "pendingMovingInFwdRebuildJobs",
     "pendingMovingInBckRebuildJobs",
-    "pendingMovingInNormRebuildJobs",
     "rebuildPendingCapacityInKb",
-    "degradedHealthyCapacityInKb",
-    "degradedFailedCapacityInKb",
 )
 _REBALANCE_KEYS = (
+    "rebalanceCapacityInKb",
     "pendingRebalanceCapacityInKb",
     "activeRebalanceCapacityInKb",
     "activeMovingInRebalanceJobs",
     "pendingMovingInRebalanceJobs",
     "rebalancePendingCapacityInKb",
 )
-# Data with no copy left: unavailable, the worst state a pool can be in.
-_FAILED_KEYS = ("failedCapacityInKb",)
+# Data with no copy left, or not reachable: unavailable, the worst state a pool can be in.
+_FAILED_KEYS = ("failedCapacityInKb", "failedVacInKb", "inaccessibleCapacityInKb")
 _PD_DEGRADED_KEYS = (*_REBUILD_KEYS, *_REBALANCE_KEYS, *_FAILED_KEYS)
 
 
@@ -294,11 +303,12 @@ def summarize_health(
     pending-capacity field is above zero.
     """
     healthy_sds = {"normal", "connected", "joined"}
+    # A field that is absent or null is not reported, not unhealthy.
     sds_down = [
         node
         for node in sds
-        if not all(
-            str(node.get(key, "normal")).lower() in healthy_sds
+        if any(
+            node.get(key) is not None and str(node[key]).lower() not in healthy_sds
             for key in ("sdsState", "mdmConnectionState", "membershipState")
         )
     ]
