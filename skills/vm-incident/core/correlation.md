@@ -39,8 +39,10 @@ clocks. A reset time comes from a vCenter event (vCenter's clock), latency from
 a host counter (the host's clock), and the orchestrator's reboot time from the
 runner (a third clock).
 
-If they agree within one sample interval (20 s for realtime counters, 5 min for
-historical), trust the correlation. If the orchestrator's reboot time and
+If they agree within one sample interval, trust the correlation. The interval
+grows with age: 20 s for the last hour (realtime), 5 min up to a day back,
+30 min up to a week, 2 h up to a month, then a day. A counter from last week is
+a 30-minute average, so a 5-minute coincidence in it means little. If the orchestrator's reboot time and
 vCenter's power-on event differ by minutes, say so and widen the window rather
 than trusting either to the second.
 

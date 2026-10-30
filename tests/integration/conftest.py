@@ -74,14 +74,26 @@ class Plan:
 
     def __init__(self, a: scenario.World) -> None:
         self.values: dict[tuple[str, str, str], dict[str, float]] = {}
+        # Each VM's CPU over the window is what vcsim reports it using now, so the
+        # series and the instant reading agree (a starved VM busy, a hung one idle).
+        for machine in a.machines.values():
+            self.set(a, machine.moref, "cpu.usagemhz.average", {"": float(machine.cpu_mhz)})
         # The CPU incident: one host at 120% demand; its stuck VMs wait 30% of the time.
         self.set(a, a.hosts["DC0_C1_H0"], "cpu.demand.average", {"": 1.2 * HOST_CAPACITY})
         self.set(a, a.hosts["DC0_C1_H0"], "cpu.usagemhz.average", {"": 0.99 * HOST_CAPACITY})
         for name in ("web-01", "db-01"):
             moref = a.moref("environments/env-1002", name)
             self.set(a, moref, "cpu.ready.summation", {"": 0.30 * 20_000 * 2})
-        # The storage incident: LocalDS_0 slow from the hosts env-1001 runs on.
-        for host in ("DC0_C0_H0", "DC0_C0_H1", "DC0_C0_H2"):
+        # The storage incident: LocalDS_0 slow from the hosts env-1001's clones run on,
+        # and so the disks of every VM reaching it through them. vcsim backs both
+        # datastores with one device, so DC0_C0_H2 (app-02, on LocalDS_1) stays healthy
+        # or the device would read slow there too.
+        slow_path = ("DC0_C0_H0", "DC0_C0_H1")
+        for machine in a.machines.values():
+            if machine.datastore == "LocalDS_0" and machine.host in slow_path:
+                self.set(a, machine.moref, "virtualDisk.totalReadLatency.average", {"scsi0:0": 90.0})
+                self.set(a, machine.moref, "virtualDisk.totalWriteLatency.average", {"scsi0:0": 160.0})
+        for host in slow_path:
             self.set(
                 a,
                 a.hosts[host],

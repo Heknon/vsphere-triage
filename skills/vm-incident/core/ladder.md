@@ -42,8 +42,16 @@ out.
 `diagnose_vm(vcenter, env_id=…, vm_name=…)`, or with `moref=` if you have it.
 Pass `rebooted_at` when the orchestrator logged the reboot time. It returns
 `finding`, `conclusion` (ranked causes with evidence for and against),
-`machine`, `environment`, `cpu`, `storage`, `boot`, `serial_console`,
-`console`, `snapshots`, `events` and `evidence_gaps`.
+`machine` (state, flags, question, and the virtual hardware in `devices` and
+`device_findings`), `environment`, `cpu`, `storage`, `host_hardware`,
+`host_log`, `boot`, `serial_console`, `console`, `snapshots`, `events`,
+`evidence_gaps` and `next_checks`.
+Those sections hold what `get_boot_timeline` (`boot`, `serial_console`),
+`read_serial_console` (`serial_console`), `get_vm_console` (`console`),
+`get_vm_hardware` (`machine.devices`, `machine.device_findings`) and
+`get_vm_events` (`events`) return, so do not call them for the same VM: read
+the section instead. Call them only after a reboot,
+or to read further than the section shows (`read_vm_log` for more log lines).
 
 Read it in this order:
 

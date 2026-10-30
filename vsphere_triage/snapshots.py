@@ -123,13 +123,17 @@ async def find_vms_by_snapshot(  # noqa: PLR0913 - one filtered fleet query
     matched.sort(key=lambda row: row["total_bytes"], reverse=True)
 
     total_gb = sum(row["total_bytes"] for row in rows) / GIGABYTE
+    # A snapshot always has a delta file with a size: a total of exactly 0 is
+    # vCenter not reporting sizes, not a snapshot that costs nothing.
+    unsized = sum(1 for row in rows if not row["total_bytes"])
     findings = [
         (
             f"{len(matched)} VMs with snapshots matched across {len(read)} vCenter(s); "
             f"{total_gb:.0f} GB of snapshot data on {len(rows)} VMs in all"
+            + (f" ({unsized} of them with no size reported by vCenter)" if unsized else "")
         )
     ]
-    if matched:
+    if matched and matched[0]["total_bytes"]:
         biggest = matched[0]
         findings.append(
             f"biggest: {biggest['name']} on {biggest['vcenter']} — "
@@ -146,8 +150,8 @@ async def find_vms_by_snapshot(  # noqa: PLR0913 - one filtered fleet query
         worst = by_template[0]
         findings.append(
             f"template-wide: {worst['clones']} clones of {worst['vcenter']}:{worst['base_disk']} carry "
-            f"{worst['total_gb']} GB of snapshots between them — the template is the common factor, "
-            "whatever the clones are named"
+            + (f"{worst['total_gb']} GB of " if worst["total_gb"] else "")
+            + "snapshots between them — the template is the common factor, whatever the clones are named"
         )
     for name, error in errors.items():
         findings.append(f"vCenter {name} not read: {error}")
@@ -163,9 +167,10 @@ async def find_vms_by_snapshot(  # noqa: PLR0913 - one filtered fleet query
                 "folder": row["folder"],
                 "base_disk": row["base_disk"],
                 "snapshots": row["count"],
-                "total_gb": round(row["total_bytes"] / GIGABYTE, 2),
-                "delta_gb": round(row["delta_bytes"] / GIGABYTE, 2),
-                "memory_state_gb": round(row["state_bytes"] / GIGABYTE, 2),
+                # None, not 0, when vCenter reported no sizes.
+                "total_gb": round(row["total_bytes"] / GIGABYTE, 2) if row["total_bytes"] else None,
+                "delta_gb": round(row["delta_bytes"] / GIGABYTE, 2) if row["total_bytes"] else None,
+                "memory_state_gb": round(row["state_bytes"] / GIGABYTE, 2) if row["total_bytes"] else None,
                 "oldest_age_hours": row["oldest_age_hours"],
                 "max_chain_depth": row["max_chain_depth"],
                 "consolidation_needed": row["consolidation_needed"],
@@ -177,6 +182,6 @@ async def find_vms_by_snapshot(  # noqa: PLR0913 - one filtered fleet query
         "errors": errors,
         "note": (
             "snapshot size is the delta (redo-log) files plus the .vmsn memory/state files, from "
-            "layoutEx; where vCenter does not report sizes they read as 0 and count/age/chain still apply"
+            "layoutEx; where vCenter reports no sizes they are null, and count/age/chain still apply"
         ),
     }

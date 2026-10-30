@@ -59,6 +59,8 @@ def summarize(samples: list[tuple[datetime, float]]) -> dict[str, Any] | None:
         "mean": round(fmean(values), 2),
         "last": round(values[-1], 2),
         "peak_at": peak_at,
+        # No peak to time: the first sample is the "peak", and moves with the window read.
+        "steady": len(values) > 1 and min(values) == peak,
         "samples": len(values),
         "from": samples[0][0],
         "to": samples[-1][0],
@@ -293,23 +295,35 @@ def storage(  # noqa: C901, PLR0912, PLR0915 - one report over many counters
         worst_read: list[tuple[datetime, float]] = []
         worst_write: list[tuple[datetime, float]] = []
         iops: list[tuple[datetime, float]] = []
+        # Per latency: the hosts that report this datastore, and those that saw it slow.
+        reporting: dict[str, set[str]] = {"read_latency_ms": set(), "write_latency_ms": set()}
+        slow_from: dict[str, set[str]] = {"read_latency_ms": set(), "write_latency_ms": set()}
         for moref in host_morefs:
             per_host = series.get(moref, {})
-            for name, sink in (
-                ("datastore.totalReadLatency.average", worst_read),
-                ("datastore.totalWriteLatency.average", worst_write),
-                ("datastore.numberReadAveraged.average", iops),
-                ("datastore.numberWriteAveraged.average", iops),
+            for name, sink, label in (
+                ("datastore.totalReadLatency.average", worst_read, "read_latency_ms"),
+                ("datastore.totalWriteLatency.average", worst_write, "write_latency_ms"),
+                ("datastore.numberReadAveraged.average", iops, None),
+                ("datastore.numberWriteAveraged.average", iops, None),
             ):
                 found = per_host.get(name)
                 instance = next((item for item in instances if found and item in found.samples), None)
                 if found is not None and instance is not None:
                     entry["matched_instance"] = instance
-                    sink.extend(found.samples[instance])
+                    samples = found.samples[instance]
+                    sink.extend(samples)
+                    if label and samples:
+                        host_name = hosts.get(moref, moref)
+                        reporting[label].add(host_name)
+                        if max(value for _, value in samples) >= thresholds.datastore_latency_ms:
+                            slow_from[label].add(host_name)
         # Worst across the hosts mounting it: each host sees its own latency to it.
         entry["read_latency_ms"] = summarize(sorted(worst_read))
         entry["write_latency_ms"] = summarize(sorted(worst_write))
         entry["iops"] = summarize(_sum_by_time(iops))
+        # The series above pool every host that reports the datastore; which ones saw
+        # it slow is the path-or-array question, so say it rather than leave it in the mean.
+        entry["slow_from_hosts"] = sorted(slow_from["read_latency_ms"] | slow_from["write_latency_ms"])
         free, capacity = store.get("free_bytes"), store.get("capacity_bytes")
         if free is not None and capacity:
             free_percent = free / capacity * 100
@@ -328,10 +342,19 @@ def storage(  # noqa: C901, PLR0912, PLR0915 - one report over many counters
         for label in ("read_latency_ms", "write_latency_ms"):
             summary = entry[label]
             if summary and summary["max"] >= thresholds.datastore_latency_ms:
+                when = (
+                    f"held at {summary['max']:.0f} ms from {summary['from']:%H:%M:%S}Z "
+                    f"to {summary['to']:%H:%M:%S}Z"
+                    if summary.get("steady")
+                    else f"peaked at {summary['max']:.0f} ms at {summary['peak_at']:%H:%M:%S}Z"
+                )
+                slow, seen = sorted(slow_from[label]), len(reporting[label])
+                where = (
+                    f", from {len(slow)} of {seen} hosts ({', '.join(slow)})" if 0 < len(slow) < seen else ""
+                )
                 findings.append(
-                    f"datastore {store.get('name')} {label.split('_')[0]} latency peaked at "
-                    f"{summary['max']:.0f} ms at {summary['peak_at']:%H:%M:%S}Z "
-                    f"(threshold {thresholds.datastore_latency_ms:g} ms)"
+                    f"datastore {store.get('name')} {label.split('_')[0]} latency {when} "
+                    f"(threshold {thresholds.datastore_latency_ms:g} ms){where}"
                 )
         result["datastores"].append(entry)
 

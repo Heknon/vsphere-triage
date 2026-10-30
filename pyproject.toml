@@ -82,6 +82,8 @@ known-third-party = ["mcp"]
 
 [tool.ruff.lint.per-file-ignores]
 "tests/**" = ["S101", "D100", "D101", "D102", "D103", "D104", "D107", "PLR2004", "SLF001", "INP001", "S105", "S106", "S603", "S607", "S310", "S311", "ARG001", "PLR0913", "FBT001", "FBT003", "C901", "PLR0915"]
+# Command-line scripts a person runs by hand: they print, and are not a package.
+"evals/**" = ["INP001", "T201", "S310", "PLR2004", "D103"]
 
 [tool.ty.environment]
 python-version = "3.12"

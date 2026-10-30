@@ -130,11 +130,17 @@ that are stuck — on first boot, after a reboot, or hung at any point — slow 
 come up, losing VMware Tools, blocked on a question, starved, or wedged by a
 virtual device; and for when the vCenter API itself is the problem (SSL EOF
 errors, resets, timeouts, often connection or session exhaustion). Every tool
-reads only, with three deliberate exceptions that act on a VM: run_in_guest
-executes a command inside a guest OS (needs VMware Tools and guest credentials)
-for a diagnostic a read cannot answer, and reboot_guest / hard_reset reboot a
-wedged VM so it writes a fresh boot log. They are marked not-read-only; prefer a
-graceful reboot_guest over a destructive hard_reset, and nothing else changes a VM.
+reads only from vSphere. Seven are marked not-read-only because they reach into
+the guest or its power state:
+- reboot_guest / hard_reset reboot a wedged VM so it writes a fresh boot log
+  (the only tools that change a VM; prefer the graceful reboot_guest).
+- run_in_guest runs a command in the guest, for a diagnostic a read cannot answer.
+- check_ems, investigate_windows_boot, investigate_linux_boot and read_crash_dump
+  run fixed read-only queries in the guest.
+run_in_guest, the investigate_* tools and read_crash_dump need VMware Tools and
+guest credentials; reboot_guest needs Tools; hard_reset needs neither; check_ems
+reads the serial port without Tools (only its Windows BCD check needs them).
+None of the seven is a first step.
 
 When the symptom is SSL EOF / reset / timeout against a vCenter that many
 clients hit (this server included), start with check_vcenters: a high session
@@ -605,7 +611,7 @@ def _register_fleet_tools(  # noqa: C901, PLR0915 - one closure per tool
         *,
         vcenters: list[str] | None = None,
         states: list[str] | None = None,
-        limit: int = 20,
+        limit: int = 10,
     ) -> dict[str, Any]:
         """Find abnormal VMs on some or all vCenters, and what the abnormal ones share.
 
@@ -613,7 +619,10 @@ def _register_fleet_tools(  # noqa: C901, PLR0915 - one closure per tool
         question, lost heartbeat, inaccessible, boot loops) and groups the
         abnormal ones by vCenter, cluster, host, datastore, environment folder,
         linked-clone base disk and OS, each against its population. Also reports
-        hosts over the CPU threshold and slow storage right now.
+        hosts over the CPU threshold and slow storage right now. Read findings and
+        strongest_groups first: the group is usually the answer, and explain_group
+        lists its members. The first `limit` abnormal VMs come in full;
+        more_abnormal_vms names the rest, one line each.
 
         Args:
             vcenters: vCenter names (any spelling they are known by); all when empty.
@@ -635,10 +644,19 @@ def _register_fleet_tools(  # noqa: C901, PLR0915 - one closure per tool
         # The VM rows are the bulk of a scan: list fewer of them before the
         # generic cut would trim the groups and findings along with them.
         summary = scanning.summary(result, states=wanted, limit=max(1, min(limit, MAX_LIMIT)))
-        rows = summary["abnormal_vms"]
+        rows, more = summary["abnormal_vms"], summary["more_abnormal_vms"]
+        summary["more_abnormal_vms"] = []
         while len(summary["abnormal_vms"]) > 1 and size(jsonable(summary)) > MAX_RESPONSE_CHARACTERS:
             summary["abnormal_vms"] = summary["abnormal_vms"][: len(summary["abnormal_vms"]) // 2]
         summary["abnormal_vms_truncated"] += len(rows) - len(summary["abnormal_vms"])
+        # The rows cut for size are still named, one line each, as far as the budget allows.
+        summary["more_abnormal_vms"] = [
+            scanning.brief(row) for row in rows[len(summary["abnormal_vms"]) :]
+        ] + more
+        while summary["more_abnormal_vms"] and size(jsonable(summary)) > MAX_RESPONSE_CHARACTERS:
+            summary["more_abnormal_vms"] = summary["more_abnormal_vms"][
+                : len(summary["more_abnormal_vms"]) // 2
+            ]
         return summary
 
     @tool()
@@ -1010,7 +1028,7 @@ def _register_machine_tools(  # noqa: C901, PLR0915 - one closure per tool
         reboot or power-on you are investigating) when you have it: a guest reboot
         does not move vCenter's power-on time, so without it a warm-rebooted VM
         can look up for days and be misjudged as stuck. The result's
-        machine.values.boot_time_source says what uptime was measured from
+        machine.boot_time_source says what uptime was measured from
         (reported_reboot, reboot_event or power_on).
 
         Args:
@@ -1381,6 +1399,8 @@ def _register_piece_tools(  # noqa: C901 - one closure per tool
     async def get_boot_timeline(*, vcenter: str, moref: str) -> dict[str, Any]:
         """How far the VM's last boot got, from vmware.log, and its serial console (EMS) if any.
 
+        diagnose_vm already returns this; call it to re-read after a reboot or to read more.
+
         Args:
             vcenter: the VM's vCenter.
             moref: the VM's moref.
@@ -1458,6 +1478,8 @@ def _register_piece_tools(  # noqa: C901 - one closure per tool
     async def read_serial_console(*, vcenter: str, moref: str, tail: int = 80) -> dict[str, Any]:
         """The VM's serial console file: Windows EMS or a Linux kernel console, if it has one.
 
+        diagnose_vm already returns this; call it to re-read after a reboot or to read more.
+
         Reports stop codes (with the layer each usually points at) and kernel
         errors. A VM with no serial port to a file is reported as such; that is
         normal and not a failure.
@@ -1484,6 +1506,8 @@ def _register_piece_tools(  # noqa: C901 - one closure per tool
     ) -> dict[str, Any]:
         """The console screen, read into words: black, frozen or changing, blue screen, OCR text.
 
+        diagnose_vm already returns this; call it to re-read after a reboot or to read more.
+
         Args:
             vcenter: the VM's vCenter.
             moref: the VM's moref.
@@ -1508,6 +1532,8 @@ def _register_piece_tools(  # noqa: C901 - one closure per tool
     @tool()
     async def get_vm_events(*, vcenter: str, moref: str, minutes: int = 120) -> dict[str, Any]:
         """The VM's vCenter events (power, reset, migration, HA, reconfigure, messages).
+
+        diagnose_vm already returns this; call it to re-read after a reboot or to read more.
 
         Args:
             vcenter: the VM's vCenter.
@@ -1542,6 +1568,8 @@ def _register_piece_tools(  # noqa: C901 - one closure per tool
     @tool()
     async def get_vm_hardware(*, vcenter: str, moref: str) -> dict[str, Any]:
         """The VM's virtual hardware and each device's connection state.
+
+        diagnose_vm already returns this; call it to re-read after a reboot or to read more.
 
         Lists the virtual adapters, controllers, disks, CD-ROM, sound, serial,
         USB and video the VM has, and vCenter's view of whether each connectable

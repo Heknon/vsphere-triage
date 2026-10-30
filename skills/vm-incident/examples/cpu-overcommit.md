@@ -29,8 +29,9 @@ error was the orchestrator's timeout.
      `only_abnormal_on host`.
    - `cpu`: `vm_ready_percent_per_vcpu` peaked at 38%; `cpu.host` esx-31 at
      118% demand, overcommitted. `storage`: latency normal.
-   - `conclusion.causes[0]`: CPU starvation, high confidence; "the VM is busy,
-     so it is more likely booting slowly than hung".
+   - `conclusion.causes[0]`: CPU starvation, high confidence. The headline
+     (`finding`) adds "the VM is busy, so it is more likely booting slowly than
+     hung".
    - `console`: two captures 10 s apart; the screen changed between them.
 
 4. **vROps.** `vrops_find_resource("esx-31", "HostSystem")`, then

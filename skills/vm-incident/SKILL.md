@@ -97,8 +97,13 @@ Seven tools change a VM or run code in it: `run_in_guest`, `reboot_guest`,
 `hard_reset`, `check_ems`, `investigate_windows_boot`,
 `investigate_linux_boot` and `read_crash_dump`. Use them only when the
 read-only evidence leaves a gap that matters to the verdict, and record in the
-verdict what you ran. They need VMware Tools running in the guest (except
-`hard_reset`) and, for the guest-command ones, guest credentials. Each one
+verdict what you ran. `run_in_guest`, `reboot_guest`, the two
+`investigate_*` tools and `read_crash_dump` need VMware Tools running in the
+guest (and, except `reboot_guest`, guest credentials). `hard_reset` needs
+neither. `check_ems` reads the serial port and its output file without Tools;
+only its Windows BCD check needs Tools and credentials, so run it on a VM whose
+Tools is down too. If none of these tools is listed, the server was started
+without guest execution: record that as a gap. Each one
 needs the VM's name with its moref (or the environment id with the name) and
 refuses when the VM at that moref has another name: morefs repeat across
 vCenters.
@@ -161,9 +166,11 @@ an `evidence_gaps` list to carry over. The common ones:
 With PowerFlex configured, read `powerflex_health` (failures, rebuild,
 rebalance) and `powerflex_protection_domains` (a domain carrying most of the
 IOPS), and map a slow datastore to its volume with `powerflex_find_volume`.
-When you already know a protection domain is in trouble, `powerflex_affected_vms`
-lists the datastores on its volumes and the VMs on them, split into suffering
-and not.
+`powerflex_affected_vms` finds the troubled protection domains itself (a rebuild
+or degraded state, or most of the IOPS) and lists the datastores on their
+volumes and the VMs on them, split into suffering and not. It takes no domain
+to look at: if it reports none troubled, the domain you suspected did not meet
+that test, which is evidence too.
 
 ## Files
 

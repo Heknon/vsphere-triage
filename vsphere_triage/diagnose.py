@@ -27,9 +27,11 @@ from pyVmomi import vim, vmodl
 from vsphere_triage import capabilities
 from vsphere_triage.checks import (
     BLOCKED_ON_QUESTION,
+    BOOT_LOOP,
     BOOTED_NOT_UP,
     BUSY_NOT_UP,
     CPU_LIMITED,
+    HEALTHY,
     HEARTBEAT_INTERMITTENT,
     HOST_MEMORY_PRESSURE,
     HOST_NOT_CONNECTED,
@@ -38,8 +40,10 @@ from vsphere_triage.checks import (
     MEMORY_LIMITED,
     MEMORY_RECLAIMED,
     NO_TOOLS,
+    OFF,
     PAUSED,
     RESET_EVENTS,
+    SUSPENDED,
     TOOLS_FLAPPING,
     Verdict,
     classify,
@@ -84,6 +88,7 @@ STILL_WORKING = "Windows still working through boot (slow, not hung)"
 CANNOT_BOOT = "the guest cannot boot"
 TOOLS_DID_NOT_START = "the guest booted; Tools did not start"
 EARLY_HANG = "the guest hung early in boot"
+BOOT_LOOP_CAUSE = "the VM is in a boot loop (it keeps resetting)"
 VM_FAULT = "the virtual machine faulted"
 TOOLS_FLAPPING_CAUSE = "Tools flapping"
 INACCESSIBLE_CAUSE = "vCenter cannot reach the VM"
@@ -97,6 +102,32 @@ MEMORY = "memory pressure (the host ballooning or swapping the VM)"
 DATASTORE_CAPACITY = "its datastore is full or unreachable (APD/PDL)"
 HOST_DISCONNECTED = "its ESXi host is not connected to vCenter"
 HOST_HARDWARE = "its ESXi host reports failing hardware"
+# Every cause a diagnosis can name; core/causes.md explains each.
+CAUSES = (
+    CPU,
+    STORAGE,
+    BOOT_STORM,
+    WINDOWS_CRASH,
+    KERNEL_ERROR,
+    STILL_WORKING,
+    CANNOT_BOOT,
+    TOOLS_DID_NOT_START,
+    EARLY_HANG,
+    BOOT_LOOP_CAUSE,
+    VM_FAULT,
+    TOOLS_FLAPPING_CAUSE,
+    INACCESSIBLE_CAUSE,
+    QUESTION,
+    HARDWARE,
+    SNAPSHOT,
+    CPU_LIMIT_CAUSE,
+    MEMORY_LIMIT_CAUSE,
+    PAUSED_CAUSE,
+    MEMORY,
+    DATASTORE_CAPACITY,
+    HOST_DISCONNECTED,
+    HOST_HARDWARE,
+)
 
 DIAGNOSE_PATHS = (
     *VM_PATHS,
@@ -107,6 +138,8 @@ DIAGNOSE_PATHS = (
     "layoutEx",
 )
 LAYOUT_TTL_SECONDS = 60.0
+# A VM using this share of its CPU limit is running at the limit, held back by it.
+LIMIT_BINDING_SHARE = 0.9
 EVENTS_KEPT = 40
 HOST_LOG_LINES = 2000
 SERIAL_BYTES = 256 * 1024
@@ -244,7 +277,14 @@ def locate(  # noqa: C901, PLR0911, PLR0912 - one lookup, each way it can fail b
             }
         return {"found": True, "vm": vm, "row": row, "layout": layout}
     if not env_id or not vm_name:
-        return {"found": False, "reason": "give either a moref, or both env_id and vm_name"}
+        return {
+            "found": False,
+            "reason": (
+                "give either a moref, or both env_id and vm_name: a name is reused by later "
+                "environments, so it means nothing outside its environment folder. Without the "
+                "env id, find_environment(env_id) or a scan lists the VMs with their morefs"
+            ),
+        }
     folders = find_environment(layout.folders, env_id, settings.env_parent_hints)
     if not folders:
         return {
@@ -579,6 +619,12 @@ def environment_pattern(
         "healthy_datastores": dict(Counter(ds for peer, _ in healthy for ds in peer.datastores)),
         "abnormal_base_disks": dict(Counter(peer.base_disk for peer, _ in abnormal if peer.base_disk)),
         "healthy_base_disks": dict(Counter(peer.base_disk for peer, _ in healthy if peer.base_disk)),
+        # What a device check flags on the healthy VMs too cannot be what stops this one.
+        # The VM itself is left out: a booting VM counts as healthy, and must not be
+        # compared with itself.
+        "healthy_device_blocks": sorted(
+            {text for peer, _ in healthy if peer.moref != vm.moref for text in peer.device_blocks}
+        ),
         "vm_list": [
             {
                 "name": peer.name,
@@ -654,11 +700,29 @@ def conclude(  # noqa: C901, PLR0912, PLR0913, PLR0915 - one ordered list of cau
         evidence(INACCESSIBLE_CAUSE, weight=4, text=verdict.reasons[0])
     if verdict.state == BLOCKED_ON_QUESTION:
         evidence(QUESTION, weight=5, text=verdict.reasons[0])
+    if BOOT_LOOP in verdict.flags:
+        # Repeated resets are the finding whatever the last boot then did: each boot
+        # that stops early is one turn of the loop, not a separate hang.
+        evidence(
+            BOOT_LOOP_CAUSE,
+            weight=3,
+            text=f"{verdict.values.get('resets_in_window')} resets or guest reboots in the boot-loop window",
+        )
+    shared_devices = set(environment.get("healthy_device_blocks", []))
     for finding in vm.device_blocks:
         # A hint: a disconnected NIC or a device error can matter (PXE, a stuck
         # device), but rarely stops a boot from completing, so it is weighed
         # below a CPU or storage cause rather than above it.
-        evidence(HARDWARE, weight=1, text=finding)
+        if finding in shared_devices:
+            # Not counted for: a healthy VM has it too. Said, so a reader need not check.
+            evidence(
+                HARDWARE,
+                weight=0,
+                against=True,
+                text=f"a healthy VM in its environment has the same: {finding}",
+            )
+        else:
+            evidence(HARDWARE, weight=1, text=finding)
     if snapshots and snapshots["count"]:
         gb = snapshots["total_bytes"] / (1024**3)
         if gb >= 1:
@@ -704,12 +768,18 @@ def conclude(  # noqa: C901, PLR0912, PLR0913, PLR0915 - one ordered list of cau
         evidence(HOST_HARDWARE, weight=2 if slows else 1, text=f"host hardware sensors red: {names}")
     if HEARTBEAT_INTERMITTENT in verdict.flags:
         evidence(TOOLS_FLAPPING_CAUSE, weight=2, text="Tools runs but its heartbeat is intermittent (yellow)")
-    if CPU_LIMITED in verdict.flags and verdict.state in (BUSY_NOT_UP, HUNG, BOOTED_NOT_UP):
+    if CPU_LIMITED in verdict.flags and verdict.state not in (OFF, SUSPENDED):
+        # Strongest when it is stuck, or running at the limit; a VM well under its
+        # limit is not being held back by it right now, only capped for a burst.
+        limit, used = values.get("cpu_limit_mhz") or 0, values.get("cpu_mhz") or 0
+        binding = bool(limit) and used >= LIMIT_BINDING_SHARE * limit
+        stuck = verdict.state in (BUSY_NOT_UP, HUNG, BOOTED_NOT_UP)
         evidence(
             CPU_LIMIT_CAUSE,
-            weight=3,
-            text=f"a CPU limit of {values.get('cpu_limit_mhz')} MHz is set: the VM is capped below its "
-            "full speed, which looks like host starvation but is configured, not the host",
+            weight=3 if stuck or binding else 1,
+            text=f"a CPU limit of {limit} MHz is set (using {used:g} MHz now"
+            + (", at the limit" if binding else ", under it, so not holding it back at this moment")
+            + "): a limit looks like host starvation but is configured, not the host",
         )
     if MEMORY_LIMITED in verdict.flags and MEMORY_RECLAIMED in verdict.flags:
         evidence(
@@ -717,6 +787,14 @@ def conclude(  # noqa: C901, PLR0912, PLR0913, PLR0915 - one ordered list of cau
             weight=2,
             text=f"a memory limit of {values.get('memory_limit_mb')} MB is set below the VM's "
             f"{values.get('memory_mb')} MB RAM, so the host must balloon or swap it",
+        )
+    elif MEMORY_LIMITED in verdict.flags:
+        evidence(
+            MEMORY_LIMIT_CAUSE,
+            weight=1,
+            text=f"a memory limit of {values.get('memory_limit_mb')} MB is set below the VM's "
+            f"{values.get('memory_mb')} MB RAM: nothing is reclaimed yet, but the guest cannot use "
+            "the RAM above the limit without the host ballooning or swapping it",
         )
 
     if cpu.get("available", True):
@@ -908,6 +986,17 @@ def conclude(  # noqa: C901, PLR0912, PLR0913, PLR0915 - one ordered list of cau
     if verdict.state == BUSY_NOT_UP:
         evidence(STILL_WORKING, weight=1, text=verdict.reasons[-1])
 
+    if vm.os_family == "linux":
+        # The busy and console evidence above is phrased for Windows' long boots;
+        # a Linux guest is never "Windows still working".
+        causes.pop(STILL_WORKING, None)
+    if BOOT_LOOP_CAUSE in causes and EARLY_HANG in causes:
+        # Each boot of a loop stops early, then resets: what reads as an early hang
+        # (a black console, a log that stops at firmware) is one turn of the loop.
+        hang = causes.pop(EARLY_HANG)
+        loop = causes[BOOT_LOOP_CAUSE]
+        loop["for"].extend(f"each boot stops early: {text}" for text in hang["for"])
+        loop["score"] += max(hang["score"], 0)
     ranked = sorted(causes.values(), key=lambda entry: entry["score"], reverse=True)
     for entry in ranked:
         support, opposed = len(entry["for"]), len(entry["against"])
@@ -946,6 +1035,10 @@ def conclude(  # noqa: C901, PLR0912, PLR0913, PLR0915 - one ordered list of cau
     )
     if starved_not_hung:
         headline += "; the VM is busy, so it is more likely booting slowly than hung"
+    if verdict.state == HEALTHY:
+        headline += (
+            "; vCenter sees the VM up (Tools running), so these are what would slow it, not why it is stuck"
+        )
     if verdict.state == NO_TOOLS:
         headline += (
             "; VMware Tools is not installed, so its absence says nothing: judge by the console, "
@@ -980,6 +1073,11 @@ def next_checks(conclusion: dict[str, Any], vm: VmFacts) -> list[str]:
         steps.append("powerflex_health (if configured): is a rebuild/rebalance running on the backend?")
     if leading & {EARLY_HANG, CANNOT_BOOT, VM_FAULT}:
         steps.append("does the same base disk boot fine on another host or datastore right now?")
+    if BOOT_LOOP_CAUSE in leading:
+        steps.append(
+            "who resets it: vCenter events name the user or HA, vmware.log says 'Guest-initiated reset' "
+            "for the guest's own; the serial console or console after a reset shows why"
+        )
     if leading & {WINDOWS_CRASH, KERNEL_ERROR}:
         steps.append("the stop code or kernel message: does it point at storage or CPU (points_at)?")
     if STILL_WORKING in leading:

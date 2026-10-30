@@ -509,6 +509,86 @@ def test_the_strongest_group_is_the_one_that_concentrates_the_stuck_vms() -> Non
     assert "datastore" not in result["groups"]
 
 
+def test_a_scan_for_other_states_does_not_call_them_abnormal() -> None:
+    fleet = [
+        vm(
+            moref=f"vm-{index}",
+            host=f"esx-{index % 4}",
+            base_disk="[ds] base-a.vmdk" if index < 4 else "[ds] base-b.vmdk",
+            tools_running="guestToolsRunning" if index < 3 else "guestToolsNotRunning",
+            heartbeat="green",
+        )
+        for index in range(20)
+    ]
+
+    result = scan.summary(scan_of(fleet), states=["healthy"], limit=10)
+
+    assert result["findings"][0].startswith("3 healthy of 20")
+    assert all("abnormal" not in finding for finding in result["findings"][:2])
+    assert result["findings"][1].endswith("are healthy (5x the fleet rate)")
+    # Past the limit, the rest are still named, one line each.
+    narrow = scan.summary(scan_of(fleet), limit=2)
+    assert len(narrow["abnormal_vms"]) == 2
+    assert len(narrow["more_abnormal_vms"]) == narrow["abnormal_vms_truncated"] == 15
+    assert narrow["more_abnormal_vms"][0].startswith("vc-a/vm-")
+    # The rows carry their meaning once, above them, and no unset values.
+    row = result["abnormal_vms"][0]["verdict"]
+    assert "meaning" not in row
+    assert None not in row["values"].values()
+
+
+def test_a_scan_too_large_for_its_rows_still_fits_and_names_the_rest(monkeypatch: pytest.MonkeyPatch) -> None:
+    from vsphere_triage.server import build_server  # noqa: PLC0415
+
+    fleet = [
+        vm(
+            moref=f"vm-{index}",
+            name=f"vm-{index:04d}-with-a-long-name",
+            host=f"esx-{index % 9}",
+            base_disk="[ds] base-a.vmdk" if index < 550 else "[ds] base-b.vmdk",
+            **({} if index < 600 else {"tools_running": "guestToolsRunning", "heartbeat": "green"}),
+        )
+        for index in range(700)
+    ]
+    fleet[0].notes = ["x" * 2000]  # rows that are each heavy
+
+    async def run_scan(*_: object, **__: object) -> scan.Scan:
+        return scan_of(fleet)
+
+    monkeypatch.setattr(scan, "run_scan", run_scan)
+    settings = Settings.from_environment(
+        {
+            "VSPHERE_VCENTERS": '[{"name": "vc-a", "host": "a"}]',
+            "VSPHERE_USERNAME": "u",
+            "VSPHERE_PASSWORD": "p",
+        }
+    )
+
+    result = asyncio.run(build_server(settings).call_tool("scan", {"limit": 500})).structured_content
+
+    assert "truncated" not in result  # the rows gave way, not the groups and findings
+    assert formatting.size(result) <= formatting.MAX_RESPONSE_CHARACTERS
+    assert result["strongest_groups"]
+    assert result["more_abnormal_vms"][0].startswith("vc-a/vm-")
+    assert len(result["abnormal_vms"]) + len(result["more_abnormal_vms"]) > 30
+
+
+def test_a_scan_for_some_abnormal_states_still_calls_them_abnormal() -> None:
+    fleet = [vm(moref=f"vm-{index}", host=f"esx-{index % 4}") for index in range(8)]
+
+    result = scan.summary(scan_of(fleet), states=["hung", "busy_not_up", "booted_not_up"], limit=10)
+
+    assert " abnormal of " in result["findings"][0]
+
+
+def test_a_brief_line_carries_the_flags_that_make_a_vm_abnormal() -> None:
+    row = {"vcenter": "vc-a", "moref": "vm-42", "name": "loop-01", "folder": "env-1003"}
+
+    line = scan.brief(row | {"verdict": {"state": "healthy", "flags": ["boot_loop"]}})
+
+    assert line == "vc-a/vm-42 loop-01 in env-1003: healthy (boot_loop)"
+
+
 def test_the_same_host_name_on_two_vcenters_is_two_hosts() -> None:
     fleet = [
         vm(vcenter="vc-a", moref="vm-1", host="DC0_H0"),
@@ -595,6 +675,90 @@ def test_a_stop_code_on_the_serial_console_names_the_crash_and_its_layer() -> No
     assert [cause["cause"] for cause in result["causes"]][:2] == [diagnose.WINDOWS_CRASH, diagnose.STORAGE]
 
 
+def test_a_boot_loop_is_the_cause_not_a_hang_of_its_last_boot() -> None:
+    # The last boot stopping after firmware is one turn of the loop, not a separate hang.
+    machine = vm(uptime_minutes=2.0, cpu_mhz=30.0)
+    verdict = checks.classify(machine, LIMITS, resets_in_window=4)
+    logs = {"timeline": {"boot_found": True, "last_stage": "firmware", "annotations": {}}}
+
+    result = diagnose.conclude(
+        verdict,
+        vm=machine,
+        cpu={"findings": [], "starved": False},
+        disk={"findings": [], "slow": False, "datastores": []},
+        environment={"signals": []},
+        logs=logs,
+        serial={"available": False},
+        console={"available": False},
+        host_log={"available": False},
+    )
+
+    assert result["causes"][0]["cause"] == diagnose.BOOT_LOOP_CAUSE
+    assert "4 resets" in result["causes"][0]["for"][0]
+    assert any("who resets it" in step for step in diagnose.next_checks(result, machine))
+
+
+def test_a_device_the_healthy_neighbours_share_argues_against_itself() -> None:
+    nic = "network adapter 'ethernet-0' is not connected (no link; PXE/DHCP would fail)"
+    machine = vm(cpu_mhz=10.0, uptime_minutes=40.0)
+    machine.device_blocks = [nic]
+
+    result = _conclude_on(machine, environment={"signals": [], "healthy_device_blocks": [nic]})
+
+    hardware = next(entry for entry in result["argued_against"] if entry["cause"] == diagnose.HARDWARE)
+    assert hardware["against"] == [f"a healthy VM in its environment has the same: {nic}"]
+    assert diagnose.HARDWARE not in [entry["cause"] for entry in result["causes"]]
+
+
+def test_a_device_only_this_vm_has_still_counts_beside_one_its_neighbours_share() -> None:
+    nic = "network adapter 'ethernet-0' is not connected (no link; PXE/DHCP would fail)"
+    iso = "CD-ROM 'cdrom-0' has an ISO mounted and connected at power-on"
+    machine = vm(cpu_mhz=10.0, uptime_minutes=40.0)
+    machine.device_blocks = [nic, iso]
+
+    result = _conclude_on(machine, environment={"signals": [], "healthy_device_blocks": [nic]})
+
+    hardware = next(entry for entry in result["causes"] if entry["cause"] == diagnose.HARDWARE)
+    assert hardware["for"] == [iso]
+    assert hardware["against"] == [f"a healthy VM in its environment has the same: {nic}"]
+
+
+def test_a_boot_loop_whose_boots_look_hung_is_still_a_boot_loop() -> None:
+    # Low CPU past the boot window is HUNG; a black, still console and a log that
+    # stops at firmware would each add to an early hang on their own.
+    machine = vm(cpu_mhz=10.0, uptime_minutes=40.0)
+    verdict = checks.classify(machine, LIMITS, resets_in_window=4)
+    console = {"available": True, "frozen": True, "black": True, "screen_states": [], "stop_codes": []}
+    logs = {"timeline": {"boot_found": True, "last_stage": "firmware", "annotations": {}}}
+
+    result = diagnose.conclude(
+        verdict,
+        vm=machine,
+        cpu={"findings": [], "starved": False},
+        disk={"findings": [], "slow": False, "datastores": []},
+        environment={"signals": []},
+        logs=logs,
+        serial={"available": False},
+        console=console,
+        host_log={"available": False},
+    )
+
+    assert verdict.state == checks.HUNG
+    assert result["causes"][0]["cause"] == diagnose.BOOT_LOOP_CAUSE
+    assert diagnose.EARLY_HANG not in [entry["cause"] for entry in result["causes"]]
+    assert any(text.startswith("each boot stops early") for text in result["causes"][0]["for"])
+
+
+def test_a_busy_linux_guest_is_never_windows_still_working() -> None:
+    busy = vm(cpu_mhz=3600.0, uptime_minutes=40.0, os_family="linux", guest_os="Red Hat Enterprise Linux 8")
+
+    result = _conclude_on(busy)
+
+    assert diagnose.STILL_WORKING not in [
+        entry["cause"] for entry in [*result["causes"], *result["argued_against"]]
+    ]
+
+
 def test_nothing_read_is_listed_as_not_checked() -> None:
     result = conclude(cpu={"available": False, "reason": "x"})
 
@@ -632,6 +796,16 @@ def test_a_series_is_summarised_with_its_peak() -> None:
     assert summary is not None
     assert (summary["max"], summary["mean"], summary["last"]) == (9.0, 4.67, 4.0)
     assert summary["peak_at"] == NOW + timedelta(seconds=20)
+    assert summary["steady"] is False
+
+
+def test_a_flat_series_is_steady_not_peaking_at_its_first_sample() -> None:
+    samples = [(NOW + timedelta(seconds=20 * index), 180.0) for index in range(4)]
+
+    summary = contention.summarize(samples)
+
+    assert summary is not None
+    assert summary["steady"] is True
 
 
 # -- read-only --------------------------------------------------------------------------------
@@ -1246,6 +1420,29 @@ def test_a_memory_limit_below_configured_ram_flags_memory_limited() -> None:
 
     assert checks.MEMORY_LIMITED in capped.flags
     assert checks.MEMORY_LIMITED not in uncapped.flags  # a limit at or above RAM caps nothing
+
+
+def test_a_vm_that_is_up_but_capped_names_its_limits_and_says_it_is_up() -> None:
+    def capped(cpu_mhz: float) -> VmFacts:
+        return vm(
+            tools_running="guestToolsRunning",
+            heartbeat="green",
+            cpu_mhz=cpu_mhz,
+            cpu_limit_mhz=600,
+            memory_mb=8192,
+            memory_limit_mb=2048,
+        )
+
+    at_limit = _conclude_on(capped(590.0))
+    under_limit = _conclude_on(capped(200.0))
+
+    causes = [cause["cause"] for cause in at_limit["causes"]]
+    assert causes[:2] == [diagnose.CPU_LIMIT_CAUSE, diagnose.MEMORY_LIMIT_CAUSE]
+    assert "at the limit" in at_limit["causes"][0]["for"][0]
+    assert "VM up (Tools running)" in at_limit["headline"]
+    limit = next(cause for cause in under_limit["causes"] if cause["cause"] == diagnose.CPU_LIMIT_CAUSE)
+    assert "not holding it back" in limit["for"][0]
+    assert limit["score"] < at_limit["causes"][0]["score"]
 
 
 def test_a_cpu_limit_on_a_stuck_vm_is_weighed_as_throttled_not_host_starvation() -> None:
@@ -2133,6 +2330,15 @@ def test_a_sibling_being_the_odd_one_out_is_not_said_of_the_diagnosed_vm() -> No
 
     assert result["signals"] == []
     assert result["findings"] == ["db-01 (vm-2) is the only abnormal VM of 2 here"]
+
+
+def test_a_vm_is_not_compared_with_its_own_devices() -> None:
+    nic = "network adapter 'ethernet-0' is not connected (no link; PXE/DHCP would fail)"
+    me = vm(moref="vm-1", uptime_minutes=2.0)  # booting, so on the healthy side
+    me.device_blocks = [nic]
+    peers = [(me, checks.classify(me, LIMITS))]
+
+    assert diagnose.environment_pattern(me, peers)["healthy_device_blocks"] == []
 
 
 # -- round two: answers that must not be mistaken for others ----------------------------------
