@@ -19,6 +19,9 @@ The repo contains:
   the incident procedure a Claude Code agent follows when it drives the server.
 - **A Claude Code plugin** ([`.claude-plugin/`](.claude-plugin/)) that installs
   both at once.
+- **Live evals** ([`evals/live/`](evals/live/)): a model drives the real tools
+  and the skill against the integration scenario's simulated vCenters, and its
+  verdicts and tool calls are scored.
 
 [docs/orchestrator-integration.md](docs/orchestrator-integration.md) covers
 wiring it to the system that creates your VMs.
@@ -68,7 +71,7 @@ The minimum configuration is the vCenter list and a login:
 
 The server speaks MCP over stdio by default. With `uvx`, use
 `"command": "uvx", "args": ["vsphere-triage"]` (pin a version with
-`"vsphere-triage==0.2.1"`); with a `uv tool` or `pipx` install, use
+`"vsphere-triage==0.3.0"`); with a `uv tool` or `pipx` install, use
 `"command": "vsphere-triage"` as above.
 
 ## Two ways to start
@@ -206,7 +209,7 @@ server always matches the skill. Invoke the skill as
 | Tool | What it returns |
 | --- | --- |
 | `list_vcenters` | each configured vCenter: reachable or not, version, clock |
-| `scan` | every VM judged; abnormal VMs grouped by vCenter, cluster, host, datastore, environment folder, its parent folder, base disk and OS, each group against its population; hosts over the CPU threshold, hosts near memory capacity, hosts whose hardware sensors are red or yellow (with the sensors and how many VMs run there), slow storage |
+| `scan` | every VM judged; abnormal VMs grouped by vCenter, cluster, host, datastore, environment folder, its parent folder, base disk and OS, each group against its population; hosts over the CPU threshold, hosts near memory capacity, hosts whose hardware sensors are red or yellow (with the sensors and how many VMs run there), slow storage. The first `limit` abnormal VMs (10 by default) come in full, and `more_abnormal_vms` names the rest one line each |
 | `explain_group` | for one group from a scan: what its abnormal VMs share that the healthy ones do not, and host CPU and storage over their boot window |
 | `diagnose_window` | resets, failed power-ons, host CPU and storage over a past window |
 | `cluster_events` | vSphere HA restarts and VM-monitoring resets, host failures, isolations and lost connections, failed failovers, maintenance mode and migration waves over a window; names the failed host and the hosts VMs restarted onto |
@@ -238,7 +241,7 @@ server always matches the skill. Invoke the skill as
 | Tool | What it returns |
 | --- | --- |
 | `get_host_health` | a host's CPU demand against capacity, its storage, its hardware sensors (power supplies, fans, temperature, memory) and its VMs |
-| `get_datastore_health` | a datastore's latency and IOPS from every host that mounts it, and its VMs |
+| `get_datastore_health` | a datastore's latency and IOPS from every host that mounts it, which of those hosts see it slow (`slow_from_hosts`: a path or an array), and its VMs |
 | `read_host_log` | `vmkernel`, `hostd` or `vpxa` lines, regex-filtered |
 | `check_vcenters` | per vCenter: reachable, the server's last login time, a round-trip time and the open-session count, for SSL EOFs and resets caused by session exhaustion |
 | `vcenter_sessions` | a vCenter's open API sessions grouped by user, source IP and client, with idle counts and the oldest |
@@ -256,7 +259,7 @@ vCenter session drops mid-call (the error then says the action may have run).
 | `run_in_guest` | runs a command in the guest OS through VMware Tools and returns its output and exit code; needs Tools running, guest credentials, and the VM's name with its moref (as every acting tool does; a mismatch is refused). Output goes to a temp file in the guest, which is downloaded and deleted |
 | `reboot_guest` | asks the guest OS to restart through Tools (a clean shutdown and boot); needs Tools. Requires the VM name together with a moref |
 | `hard_reset` | power-cycles the VM (`ResetVM_Task`) without asking the guest; works on a fully hung VM, but in-flight writes and unwritten crash dumps are lost. Use it only when `reboot_guest` cannot. Requires the VM name together with a moref |
-| `check_ems` | whether the serial console can carry the guest's boot output: serial-port hardware, output already seen, and on Windows the `bcdedit` EMS setting |
+| `check_ems` | whether the serial console can carry the guest's boot output: serial-port hardware and output already seen (no Tools needed), and on Windows the `bcdedit` EMS setting (needs Tools and guest credentials) |
 | `investigate_windows_boot` | reads the guest's event log: the last bugcheck (WER 1001, decoded), Kernel-Power 41 / EventLog 6008 unclean shutdowns, service and driver start timeouts (SCM 7000/7009/7011/7026), slow-boot components, crash dumps, Startup Repair and Panther logs. Only events from a day before the latest boot onward count; older ones are listed separately |
 | `investigate_linux_boot` | reads `dmesg` (panics, soft lockups, hung tasks, I/O errors, filesystem errors), `systemd-analyze blame` and `critical-chain`, and the journal for the current and the previous boot. Says when the journal is not persistent, so the boot before a reboot was not read |
 | `read_crash_dump` | decodes the newest Windows minidump header: bugcheck code, its four parameters and when the dump was written. It does not name the faulting driver (that needs WinDbg and symbols) |
@@ -349,7 +352,9 @@ pixels.
   vCenter has already rolled up for an old window are reported as gaps.
 
 Results start with `finding` or `findings`, keep the raw values, and are cut
-to 120,000 characters, saying what was cut.
+to 60,000 characters (under common clients' tool-output limit), saying what was
+cut. A steady series is marked `steady` and its finding says "held at", so a
+flat counter is not given a peak time it does not have.
 
 ## What can change vSphere
 
@@ -430,6 +435,16 @@ The simulator's limits, and how the tests handle them:
 - Guest operations, snapshot sizes, NTP state, thin provisioning, APD/PDL and
   HA events are not modelled: that logic is unit-tested only.
 
+### Live evals
+
+`evals/live/` serves the real tool surface over the integration scenario for a
+model to drive, logs every call, and scores runs on twelve scenarios
+(`scenarios.json`: what each verdict must and must not say). Like the
+integration suite it needs Docker and is not on any CI path; its README has
+the steps and the results so far. `tests/test_surface.py`, on the per-commit
+path, checks that every tool, argument, state, cause and stop code the skill
+and the docs name exists in the code.
+
 ### To confirm on a real vCenter
 
 - The privilege `/screen` needs, and what it returns for a black console.
@@ -442,7 +457,8 @@ The simulator's limits, and how the tests handle them:
   returned with its line.
 - What EMS writes on your Windows versions, and the vROps stat keys on your
   version (`vrops_list_stat_keys` lists them).
-- Snapshot sizes from `layoutEx` (the simulator reports 0).
+- Snapshot sizes from `layoutEx` (the simulator reports none, so they come back
+  `null` and "no size reported").
 - Guest exec: the guest-operation privileges, and that output capture works on
   your Windows and Linux guests.
 - That an in-guest reboot shows in `vmware.log` as a reset (`CPU reset` on
