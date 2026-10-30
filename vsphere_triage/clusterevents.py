@@ -47,9 +47,17 @@ BUCKETS: tuple[tuple[str, str, re.Pattern[str]], ...] = (
         "a VM could not be restarted or powered on (HA failover may have failed)",
         re.compile(
             r"(?i)(\bVmFailedToPowerOnEvent\b|\bFailedRestartAfterIsolation\w*|\bVmFailoverFailed\b|"
-            r"\bfailover (was )?(failed|unsuccessful)\b|\bvSphere HA (could not|cannot|failed to) restart\b|"
-            r"\binsufficient (failover )?resources\b)"
+            r"\bNotEnoughResourcesToStartVmEvent\b|\bnot enough resources to (failover|start)\b|"
+            r"\bfailover (was )?(failed|unsuccessful)\b|\bunsuccessfully failed over\b|"
+            r"\bvSphere HA (could not|cannot|failed to|was unable to) restart\b|\bunable to restart\b)"
         ),
+    ),
+    (
+        # Admission control warning: HA has too little spare capacity to fail over, a
+        # risk for the next failure, not a VM that failed to restart.
+        "ha_capacity_warning",
+        "vSphere HA lacks the spare capacity to fail over (admission control) — a risk, not an outage",
+        re.compile(r"(?i)(\bInsufficientFailoverResources\w*|\binsufficient (failover )?resources\b)"),
     ),
     (
         # Before host_isolation: a missing redundant management link is a config warning.
@@ -60,7 +68,10 @@ BUCKETS: tuple[tuple[str, str, re.Pattern[str]], ...] = (
     (
         "host_isolation",
         "a host was isolated from the management network (HA may have acted)",
-        re.compile(r"(?i)(\bHostIsolated\w*|\bhost .* is isolated\b|\bnetwork isolation\b|\bisolated\b)"),
+        re.compile(
+            r"(?i)(\bHostIsolated\w*|\bDasHostIsolated\w*|\bHostIsolationIpPingFailed\w*|"
+            r"\bhost .* is isolated\b|\bnetwork isolation\b|\bisolated\b|\bisolation address\b)"
+        ),
     ),
     (
         # Before host_failure: HostConnectionLostEvent's own message reads "Host X is
@@ -76,7 +87,8 @@ BUCKETS: tuple[tuple[str, str, re.Pattern[str]], ...] = (
         "host_failure",
         "a host failed (vSphere HA declared it failed)",
         re.compile(
-            r"(?i)(\bDasHostFailedEvent\b|\bHostFailedEvent\b|\bvSphere HA detected .*host .*failed\b)"
+            r"(?i)(\bDasHostFailedEvent\b|\bHostFailedEvent\b|\bvSphere HA detected .*host .*failed\b|"
+            r"\bpossible host failure\b|\bstate changed .* to Dead\b)"
         ),
     ),
     (
@@ -113,9 +125,13 @@ def summarize_cluster_events(
 ) -> dict[str, Any]:
     """Group cluster events by kind over the window, with the hosts and VMs each touched.
 
-    `rows` are plain dicts: {type, time, message, host, vm}. The findings call
-    out the shapes that explain a mass incident — an HA restart wave, a host
-    failure, a migration surge — with the count and the span.
+    `rows` are plain dicts: {type, time, message, host, vm, affected_host?}.
+    `host` is the event's own host: for an HA restart that is the host the VM
+    was restarted *onto*, a survivor. `affected_host` is the host an HA event is
+    about (DasHostFailedEvent.failedHost, DasHostIsolatedEvent.isolatedHost),
+    and wins where present. The findings call out the shapes that explain a mass
+    incident — an HA restart wave, a host failure, a migration surge — with the
+    count and the span.
     """
     begin = now - timedelta(minutes=window_minutes)
     buckets: dict[str, dict[str, Any]] = {}
@@ -132,18 +148,31 @@ def summarize_cluster_events(
         if isinstance(moment, datetime):
             entry["first"] = moment if entry["first"] is None else min(entry["first"], moment)
             entry["last"] = moment if entry["last"] is None else max(entry["last"], moment)
-        if row.get("host"):
-            entry["hosts"].add(row["host"])
+        where = row.get("affected_host") or row.get("host")
+        if where:
+            entry["hosts"].add(where)
         if row.get("vm"):
             entry["vms"].add(row["vm"])
     findings = []
     restart = buckets.get("ha_vm_restart")
     if restart and restart["count"]:
-        hosts = ", ".join(sorted(restart["hosts"])[:5]) or "unknown host(s)"
+        # The restart events' hosts are where the VMs came back up, not what failed;
+        # the failed or isolated host comes from those events, when they were read.
+        onto = ", ".join(sorted(restart["hosts"])[:5]) or "unknown host(s)"
+        lost = sorted(
+            {
+                host
+                for name in ("host_failure", "host_isolation")
+                for host in buckets.get(name, {}).get("hosts", ())
+            }
+        )
+        cause = (
+            f"after a failure of {', '.join(lost[:5])}" if lost else "after a host failure (host not named)"
+        )
         findings.append(
-            f"vSphere HA restarted {restart['count']} VM(s) between {_iso(restart['first'])} and "
-            f"{_iso(restart['last'])} — a host failure on {hosts}, not a per-VM problem; the restarted "
-            "VMs rebooting is expected, so judge them from that restart, not as independent hangs"
+            f"vSphere HA restarted {restart['count']} VM(s) onto {onto} between {_iso(restart['first'])} "
+            f"and {_iso(restart['last'])}, {cause} — not a per-VM problem; the restarted VMs rebooting is "
+            "expected, so judge them from that restart, not as independent hangs"
         )
     for name in (
         "ha_vm_monitoring_reset",
@@ -152,6 +181,7 @@ def summarize_cluster_events(
         "host_connection_lost",
         "vm_failover_failed",
         "host_no_redundant_management",
+        "ha_capacity_warning",
     ):
         entry = buckets.get(name)
         if entry and entry["count"]:

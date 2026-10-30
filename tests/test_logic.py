@@ -3125,3 +3125,60 @@ def test_a_32_bit_dump_is_not_decoded_with_64_bit_offsets() -> None:
 
     assert decoded["bugcheck"] is None
     assert "PAGEDU64" in decoded["note"]
+
+
+# -- review of main, round four -----------------------------------------------------------------
+
+
+def test_an_ha_restart_names_the_failed_host_not_the_one_the_vms_came_back_on() -> None:
+    from vsphere_triage import clusterevents  # noqa: PLC0415
+
+    rows = [
+        {
+            "type": "DasHostFailedEvent",
+            "time": NOW - timedelta(minutes=7),
+            "message": "A possible host failure has been detected by vSphere HA on esx-1",
+            "host": None,
+            "affected_host": "esx-1",
+            "vm": None,
+        },
+        *(
+            {
+                "type": "com.vmware.vc.ha.VmRestartedByHAEvent",
+                "time": NOW - timedelta(minutes=m),
+                "message": f"vSphere HA restarted virtual machine web-0{m} on host esx-2",
+                "host": "esx-2",
+                "vm": f"web-0{m}",
+            }
+            for m in range(3)
+        ),
+    ]
+
+    summary = clusterevents.summarize_cluster_events(rows, now=NOW, window_minutes=120)
+
+    restart = next(finding for finding in summary["findings"] if "HA restarted" in finding)
+    assert "onto esx-2" in restart
+    assert "after a failure of esx-1" in restart
+    assert summary["buckets"]["host_failure"]["hosts"] == ["esx-1"]
+
+
+@pytest.mark.parametrize(
+    ("kind", "message", "bucket"),
+    [
+        ("NotEnoughResourcesToStartVmEvent", "Not enough resources to failover web-01", "vm_failover_failed"),
+        ("com.vmware.vc.ha.VmFailedRestart", "vSphere HA was unable to restart web-01", "vm_failover_failed"),
+        (
+            "InsufficientFailoverResourcesEvent",
+            "Insufficient resources to satisfy HA failover",
+            "ha_capacity_warning",
+        ),
+        ("HostIsolationIpPingFailedEvent", "Host esx-1 could not reach isolation address", "host_isolation"),
+    ],
+)
+def test_ha_wordings_the_patterns_had_missed(kind: str, message: str, bucket: str) -> None:
+    from vsphere_triage import clusterevents  # noqa: PLC0415
+
+    hit = clusterevents.classify_event(kind, message)
+
+    assert hit is not None
+    assert hit[0] == bucket

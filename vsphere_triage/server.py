@@ -483,6 +483,13 @@ def _register_fleet_tools(  # noqa: C901, PLR0915 - one closure per tool
                     "time": getattr(event, "createdTime", None),
                     "message": getattr(event, "fullFormattedMessage", "") or "",
                     "host": getattr(getattr(event, "host", None), "name", None),
+                    # The host an HA event is about, which is not always the event's own
+                    # host (an HA restart's host is where the VM came back up).
+                    "affected_host": getattr(
+                        getattr(event, "failedHost", None) or getattr(event, "isolatedHost", None),
+                        "name",
+                        None,
+                    ),
                     "vm": getattr(getattr(event, "vm", None), "name", None),
                 }
                 for event in events
