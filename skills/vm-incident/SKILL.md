@@ -113,6 +113,11 @@ cluster-level reads name a shared cause that no single VM shows:
   onto one datastore, a mass reconfigure, a snapshot consolidation. A cause
   someone or an automation introduced shows here and nowhere in a VM's counters.
 
+A sick host is a shared cause too: **`get_host_health`** now reports the host's
+own hardware sensors (PSU, fan, temperature, memory) alongside its CPU and
+storage. A red sensor — a failing power supply, an overheating CPU — stalls
+every VM on that host, and shows in none of their guest-level evidence.
+
 ## When a read cannot answer: acting on the VM
 
 Most tools read. A few act on the VM — `run_in_guest`, the two reboots, and the
@@ -160,7 +165,9 @@ components, and the crash dumps / Startup-Repair / update logs. The bugcheck cod
 is decoded to the layer it points at. Read `core/windows-boot.md` for the flow.
 For a Linux guest, **`investigate_linux_boot`** is the same move — dmesg,
 `systemd-analyze blame`/`critical-chain`, and `journalctl -b`, after the same
-reboot-if-off step.
+reboot-if-off step. When a Windows bugcheck is found, **`read_crash_dump`**
+decodes the newest minidump's header for the four bugcheck parameters the event
+log omits (it does not name the faulting driver — that needs WinDbg).
 
 **Is the serial console even available?** When serial-console evidence is
 missing, do not just move on — run **`check_ems`** to say *why* it is missing and

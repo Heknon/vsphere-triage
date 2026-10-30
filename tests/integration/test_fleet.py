@@ -464,6 +464,7 @@ def test_every_call_the_tools_made_is_on_the_read_list(
         "check_ems",
         "investigate_windows_boot",
         "investigate_linux_boot",
+        "read_crash_dump",
     ):
         call(server, tool, {"vcenter": "vc-a", "moref": moref})
     call(server, "get_host_health", {"vcenter": "vc-a", "host": "DC0_C0_H0"})

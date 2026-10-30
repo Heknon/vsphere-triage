@@ -36,9 +36,11 @@ from vsphere_triage import (
     capabilities,
     clusterevents,
     connhistory,
+    crashdump,
     emscheck,
     guestexec,
     hardware,
+    hostsensors,
     linuxboot,
     power,
     powerflex,
@@ -798,7 +800,7 @@ def _register_fleet_tools(  # noqa: C901, PLR0915 - one closure per tool
         return await scanning.diagnose_window(fleet, resolved, names, begin, end)
 
 
-def _register_machine_tools(  # noqa: C901 - one closure per tool
+def _register_machine_tools(  # noqa: C901, PLR0915 - one closure per tool
     tool: Callable[..., Any], fleet: VCenterPool, resolved: Settings
 ) -> None:
     """Environments and machines: finding them, diagnosing them, and each piece on its own."""
@@ -1177,6 +1179,47 @@ def _register_machine_tools(  # noqa: C901 - one closure per tool
             password=password,
         )
 
+    @tool("read_crash_dump", annotations=NOT_READ_ONLY)
+    async def read_crash_dump_tool(
+        *,
+        vcenter: str,
+        moref: str | None = None,
+        env_id: str | None = None,
+        vm_name: str | None = None,
+        username: str | None = None,
+        password: str | None = None,
+    ) -> dict[str, Any]:
+        r"""Decode the newest Windows minidump's bugcheck code and its 4 parameters.
+
+        Reads only the dump header (no WinDbg, no symbols, air-gap safe) from the
+        newest file in C:\\Windows\\Minidump, giving the stop code decoded to its
+        layer plus the four parameters the event log usually omits. It does NOT
+        name the faulting driver — that needs WinDbg `!analyze -v` with symbols.
+        Use it after investigate_windows_boot flags a bugcheck, for the extra
+        parameters. Needs Tools and guest credentials; runs a read-only command
+        in the guest, so it is marked not-read-only.
+
+        Args:
+            vcenter: the VM's vCenter.
+            moref: the VM's moref, or give env_id and vm_name.
+            env_id: the environment id, with vm_name.
+            vm_name: the machine's name inside its environment.
+            username: guest-OS account; the configured default when omitted.
+            password: that account's password; the configured default when omitted.
+
+        """
+        name = fleet.resolve(vcenter)
+        return await crashdump.read_crash_dump(
+            fleet,
+            resolved,
+            name,
+            moref=moref,
+            env_id=env_id,
+            vm_name=vm_name,
+            username=username,
+            password=password,
+        )
+
 
 def _register_piece_tools(  # noqa: C901 - one closure per tool
     tool: Callable[..., Any], fleet: VCenterPool, resolved: Settings
@@ -1430,6 +1473,7 @@ def _register_infrastructure_tools(tool: Callable[..., Any], fleet: VCenterPool,
                 "maintenance": found.maintenance,
                 "cpu": cpu.get(found.moref),
                 "cpu_counters_unavailable": unknown,
+                "hardware": hostsensors.classify_sensors(_read_host_sensors(session, found.moref)),
                 "storage": disk,
                 "vms": len(vms),
                 "vm_states": count_states(verdicts),
@@ -1836,6 +1880,38 @@ def _register_powerflex_tools(  # noqa: C901, PLR0915 - one closure per tool
             ],
             "match_count": len(matches),
         }
+
+
+def _read_host_sensors(session: VCenterSession, host_moref: str) -> list[dict[str, Any]]:
+    """A host's hardware sensors, flattened to {name, type, health, reading}. Read-only."""
+    paths = (
+        "runtime.healthSystemRuntime.systemHealthInfo.numericSensorInfo",
+        "runtime.healthSystemRuntime.hardwareStatusInfo",
+    )
+    rows = session.retrieve(vim.HostSystem, paths, objects=[session.reference("HostSystem", host_moref)])
+    if not rows:
+        return []
+    sensors: list[dict[str, Any]] = [
+        {
+            "name": getattr(sensor, "name", None),
+            "type": getattr(sensor, "sensorType", None),
+            "health": getattr(getattr(sensor, "healthState", None), "key", None),
+            "reading": getattr(sensor, "currentReading", None),
+        }
+        for sensor in rows[0].get("runtime.healthSystemRuntime.systemHealthInfo.numericSensorInfo") or []
+    ]
+    hardware_status = rows[0].get("runtime.healthSystemRuntime.hardwareStatusInfo")
+    for group in ("memoryStatusInfo", "cpuStatusInfo", "storageStatusInfo"):
+        sensors.extend(
+            {
+                "name": getattr(item, "name", None),
+                "type": group.removesuffix("StatusInfo"),
+                "health": getattr(getattr(item, "status", None), "key", None),
+                "reading": None,
+            }
+            for item in getattr(hardware_status, group, None) or []
+        )
+    return sensors
 
 
 def _pick[T](items: Any, wanted: str, keys: Callable[[T], tuple[str, str]]) -> T:

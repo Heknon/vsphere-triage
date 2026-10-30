@@ -22,10 +22,12 @@ from vsphere_triage import (
     connhistory,
     console,
     contention,
+    crashdump,
     diagnose,
     emscheck,
     formatting,
     guestexec,
+    hostsensors,
     linuxboot,
     powerflex,
     resources,
@@ -1841,3 +1843,46 @@ def test_powerflex_login_failure_is_reported() -> None:
     client = _powerflex_client(lambda _request: httpx.Response(401, text="denied"))
     with pytest.raises(powerflex.PowerFlexError):
         asyncio.run(client.sds())
+
+
+# -- host hardware sensors ----------------------------------------------------
+
+
+def test_host_sensors_flag_red_and_yellow() -> None:
+    sensors = [
+        {"name": "PSU1", "type": "power", "health": "green"},
+        {"name": "PSU2", "type": "power", "health": "red"},
+        {"name": "DIMM3", "type": "memory", "health": "yellow"},
+    ]
+    verdict = hostsensors.classify_sensors(sensors)
+    assert verdict["healthy"] is False
+    assert verdict["red"][0]["name"] == "PSU2"
+    assert any("CRITICAL" in finding for finding in verdict["findings"])
+
+
+def test_host_sensors_no_data_is_said_not_assumed_healthy() -> None:
+    verdict = hostsensors.classify_sensors([])
+    assert verdict["healthy"] is True
+    assert any("no hardware sensor data" in finding for finding in verdict["findings"])
+
+
+# -- crash dump header decode -------------------------------------------------
+
+
+def test_crash_dump_decodes_the_bugcheck_and_parameters() -> None:
+    parsed = {
+        "found": True,
+        "name": "103025-1234.dmp",
+        "signature": "PAGEDU64",
+        "code": 0x7A,
+        "params": [0x1, 0xFFFFF8000000, 0xC000000E, 0x2000],
+    }
+    decoded = crashdump.decode_dump(parsed)
+    assert decoded["found"] is True
+    assert decoded["bugcheck"]["code"] == "0x0000007A"
+    assert decoded["bugcheck"]["name"] == "KERNEL_DATA_INPAGE_ERROR"
+    assert decoded["parameters"][0] == "0x0000000000000001"
+
+
+def test_crash_dump_absent_is_reported() -> None:
+    assert crashdump.decode_dump({"found": False})["found"] is False

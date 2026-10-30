@@ -210,6 +210,7 @@ internal index.
 | `check_ems` | **not read-only** (reads the BCD in-guest) — whether the serial console (EMS on Windows) can carry the guest's boot words: serial-port hardware, output seen, and the `bcdedit` EMS state; says why it is unavailable and how to enable it |
 | `investigate_windows_boot` | **not read-only** (reads the guest) — the Windows boot picture from the guest's own event log: last bugcheck (WER 1001, decoded), unclean shutdowns, service/driver timeouts, slow-boot components, crash dumps and repair/update logs |
 | `investigate_linux_boot` | **not read-only** (reads the guest) — the Linux boot picture: dmesg (panics, soft-lockups, hung tasks, device timeouts, filesystem errors), systemd-analyze blame/critical-chain, journalctl -b, mapped to the layer each points at |
+| `read_crash_dump` | **not read-only** (reads the guest) — decodes the newest Windows minidump's header: the bugcheck code (to its layer) and the 4 parameters the event log omits; no WinDbg/symbols, so it does not name the faulting driver |
 | `powerflex_health` | **optional** (PowerFlex configured) — Dell PowerFlex backend health: SDS/device state and any rebuild/rebalance in progress, the usual cause of a PowerFlex-backed datastore going slow |
 | `powerflex_protection_domains` | **optional** — protection domains ranked by traffic (read/write IOPS + throughput), flagging a hot PD carrying a disproportionate share — the busy-PD pattern behind datastores on it going slow |
 | `powerflex_find_volume` | **optional** — map a slow datastore to its PowerFlex volume by name, id, or ESXi device id (naa/eui) |
@@ -226,7 +227,7 @@ internal index.
 | `find_resource_limits` | VMs throttled or constrained by a configured CPU/memory limit or reservation — a CPU limit mimics host starvation, a memory limit forces balloon/swap; templates marked, since a linked clone inherits the template's limit |
 | `check_host_time` | each ESXi host's NTP configuration and clock skew from vCenter — drift breaks TLS and Kerberos/AD auth, a root of the SSL/handshake errors separate from session exhaustion |
 | `check_datastores` | every datastore's fill, thin over-provisioning and per-host reachability (APD/PDL); datastores holding a template's base disk are marked, since they take every clone down with them |
-| `get_host_health` | a host's CPU demand against capacity, its storage, its VMs |
+| `get_host_health` | a host's CPU demand against capacity, its storage, its **hardware sensors** (PSU/fan/temperature/memory — a failing host stalls its VMs), and its VMs |
 | `get_datastore_health` | a datastore's latency and IOPS from every host mounting it, its VMs |
 | `read_host_log` | `vmkernel` / `hostd` / `vpxa` lines, filtered |
 | `vrops_*` | find a resource, list its stat keys, read stats, compare a window with previous days, alerts |

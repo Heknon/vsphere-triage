@@ -789,6 +789,14 @@ def _env_reboots(
     return latest_reboot_by_vm(events)
 
 
+def _gaps_for(settings: Settings, vm: VmFacts, *, storage_implicated: bool) -> list[dict[str, Any]]:
+    """The evidence gaps for a VM: the always-relevant ones, plus PowerFlex when storage is in play."""
+    gaps = capabilities.evidence_gaps(settings, vm)
+    if storage_implicated and (powerflex_gap := capabilities.powerflex_gap(settings)):
+        gaps.append(powerflex_gap)
+    return gaps
+
+
 def diagnose_vm(
     session: VCenterSession,
     settings: Settings,
@@ -924,8 +932,10 @@ def diagnose_vm(
         "events": summarize_events(raw_events) if "events" in events else events,
         # Stronger sources this diagnosis lacked: name them so a reader does not
         # mistake "could not see it" for "it did not happen", and knows what to
-        # turn on. Empty when nothing better was missing.
-        "evidence_gaps": capabilities.evidence_gaps(settings, vm),
+        # turn on. Empty when nothing better was missing. The PowerFlex backend is
+        # named only when storage is actually implicated, so it does not nag on a
+        # VM whose trouble has nothing to do with the datastore.
+        "evidence_gaps": _gaps_for(settings, vm, storage_implicated=bool(disk.get("slow"))),
     }
 
 
