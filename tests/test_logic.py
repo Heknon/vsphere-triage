@@ -1622,6 +1622,9 @@ class _WindowPool:
     async def run(self, _name: str, _work: object) -> dict:
         return self.result
 
+    async def sweep(self, _name: str, _work: object) -> dict:
+        return self.result
+
 
 def test_a_window_with_resets_never_opens_with_nothing_found() -> None:
     quiet_but_reset = {
@@ -1660,6 +1663,9 @@ class _ProfilePool:
         self.rows = rows
 
     async def run(self, _name: str, _work: object) -> list[dict]:
+        return self.rows
+
+    async def sweep(self, _name: str, _work: object) -> list[dict]:
         return self.rows
 
 
@@ -1840,3 +1846,156 @@ def test_the_last_resort_cut_still_fits_the_budget() -> None:
     result = formatting.bounded(huge)
 
     assert len(json.dumps(result)) <= formatting.MAX_RESPONSE_CHARACTERS
+
+
+# -- the pool under stalls, and the smaller reads ---------------------------------------------
+
+
+def test_a_read_past_its_deadline_keeps_the_vcenters_slot_until_its_thread_ends(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import threading  # noqa: PLC0415
+
+    from vsphere_triage.vcenter import VSphereError  # noqa: PLC0415
+
+    settings = Settings.from_environment(
+        {
+            "VSPHERE_VCENTERS": '[{"name": "vc-a", "host": "a"}]',
+            "VSPHERE_USERNAME": "u",
+            "VSPHERE_PASSWORD": "p",
+            "VSPHERE_MAX_CONCURRENT_PER_VCENTER": "1",
+        }
+    )
+    from vsphere_triage.vcenter import VCenterPool  # noqa: PLC0415
+
+    pool = VCenterPool(settings)
+    session = pool.session("vc-a")
+    monkeypatch.setattr(session, "connect", lambda: None)
+    stalled = threading.Event()
+
+    async def scenario() -> tuple[bool, bool]:
+        with pytest.raises(VSphereError, match="deadline"):
+            await pool.run("vc-a", lambda _s: stalled.wait(5), timeout_seconds=0.05)
+        held_while_stalled = pool._limits["vc-a"].locked()
+        stalled.set()
+        await asyncio.sleep(0.1)
+        return held_while_stalled, pool._limits["vc-a"].locked()
+
+    held, still_held = asyncio.run(scenario())
+
+    assert held is True  # the stuck thread still counts against the vCenter
+    assert still_held is False  # and gives the slot back once it ends
+
+
+def test_a_sweep_gets_the_longer_scan_deadline(monkeypatch: pytest.MonkeyPatch) -> None:
+    from vsphere_triage.vcenter import VCenterPool  # noqa: PLC0415
+
+    settings = Settings.from_environment(
+        {
+            "VSPHERE_VCENTERS": '[{"name": "vc-a", "host": "a"}]',
+            "VSPHERE_USERNAME": "u",
+            "VSPHERE_PASSWORD": "p",
+            "VSPHERE_TIMEOUT_SECONDS": "0.05",
+            "VSPHERE_SCAN_TIMEOUT_SECONDS": "5",
+        }
+    )
+    pool = VCenterPool(settings)
+    monkeypatch.setattr(pool.session("vc-a"), "connect", lambda: None)
+
+    def slow(_session: VCenterSession) -> str:
+        import time  # noqa: PLC0415
+
+        time.sleep(0.2)
+        return "swept"
+
+    assert asyncio.run(pool.sweep("vc-a", slow)) == "swept"
+
+
+class _SessionEntry:
+    def __init__(self, key: str, user: str = "svc") -> None:
+        self.key = key
+        self.userName = user
+
+
+class _SessionManager:
+    def __init__(self, sessions: list) -> None:
+        self.sessionList = sessions
+        self.currentSession = sessions[0] if sessions else _SessionEntry("own")
+
+
+def test_only_the_servers_own_session_is_reported_as_a_restricted_view() -> None:
+    session = VCenterSession(VCenter(name="vc-a", host="a"), Settings())
+    own = _SessionEntry("own")
+    session._content = type("Content", (), {"sessionManager": _SessionManager([own])})()
+
+    counted = session.session_count()
+
+    assert counted["visible"] == "own_only"
+    assert "Sessions.View" in counted["note"]
+
+
+def test_an_ocr_failure_loses_the_text_not_the_console(monkeypatch: pytest.MonkeyPatch) -> None:
+    import sys  # noqa: PLC0415
+    import types  # noqa: PLC0415
+
+    broken = types.ModuleType("pytesseract")
+
+    def fail(_image: object) -> str:
+        msg = "tesseract crashed"
+        raise RuntimeError(msg)
+
+    broken.image_to_string = fail  # ty: ignore[unresolved-attribute]
+    monkeypatch.setitem(sys.modules, "pytesseract", broken)
+    monkeypatch.setattr(console.shutil, "which", lambda _name: "/usr/bin/tesseract")
+    buffer = io.BytesIO()
+    Image.new("RGB", (8, 8)).save(buffer, format="PNG")
+
+    text, how = console.ocr(buffer.getvalue())
+
+    assert text is None
+    assert "OCR failed" in how
+
+
+def test_vrops_alerts_are_read_across_pages() -> None:
+    from vsphere_triage import vrops  # noqa: PLC0415
+
+    since = datetime(2026, 10, 29, 0, 0, tzinfo=UTC)
+    recent = int(since.timestamp() * 1000) + 60_000
+
+    def respond(request: httpx.Request) -> httpx.Response:
+        if request.url.path.endswith("/auth/token/acquire"):
+            return httpx.Response(200, json={"token": "t"})
+        page = int(request.url.params["page"])
+        size = int(request.url.params["pageSize"])
+        if page == 0:
+            batch = [{"alertDefinitionName": "old", "startTimeUTC": 1} for _ in range(size)]
+        else:
+            batch = [{"alertDefinitionName": "the new one", "startTimeUTC": recent}]
+        return httpx.Response(200, json={"alerts": batch, "pageInfo": {"totalCount": size + 1}})
+
+    settings = Settings.from_environment(
+        {
+            "VSPHERE_VROPS_URL": "https://vrops.example",
+            "VSPHERE_VROPS_USERNAME": "reader",
+            "VSPHERE_VROPS_PASSWORD": "secret",
+        }
+    )
+    client = vrops.Vrops(settings, transport=httpx.MockTransport(respond))
+
+    alerts = asyncio.run(client.alerts("host-1", since))
+
+    assert [alert["name"] for alert in alerts] == ["the new one"]
+
+
+def test_the_plugin_runs_the_same_version_the_package_is() -> None:
+    import pathlib  # noqa: PLC0415
+    import tomllib  # noqa: PLC0415
+
+    root = pathlib.Path(__file__).resolve().parents[1]
+    version = tomllib.loads((root / "pyproject.toml").read_text())["project"]["version"]
+    plugin = json.loads((root / ".claude-plugin" / "plugin.json").read_text())
+
+    # The skill ships in the plugin and the server from the index: pinned together,
+    # so a plugin install never runs a server older or newer than its skill.
+    assert plugin["version"] == version
+    assert plugin["mcpServers"]["vsphere-triage"]["args"] == [f"vsphere-triage=={version}"]

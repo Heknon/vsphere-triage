@@ -46,8 +46,10 @@ wire it into `ci.yml`'s automatic triggers.
 
 `.github/workflows/release.yml` publishes to PyPI via **Trusted Publishing**
 (OIDC) — there is **no token** in the repo, and none should be added. Release
-is a version bump: raise `version` in `pyproject.toml`, merge to `main`, and the
-workflow builds, verifies the wheel, publishes, tags, and makes the GitHub
+is a version bump: raise `version` in `pyproject.toml` (and the matching version
+and `vsphere-triage==X.Y.Z` pin in `.claude-plugin/plugin.json`; a unit test
+checks they agree), merge to `main`, and the workflow runs the `ci.yml` gate,
+builds, verifies the wheel, publishes, tags, and makes the GitHub
 release. A merge that does not change the version stops at the gate. Never
 commit a PyPI token, and never weaken the version/tag consistency checks in
 `build` — they are the guard against publishing the wrong artifact under a

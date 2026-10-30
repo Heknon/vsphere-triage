@@ -97,7 +97,7 @@ async def find_vms_by_snapshot(  # noqa: PLR0913 - one filtered fleet query
 ) -> dict[str, Any]:
     """VMs with snapshots across the vCenters, biggest first, filtered and flagged."""
     results = await asyncio.gather(
-        *(pool.run(name, lambda session: _scan_snapshots(session, under)) for name in names),
+        *(pool.sweep(name, lambda session: _scan_snapshots(session, under)) for name in names),
         return_exceptions=True,
     )
     rows: list[dict[str, Any]] = []

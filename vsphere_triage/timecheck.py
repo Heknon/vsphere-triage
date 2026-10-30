@@ -119,7 +119,7 @@ async def check_host_time(
     """Each host's NTP configuration and clock skew across the vCenters, worst first."""
     results = await asyncio.gather(
         *(
-            pool.run(name, lambda session: _scan_host_time(session, measure_skew=measure_skew))
+            pool.sweep(name, lambda session: _scan_host_time(session, measure_skew=measure_skew))
             for name in names
         ),
         return_exceptions=True,

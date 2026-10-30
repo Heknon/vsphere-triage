@@ -110,6 +110,7 @@ Configure it entirely through `VSPHERE_`-prefixed environment variables — only
 | `VSPHERE_THRESHOLDS` | see `config.Thresholds` | JSON object overriding any threshold |
 | `VSPHERE_SCAN_BASE_DISKS` | `1` | read disk chains in a scan, to group linked clones by base disk |
 | `VSPHERE_TIMEOUT_SECONDS` | `60` | deadline per vCenter read |
+| `VSPHERE_SCAN_TIMEOUT_SECONDS` | `300` | deadline for a whole-vCenter sweep (`scan`, `diagnose_window`, the fleet reports), which is many reads in a row |
 | `VSPHERE_MAX_CONCURRENT_TOOLS` | `4` | tool calls at once |
 | `VSPHERE_MAX_CONCURRENT_PER_VCENTER` | `4` | reads at once per vCenter |
 | `VSPHERE_MAX_LOG_BYTES` | 4 MiB | how much of the end of a log is read |
@@ -361,8 +362,11 @@ publishing `0.0.0`, since PyPI names are first-come.
 
 Then releasing is a version bump:
 
-1. raise `version` in `pyproject.toml`, commit, merge to `main`;
-2. the workflow sees the new version has no `vX.Y.Z` tag, builds the sdist +
+1. raise `version` in `pyproject.toml` and, to the same value, `version` and the
+   pinned `vsphere-triage==X.Y.Z` in `.claude-plugin/plugin.json` (a unit test
+   keeps the three in step); commit, merge to `main`;
+2. the workflow sees the new version has no `vX.Y.Z` tag, runs the CI gate
+   (lint, types, unit tests), builds the sdist +
    wheel, verifies the wheel installs and imports, publishes to PyPI, then tags
    the commit and makes the GitHub release.
 

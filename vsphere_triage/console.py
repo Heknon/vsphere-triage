@@ -152,8 +152,11 @@ def ocr(data: bytes) -> tuple[str | None, str]:
         return None, "pytesseract is not installed"
     if shutil.which("tesseract") is None:
         return None, "the tesseract binary is not on PATH"
-    with Image.open(io.BytesIO(data)) as image:
-        return pytesseract.image_to_string(image.convert("L")), "tesseract"
+    try:
+        with Image.open(io.BytesIO(data)) as image:
+            return pytesseract.image_to_string(image.convert("L")), "tesseract"
+    except Exception as error:  # noqa: BLE001 - a failed OCR loses the text, not the whole console read
+        return None, f"OCR failed ({type(error).__name__}: {error})"
 
 
 def screen_state(text: str) -> list[dict[str, str]]:

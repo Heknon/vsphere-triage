@@ -237,6 +237,9 @@ class Settings(BaseSettings):
     """
 
     timeout_seconds: PositiveFloat = 60.0
+    """The deadline for one vCenter read (a diagnosis, a log, a property read)."""
+    scan_timeout_seconds: PositiveFloat = 300.0
+    """The deadline for a whole-vCenter sweep (a scan, a fleet report): many reads in a row."""
     max_concurrent_tools: PositiveInt = 4
     max_concurrent_per_vcenter: PositiveInt = 4
     max_log_bytes: PositiveInt = 4 * 1024 * 1024

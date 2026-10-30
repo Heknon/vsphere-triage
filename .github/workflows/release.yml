@@ -62,9 +62,18 @@ jobs:
             echo "release=true" >> "$GITHUB_OUTPUT"
           fi
 
+  checks:
+    # The per-commit gate (lint, format, types, unit tests), reused from ci.yml,
+    # so nothing is published that the gate would refuse — a tag push otherwise
+    # never runs it, and on main it would race the publish. Only when releasing.
+    name: Gate (ci.yml)
+    needs: gate
+    if: needs.gate.outputs.release == 'true'
+    uses: ./.github/workflows/ci.yml
+
   build:
     name: Build
-    needs: gate
+    needs: [gate, checks]
     if: needs.gate.outputs.release == 'true'
     runs-on: ubuntu-latest
     timeout-minutes: 10

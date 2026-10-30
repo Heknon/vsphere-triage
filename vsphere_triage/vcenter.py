@@ -126,6 +126,19 @@ def _declared_size(response: httpx.Response, *, ranged: bool) -> int | None:
     return int(declared) if declared and declared.isdigit() else None
 
 
+_OWN_ONLY_NOTE = (
+    "only this server's own session is visible: either it is the only one open, or (far more "
+    "likely) the account lacks the Sessions.View privilege, which vCenter answers with just the "
+    "caller's session rather than an error; grant it to see the global count"
+)
+
+
+def _only_own(sessions: Sequence[Any], manager: Any) -> bool:
+    """Whether the session list is just this server's own session, as a role without Sessions.View sees it."""
+    own = getattr(getattr(manager, "currentSession", None), "key", None)
+    return len(sessions) <= 1 and all(getattr(entry, "key", None) == own for entry in sessions)
+
+
 def _session_row(entry: Any, now: datetime) -> dict[str, Any]:
     """One UserSession flattened: who, from where, how old and how idle."""
     login = as_utc(entry.loginTime) if getattr(entry, "loginTime", None) else None
@@ -296,6 +309,13 @@ class VCenterSession:
                 "note": "the account may not list all sessions; grant Sessions.View to see the global count",
                 "current_user": current,
             }
+        if _only_own(sessions, manager):
+            return {
+                "visible": "own_only",
+                "total": len(sessions),
+                "note": _OWN_ONLY_NOTE,
+                "current_user": current,
+            }
         by_user: dict[str, int] = {}
         for entry in sessions:
             by_user[entry.userName] = by_user.get(entry.userName, 0) + 1
@@ -330,6 +350,13 @@ class VCenterSession:
                     "this account may not list all sessions; grant the Sessions.View privilege (or a role "
                     "that carries it) to diagnose exhaustion, or read the vCenter's session count from vROps"
                 ),
+                "current_user": getattr(manager.currentSession, "userName", None),
+            }
+        if _only_own(raw, manager):
+            return {
+                "visible": "own_only",
+                "total": len(raw),
+                "note": _OWN_ONLY_NOTE,
                 "current_user": getattr(manager.currentSession, "userName", None),
             }
         idle_cut = self._session_timeout_minutes()
@@ -848,6 +875,37 @@ def _rows(objects: Iterable[Any]) -> list[dict[str, Any]]:
     return rows
 
 
+class _Slot:
+    """One of a vCenter's concurrent-read slots, which a stalled worker thread can keep."""
+
+    def __init__(self, limit: asyncio.Semaphore) -> None:
+        self._limit = limit
+        self._owned = False
+
+    async def acquire(self) -> None:
+        await self._limit.acquire()
+        self._owned = True
+
+    def release(self) -> None:
+        """Give the slot back, unless a stalled thread has taken it over."""
+        if self._owned:
+            self._owned = False
+            self._limit.release()
+
+    def hand_off(self, future: asyncio.Future[Any]) -> None:
+        """Let a thread that outlived its deadline release the slot when it finally ends."""
+        if not self._owned:
+            return
+        self._owned = False
+
+        def done(finished: asyncio.Future[Any]) -> None:
+            if not finished.cancelled():
+                finished.exception()  # retrieved, so it is not reported as unhandled
+            self._limit.release()
+
+        future.add_done_callback(done)
+
+
 def _not_retried(name: str, why: str) -> VSphereError:
     """The error for work that must not be repeated, when its session broke under it."""
     msg = (
@@ -904,31 +962,32 @@ class VCenterPool:
         """
         session = self.session(name)
         deadline = timeout_seconds or self.settings.timeout_seconds
-        async with self._limits[name]:
-            await self._bounded(session.connect)
+        slot = _Slot(self._limits[name])
+        await slot.acquire()
+        try:
+            await self._bounded(session.connect, slot=slot)
             generation = session.generation
             try:
-                return await self._bounded(lambda: work(session), deadline)
+                return await self._bounded(lambda: work(session), deadline, slot=slot)
             except vim.fault.NotAuthenticated:
                 # The session expired. Reconnect (a no-op if a sibling call already
                 # did, so we never log its new session out), then retry once.
-                await self._bounded(lambda: session.reconnect(generation))
+                await self._bounded(lambda: session.reconnect(generation), slot=slot)
                 if not retry:
                     raise _not_retried(name, "the session expired") from None
-                return await self._bounded(lambda: work(session), deadline)
+                return await self._bounded(lambda: work(session), deadline, slot=slot)
             except (ssl.SSLError, ConnectionError, HTTPException) as dropped:
                 # A dropped or reset connection — under load often the vCenter at
                 # its connection or session limit. Reconnect and retry once; if it
                 # happens again, say so plainly rather than as a bare socket error.
                 if not retry:
                     with contextlib.suppress(Exception):
-                        await self._bounded(lambda: session.reconnect(generation))
-                    raise _not_retried(
-                        name, f"the connection dropped ({type(dropped).__name__})"
-                    ) from dropped
+                        await self._bounded(lambda: session.reconnect(generation), slot=slot)
+                    why = f"the connection dropped ({type(dropped).__name__})"
+                    raise _not_retried(name, why) from dropped
                 try:
-                    await self._bounded(lambda: session.reconnect(generation))
-                    return await self._bounded(lambda: work(session), deadline)
+                    await self._bounded(lambda: session.reconnect(generation), slot=slot)
+                    return await self._bounded(lambda: work(session), deadline, slot=slot)
                 except (ssl.SSLError, ConnectionError, HTTPException) as again:
                     msg = (
                         f"vCenter {name} dropped the connection twice ({type(again).__name__}: {again}). "
@@ -936,14 +995,35 @@ class VCenterPool:
                         "check_vcenters reports its session count, and vROps has its session history."
                     )
                     raise VSphereError(msg) from again
+        finally:
+            slot.release()
 
-    async def _bounded(self, work: Callable[[], T], timeout_seconds: float | None = None) -> T:
+    async def sweep(self, name: str, work: Callable[[VCenterSession], T]) -> T:
+        """A whole-vCenter read (a scan, a fleet report): `run` under VSPHERE_SCAN_TIMEOUT_SECONDS.
+
+        One of these is many reads in a row (inventory, devices, events, counters),
+        so it gets the longer sweep deadline rather than the one meant for one read.
+        """
+        return await self.run(name, work, timeout_seconds=self.settings.scan_timeout_seconds)
+
+    async def _bounded(
+        self, work: Callable[[], T], timeout_seconds: float | None = None, *, slot: _Slot | None = None
+    ) -> T:
         deadline = timeout_seconds or self.settings.timeout_seconds
+        future = asyncio.ensure_future(asyncio.to_thread(work))
         try:
-            return await asyncio.wait_for(asyncio.to_thread(work), timeout=deadline)
+            return await asyncio.wait_for(asyncio.shield(future), timeout=deadline)
         except TimeoutError as error:
-            msg = f"vCenter read exceeded VSPHERE_TIMEOUT_SECONDS ({deadline:g}s)"
+            # The worker thread cannot be stopped; it keeps the vCenter's slot until
+            # it ends, so stalled reads cannot pile up past the per-vCenter limit.
+            if slot is not None:
+                slot.hand_off(future)
+            msg = f"vCenter read exceeded its deadline ({deadline:g}s)"
             raise VSphereError(msg) from error
+        except asyncio.CancelledError:
+            if slot is not None:
+                slot.hand_off(future)
+            raise
 
     def methods_seen(self) -> set[str]:
         """Every vSphere method any session has sent."""

@@ -39,7 +39,7 @@
   "mcpServers": {
     "vsphere-triage": {
       "command": "uvx",
-      "args": ["vsphere-triage"],
+      "args": ["vsphere-triage==0.1.1"],
       "env": {
         "UV_INDEX_URL": "${user_config.index_url}",
         "VSPHERE_VCENTERS": "${user_config.vcenters}",

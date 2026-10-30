@@ -191,7 +191,7 @@ async def run_scan(pool: VCenterPool, settings: Settings, names: Sequence[str]) 
     """Scan the named vCenters concurrently; one failing does not fail the rest."""
     started = datetime.now().astimezone()
     results = await asyncio.gather(
-        *(pool.run(name, lambda session: scan_vcenter(session, settings)) for name in names),
+        *(pool.sweep(name, lambda session: scan_vcenter(session, settings)) for name in names),
         return_exceptions=True,
     )
     scans: dict[str, VCenterScan] = {}
@@ -493,7 +493,7 @@ async def explain_group(  # noqa: C901 - one comparison, then one check per vCen
         own = [vm for vm in members if vm.vcenter == name]
         own_healthy = [vm for vm in healthy if vm.vcenter == name]
         try:
-            per_vcenter[name] = await pool.run(
+            per_vcenter[name] = await pool.sweep(
                 name,
                 lambda session, vs=vscan, m=own, h=own_healthy: explain_on_vcenter(
                     session, settings, vs, m, h
@@ -604,7 +604,10 @@ async def diagnose_window(
 ) -> dict[str, Any]:
     """The fleet over a past window, when the VMs themselves may already be gone."""
     results = await asyncio.gather(
-        *(pool.run(name, lambda session: window_on_vcenter(session, settings, begin, end)) for name in names),
+        *(
+            pool.sweep(name, lambda session: window_on_vcenter(session, settings, begin, end))
+            for name in names
+        ),
         return_exceptions=True,
     )
     per_vcenter: dict[str, Any] = {}

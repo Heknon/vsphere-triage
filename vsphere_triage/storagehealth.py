@@ -109,7 +109,7 @@ async def check_datastores(
 ) -> dict[str, Any]:
     """Every datastore's fill, over-provisioning and reachability across the vCenters, worst first."""
     results = await asyncio.gather(
-        *(pool.run(name, _scan_datastores) for name in names),
+        *(pool.sweep(name, _scan_datastores) for name in names),
         return_exceptions=True,
     )
     verdicts: list[dict[str, Any]] = []

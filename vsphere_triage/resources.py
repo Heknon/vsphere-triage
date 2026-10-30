@@ -108,7 +108,7 @@ async def find_resource_limits(
 ) -> dict[str, Any]:
     """VMs with a CPU/memory limit or reservation set across the vCenters, templates marked."""
     results = await asyncio.gather(
-        *(pool.run(name, lambda session: _scan_resource_policy(session, under)) for name in names),
+        *(pool.sweep(name, lambda session: _scan_resource_policy(session, under)) for name in names),
         return_exceptions=True,
     )
     rows: list[dict[str, Any]] = []

@@ -53,7 +53,7 @@ async def find_vms_by_device(
 ) -> dict[str, Any]:
     """VMs across the named vCenters that have (present) or lack (not present) a device."""
     results = await asyncio.gather(
-        *(pool.run(name, lambda session: _scan_devices(session, under)) for name in names),
+        *(pool.sweep(name, lambda session: _scan_devices(session, under)) for name in names),
         return_exceptions=True,
     )
     rows: list[dict[str, Any]] = []
@@ -143,7 +143,7 @@ async def hardware_profile(  # noqa: C901 - one fleet walk, kept together
     """
     results = await asyncio.gather(
         *(
-            pool.run(name, lambda s: _profile_scope(s, under, include_templates=include_templates))
+            pool.sweep(name, lambda s: _profile_scope(s, under, include_templates=include_templates))
             for name in names
         ),
         return_exceptions=True,

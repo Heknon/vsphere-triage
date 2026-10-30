@@ -130,7 +130,7 @@ async def find_old_environments(
     """Environments older than `older_than_hours` across vCenters, oldest first."""
     results = await asyncio.gather(
         *(
-            pool.run(name, lambda session: _scan_ages(session, settings, older_than_hours, under))
+            pool.sweep(name, lambda session: _scan_ages(session, settings, older_than_hours, under))
             for name in names
         ),
         return_exceptions=True,
