@@ -7,6 +7,7 @@ import io
 import json
 import ssl
 from datetime import UTC, datetime, timedelta
+from types import SimpleNamespace
 
 import httpx
 import pytest
@@ -43,6 +44,7 @@ from vsphere_triage.inventory import (
     Inventory,
     Question,
     VmFacts,
+    datastore_backing_naas,
     describe_devices,
     find_environment,
     os_family,
@@ -1725,3 +1727,59 @@ def test_powerflex_even_traffic_names_no_hotspot() -> None:
     ]
     ranked = powerflex.rank_protection_domains(rows)
     assert any("none dominates" in finding for finding in ranked["findings"])
+
+
+# -- PowerFlex -> vSphere reverse mapping ------------------------------------
+
+
+def test_datastore_backing_naas_reads_vmfs_extents() -> None:
+    info = SimpleNamespace(
+        vmfs=SimpleNamespace(
+            extent=[SimpleNamespace(diskName="naa.6abc"), SimpleNamespace(diskName="naa.6def")]
+        )
+    )
+    assert datastore_backing_naas(info) == ["naa.6abc", "naa.6def"]
+    assert datastore_backing_naas(SimpleNamespace(nas=object())) == []  # NFS: no vmfs extent
+
+
+def test_map_backend_impact_picks_volumes_on_troubled_pds() -> None:
+    pds = [{"id": "pd1", "name": "prod"}, {"id": "pd2", "name": "quiet"}]
+    pd_stats = {
+        "pd1": {"rebuildPendingCapacityInKb": 9000},  # degraded -> troubled
+        "pd2": {},
+    }
+    pools = [{"id": "sp1", "protectionDomainId": "pd1"}, {"id": "sp2", "protectionDomainId": "pd2"}]
+    volumes = [
+        {"id": "VOL-AAAA", "name": "ds-a", "storagePoolId": "sp1"},
+        {"id": "VOL-BBBB", "name": "ds-b", "storagePoolId": "sp2"},
+    ]
+    impact = powerflex.map_backend_impact(pds, pd_stats, pools, volumes)
+    assert impact["volume_to_pd"] == {"vol-aaaa": "prod"}
+    assert "prod" in impact["troubled_protection_domains"]
+
+
+def test_affected_vms_joins_volumes_to_datastores_to_suffering_vms() -> None:
+    volume_to_pd = {"vol-aaaa": "prod"}
+    datastores = [
+        {"vcenter": "vc-a", "moref": "ds-1", "name": "ds-a", "powerflex_volume_ids": ["vol-aaaa"]},
+        {"vcenter": "vc-a", "moref": "ds-2", "name": "ds-b", "powerflex_volume_ids": ["vol-zzzz"]},
+    ]
+    vms_by_datastore = {
+        "ds-1": [
+            {"name": "web-01", "moref": "vm-1", "vcenter": "vc-a", "state": "busy_not_up", "suffering": True},
+            {"name": "web-02", "moref": "vm-2", "vcenter": "vc-a", "state": "up", "suffering": False},
+        ]
+    }
+    result = powerflex.affected_vms(volume_to_pd, datastores, vms_by_datastore)
+    assert len(result["affected_datastores"]) == 1
+    hit = result["affected_datastores"][0]
+    assert hit["datastore"] == "ds-a"
+    assert hit["protection_domain"] == "prod"
+    assert hit["suffering_total"] == 1
+    assert result["suffering_total"] == 1
+
+
+def test_affected_vms_says_so_when_nothing_maps() -> None:
+    result = powerflex.affected_vms({"vol-x": "pd"}, [], {})
+    assert result["affected_datastores"] == []
+    assert any("no datastore" in finding for finding in result["findings"])

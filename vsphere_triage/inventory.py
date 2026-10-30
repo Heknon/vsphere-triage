@@ -94,8 +94,23 @@ DATASTORE_MOUNT_PATHS = (
     "summary.uncommitted",
     "summary.accessible",
     "summary.type",
+    "info",
     "host",
 )
+
+
+def datastore_backing_naas(info: Any) -> list[str]:
+    """The SCSI device ids (naa/eui) a VMFS datastore's extents sit on, for backend mapping.
+
+    A VMFS datastore's `info.vmfs.extent[].diskName` is the canonical name of each
+    LUN it spans — the handle that maps back to a PowerFlex volume. NFS/vSAN info
+    carries no such extent, so the list is empty for them.
+    """
+    vmfs = getattr(info, "vmfs", None)
+    extents = getattr(vmfs, "extent", None) or []
+    return [name for extent in extents if (name := getattr(extent, "diskName", None))]
+
+
 HOST_TIME_PATHS = (
     "name",
     "runtime.connectionState",
@@ -769,6 +784,7 @@ def read_datastore_mounts(session: VCenterSession) -> list[dict[str, Any]]:
                 "free_bytes": row.get("summary.freeSpace"),
                 "uncommitted_bytes": row.get("summary.uncommitted"),
                 "accessible": row.get("summary.accessible"),
+                "backing_naas": datastore_backing_naas(row.get("info")),
                 "mounts": mounts,
             }
         )

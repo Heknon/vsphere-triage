@@ -193,6 +193,13 @@ them into the verdict in plain words:
   disproportionate share of IOPS — the busy-PD pattern); map the slow datastore
   to its volume with `powerflex_find_volume` and confirm which PD it is on.
 
+When PowerFlex *is* the starting point — a PD you already know is rebuilding or
+busy — run it the other way with **`powerflex_affected_vms`**: it finds the
+troubled/hot PDs, maps their volumes back to the vSphere datastores on them (by
+the datastore's backing device id, which `check_datastores` now reports), and
+lists the VMs there split into suffering and healthy. That turns "this PD is
+hot" straight into "these are the VMs it is hurting".
+
 The honest sentence is: *there is something better I could use, but it has not
 been given to me — here is what, and here is how.*
 

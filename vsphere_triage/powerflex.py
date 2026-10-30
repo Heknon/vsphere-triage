@@ -128,6 +128,113 @@ def rank_protection_domains(rows: list[dict[str, Any]]) -> dict[str, Any]:
     }
 
 
+_PD_DEGRADED_KEYS = (
+    "rebuildPendingCapacityInKb",
+    "rebalancePendingCapacityInKb",
+    "degradedHealthyCapacityInKb",
+    "degradedFailedCapacityInKb",
+)
+
+
+def map_backend_impact(
+    pds: list[dict[str, Any]],
+    pd_stats: dict[str, dict[str, Any]],
+    pools: list[dict[str, Any]],
+    volumes: list[dict[str, Any]],
+) -> dict[str, Any]:
+    """Which PowerFlex volumes sit on a *troubled* protection domain, and why.
+
+    A PD is troubled if it is rebuilding/rebalancing or has degraded capacity, or
+    if it is the hot PD (more than half the backend IOPS). Returns {volume_id ->
+    PD name} for every volume on a troubled PD, so the caller can map those
+    volumes back to vSphere datastores. Pure.
+    """
+    pd_name = {pd["id"]: (pd.get("name") or pd["id"]) for pd in pds if pd.get("id")}
+    rows = [
+        {"id": pd["id"], "name": pd_name[pd["id"]], "traffic": traffic_of(pd_stats.get(pd["id"]) or {})}
+        for pd in pds
+        if pd.get("id")
+    ]
+    ranked = rank_protection_domains(rows)
+    total = ranked["total_iops"]
+    top = ranked["ranked"][0] if ranked["ranked"] else None
+    hot_id = (
+        top["id"]
+        if top and total > 0 and len(ranked["ranked"]) > 1 and top["traffic"]["total_iops"] / total > 0.5  # noqa: PLR2004
+        else None
+    )
+    troubled: dict[str, list[str]] = {}
+    for pd in pds:
+        pd_id = pd.get("id")
+        if not pd_id:
+            continue
+        reasons = []
+        if any(_positive((pd_stats.get(pd_id) or {}).get(key)) for key in _PD_DEGRADED_KEYS):
+            reasons.append("rebuild/rebalance or degraded capacity")
+        if pd_id == hot_id:
+            reasons.append("hot: more than half of backend IOPS")
+        if reasons:
+            troubled[pd_id] = reasons
+    pool_pd = {pool.get("id"): pool.get("protectionDomainId") for pool in pools}
+    volume_to_pd: dict[str, str] = {}
+    for volume in volumes:
+        pd_id = pool_pd.get(volume.get("storagePoolId"))
+        if pd_id in troubled:
+            identifier = str(volume.get("id", "")).lower()
+            if identifier:
+                volume_to_pd[identifier] = pd_name.get(pd_id, pd_id)
+    return {
+        "troubled_protection_domains": {pd_name.get(k, k): v for k, v in troubled.items()},
+        "volume_to_pd": volume_to_pd,
+    }
+
+
+def affected_vms(
+    volume_to_pd: dict[str, str],
+    datastores: list[dict[str, Any]],
+    vms_by_datastore: dict[str, list[dict[str, Any]]],
+    *,
+    limit: int = 50,
+) -> dict[str, Any]:
+    """Join troubled-volume ids to datastores to the VMs on them, split by suffering.
+
+    `datastores`: {vcenter, moref, name, powerflex_volume_ids}. `vms_by_datastore`:
+    moref -> [{name, moref, vcenter, state, suffering}]. Pure.
+    """
+    affected = []
+    total_suffering = 0
+    for datastore in datastores:
+        hit = next((vid for vid in datastore.get("powerflex_volume_ids", []) if vid in volume_to_pd), None)
+        if hit is None:
+            continue
+        vms = vms_by_datastore.get(datastore["moref"], [])
+        suffering = [vm for vm in vms if vm.get("suffering")]
+        total_suffering += len(suffering)
+        affected.append(
+            {
+                "vcenter": datastore["vcenter"],
+                "datastore": datastore["name"],
+                "moref": datastore["moref"],
+                "powerflex_volume_id": hit,
+                "protection_domain": volume_to_pd[hit],
+                "vms_total": len(vms),
+                "suffering_total": len(suffering),
+                "suffering_vms": suffering[:limit],
+            }
+        )
+    affected.sort(key=lambda item: item["suffering_total"], reverse=True)
+    if affected:
+        findings = [
+            (
+                f"{total_suffering} VM(s) suffering on {len(affected)} datastore(s) backed by a troubled "
+                "protection domain — the backend trouble is reaching the VMs"
+            )
+        ]
+    else:
+        findings = ["no datastore in these vCenters maps to a troubled protection domain"]
+    return {"affected_datastores": affected, "suffering_total": total_suffering, "findings": findings}
+
+
 def summarize_health(
     sds: list[dict[str, Any]], devices: list[dict[str, Any]], system_stats: dict[str, Any]
 ) -> dict[str, Any]:
@@ -258,6 +365,10 @@ class PowerFlex:
     async def protection_domain_statistics(self, domain_id: str) -> dict[str, Any]:
         """One protection domain's statistics, including its read/write bandwidth counters."""
         return await self._get(f"/instances/ProtectionDomain::{domain_id}/relationships/Statistics")
+
+    async def storage_pools(self) -> list[dict[str, Any]]:
+        """Every storage pool and the protection domain it belongs to (pool -> PD)."""
+        return await self._get("/types/StoragePool/instances")
 
     async def volumes(self) -> list[dict[str, Any]]:
         """Every volume (id, name, size), for mapping a datastore to its backend volume."""

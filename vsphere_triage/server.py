@@ -50,7 +50,7 @@ from vsphere_triage import (
     winboot,
 )
 from vsphere_triage import scan as scanning
-from vsphere_triage.checks import classify, count_states
+from vsphere_triage.checks import ABNORMAL, classify, count_states
 from vsphere_triage.config import Settings
 from vsphere_triage.contention import hosts_cpu, storage
 from vsphere_triage.diagnose import (
@@ -67,6 +67,7 @@ from vsphere_triage.diagnose import (
 )
 from vsphere_triage.formatting import bounded
 from vsphere_triage.inventory import find_environment as environment_folders
+from vsphere_triage.inventory import read_datastore_mounts, read_inventory
 from vsphere_triage.powerflex import PowerFlexError
 from vsphere_triage.readonly import ReadOnlyViolationError
 from vsphere_triage.vcenter import VCenterPool, VSphereError
@@ -217,7 +218,7 @@ def build_server(settings: Settings | None = None, pool: VCenterPool | None = No
     if vrops is not None:
         _register_vrops_tools(tool, vrops)
     if powerflex_client is not None:
-        _register_powerflex_tools(tool, powerflex_client)
+        _register_powerflex_tools(tool, powerflex_client, fleet, resolved)
     server.vcenters = fleet  # type: ignore[attr-defined]  # ty: ignore[unresolved-attribute] - attached for the tests to read methods_seen
     return server
 
@@ -1670,8 +1671,90 @@ def _register_vrops_tools(tool: Callable[..., Any], vrops: Vrops) -> None:
         return {"count": len(alerts), "alerts": alerts[:100]}
 
 
-def _register_powerflex_tools(tool: Callable[..., Any], client: powerflex.PowerFlex) -> None:
+def _register_powerflex_tools(  # noqa: C901, PLR0915 - one closure per tool
+    tool: Callable[..., Any], client: powerflex.PowerFlex, fleet: VCenterPool, resolved: Settings
+) -> None:
     """The PowerFlex backend tools, registered only when PowerFlex is configured."""
+
+    @tool("powerflex_affected_vms")
+    async def powerflex_affected_vms(*, vcenters: list[str] | None = None) -> dict[str, Any]:
+        """Start from PowerFlex: find troubled protection domains, then the VMs suffering on them.
+
+        The top-down flow. Reads PowerFlex to find protection domains that are
+        rebuilding/degraded or hot (more than half the backend IOPS), maps the
+        volumes on them back to the vSphere datastores that sit on those volumes
+        (by the datastore's backing device id), and reports the VMs on those
+        datastores — split into suffering and healthy. Answers "a PD is busy or
+        rebuilding; which of my VMs is that actually hurting?".
+
+        Args:
+            vcenters: vCenter names to check for affected VMs; all when empty.
+
+        """
+        pds = await client.protection_domains()
+        pools = await client.storage_pools()
+        volumes = await client.volumes()
+        pd_stats: dict[str, dict[str, Any]] = {}
+        for domain in pds:
+            identifier = domain.get("id")
+            if identifier:
+                stats = await client.protection_domain_statistics(identifier)
+                pd_stats[identifier] = stats if isinstance(stats, dict) else {}
+        impact = powerflex.map_backend_impact(pds, pd_stats, pools, volumes)
+        if not impact["volume_to_pd"]:
+            return {
+                "troubled_protection_domains": impact["troubled_protection_domains"],
+                "affected_datastores": [],
+                "findings": ["no protection domain is troubled (or no volumes sit on one)"],
+            }
+
+        def read(session: VCenterSession) -> tuple[list[dict[str, Any]], dict[str, list[dict[str, Any]]]]:
+            datastores = [
+                {
+                    "vcenter": session.vcenter.name,
+                    "moref": store["moref"],
+                    "name": store.get("name"),
+                    "powerflex_volume_ids": [
+                        vid
+                        for naa in store.get("backing_naas") or []
+                        if (vid := powerflex.volume_id_from_naa(naa))
+                    ],
+                }
+                for store in read_datastore_mounts(session)
+            ]
+            vms_by_datastore: dict[str, list[dict[str, Any]]] = {}
+            inventory = read_inventory(session, with_devices=False)
+            for vm in inventory.vms:
+                verdict = classify(vm, resolved.thresholds)
+                row = {
+                    "name": vm.name,
+                    "moref": vm.moref,
+                    "vcenter": vm.vcenter,
+                    "state": verdict.state,
+                    "suffering": verdict.state in ABNORMAL,
+                }
+                for datastore_moref in vm.datastore_morefs:
+                    vms_by_datastore.setdefault(datastore_moref, []).append(row)
+            return datastores, vms_by_datastore
+
+        names = _names(fleet, vcenters)
+        results = await asyncio.gather(*(fleet.run(name, read) for name in names), return_exceptions=True)
+        datastores: list[dict[str, Any]] = []
+        vms_by_datastore: dict[str, list[dict[str, Any]]] = {}
+        errors: dict[str, str] = {}
+        for name, result in zip(names, results, strict=True):
+            if isinstance(result, BaseException):
+                errors[name] = str(result)
+                continue
+            store_rows, vm_map = result
+            datastores.extend(store_rows)
+            vms_by_datastore.update(vm_map)
+        join = powerflex.affected_vms(impact["volume_to_pd"], datastores, vms_by_datastore)
+        return {
+            "troubled_protection_domains": impact["troubled_protection_domains"],
+            **join,
+            "errors": errors,
+        }
 
     @tool("powerflex_health")
     async def powerflex_health() -> dict[str, Any]:

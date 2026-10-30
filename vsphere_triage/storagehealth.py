@@ -23,6 +23,7 @@ from typing import TYPE_CHECKING, Any
 
 from pyVmomi import vim
 
+from vsphere_triage import powerflex
 from vsphere_triage.inventory import read_datastore_mounts
 
 if TYPE_CHECKING:
@@ -65,12 +66,19 @@ def classify_datastore(row: dict[str, Any], thresholds: Thresholds) -> dict[str,
         reason = mount["reason"] or "inaccessible"
         apd_pdl = " (all-paths-down / permanent-device-loss)" if reason in APD_PDL_REASONS else ""
         findings.append(f"mounted but unreachable on a host: {reason}{apd_pdl} — its VMs there stall")
+    naas = row.get("backing_naas") or []
     return {
         "vcenter": row["vcenter"],
         "moref": row["moref"],
         "name": name,
         "type": row.get("type"),
         "accessible": row.get("accessible"),
+        "backing_naas": naas,
+        # Decoded candidate PowerFlex volume id(s) — the handle that maps this
+        # datastore to its backend volume (confirm against powerflex_find_volume).
+        "powerflex_volume_ids": [
+            volume_id for naa in naas if (volume_id := powerflex.volume_id_from_naa(naa))
+        ],
         "capacity_gb": round(capacity / GIGABYTE, 1) if capacity else None,
         "free_gb": round(free / GIGABYTE, 1) if free is not None else None,
         "free_percent": free_percent,
