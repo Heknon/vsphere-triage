@@ -41,7 +41,18 @@ async def _located(
     env_id: str | None,
     vm_name: str | None,
 ) -> dict[str, Any]:
-    """Find the VM: reads only, so this step may be retried on a dropped session."""
+    """Find the VM: reads only, so this step may be retried on a dropped session.
+
+    A moref alone is refused for a power operation: morefs repeat across vCenters
+    (vm-1001 on each), so a moref paired with the wrong vCenter would reset some
+    other VM. The VM's name must come with it, and must match.
+    """
+    if moref and not vm_name:
+        return {
+            "found": False,
+            "reason": "a power operation needs the VM's name with its moref (morefs repeat across "
+            "vCenters); pass vm_name too, so the right VM is checked before anything is sent",
+        }
 
     def find(session: VCenterSession) -> dict[str, Any]:
         located = locate(session, settings, env_id=env_id, vm_name=vm_name, moref=moref, strict=True)

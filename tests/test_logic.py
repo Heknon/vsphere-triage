@@ -2806,7 +2806,7 @@ def test_a_hard_reset_is_never_sent_twice_after_a_session_expiry(monkeypatch: py
     monkeypatch.setattr(session, "hard_reset", reset)
 
     with pytest.raises(VSphereError, match="may or may not have run"):
-        asyncio.run(power.hard_reset(pool, settings, "vc-a", moref="vm-7", env_id=None, vm_name=None))
+        asyncio.run(power.hard_reset(pool, settings, "vc-a", moref="vm-7", env_id=None, vm_name="web-01"))
 
     assert sent["n"] == 1
 
@@ -3290,3 +3290,18 @@ def test_vms_stunned_on_a_question_by_a_full_datastore_count_as_suffering() -> N
 
     assert {checks.BLOCKED_ON_QUESTION, checks.PAUSED, checks.INACCESSIBLE} <= STORAGE_SUFFERING
     assert checks.HEALTHY not in STORAGE_SUFFERING
+
+
+def test_a_power_operation_by_moref_alone_is_refused() -> None:
+    from vsphere_triage import power  # noqa: PLC0415
+
+    class _NoPool:
+        async def run(self, *_a: object, **_k: object) -> dict:
+            raise AssertionError("nothing may be read or sent")
+
+    result = asyncio.run(
+        power.hard_reset(_NoPool(), Settings(), "vc-a", moref="vm-1001", env_id=None, vm_name=None)  # type: ignore[arg-type]
+    )
+
+    assert result["found"] is False
+    assert "needs the VM's name" in result["reason"]

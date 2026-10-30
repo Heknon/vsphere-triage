@@ -1117,11 +1117,12 @@ def _register_machine_tools(  # noqa: C901, PLR0915 - one closure per tool
         a fresh boot log, serial console, and (on Windows) the bugcheck its next
         boot records. After it comes back, read get_boot_timeline / read_serial_console.
 
-        Find the VM by moref, or by env_id plus vm_name (never by name alone).
+        Find the VM by moref plus vm_name (both: morefs repeat across vCenters), or
+        by env_id plus vm_name (never by name alone).
 
         Args:
             vcenter: the VM's vCenter.
-            moref: the VM's moref, or give env_id and vm_name.
+            moref: the VM's moref, given together with vm_name; or give env_id and vm_name.
             env_id: the environment id, with vm_name.
             vm_name: the machine's name inside its environment.
 
@@ -1149,11 +1150,12 @@ def _register_machine_tools(  # noqa: C901, PLR0915 - one closure per tool
         graceful reboot was issued and the VM never came back. After it resets,
         read get_boot_timeline / read_serial_console for the fresh boot.
 
-        Find the VM by moref, or by env_id plus vm_name (never by name alone).
+        Find the VM by moref plus vm_name (both: morefs repeat across vCenters), or
+        by env_id plus vm_name (never by name alone).
 
         Args:
             vcenter: the VM's vCenter.
-            moref: the VM's moref, or give env_id and vm_name.
+            moref: the VM's moref, given together with vm_name; or give env_id and vm_name.
             env_id: the environment id, with vm_name.
             vm_name: the machine's name inside its environment.
 
@@ -1916,8 +1918,8 @@ def _register_powerflex_tools(  # noqa: C901, PLR0915 - one closure per tool
                     "moref": vm.moref,
                     "vcenter": vm.vcenter,
                     "state": verdict.state,
-                    # States a slow backend can cause; a VM blocked on a question or
-                    # paused is abnormal for its own reasons, not the storage's.
+                    # States a slow, full or unreachable backend can cause (see
+                    # STORAGE_SUFFERING); counted only on a troubled PD's datastores.
                     "suffering": verdict.state in STORAGE_SUFFERING,
                 }
                 for datastore_moref in vm.datastore_morefs:
