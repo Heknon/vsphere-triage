@@ -17,6 +17,7 @@ from vsphere_triage import (
     ages,
     capabilities,
     checks,
+    clusterevents,
     connhistory,
     console,
     contention,
@@ -24,10 +25,13 @@ from vsphere_triage import (
     emscheck,
     formatting,
     guestexec,
+    linuxboot,
+    powerflex,
     resources,
     scan,
     snapshots,
     storagehealth,
+    taskhistory,
     timecheck,
     vmlog,
     winboot,
@@ -1538,3 +1542,150 @@ def test_session_history_says_so_when_there_is_nothing() -> None:
     summary = connhistory.summarize_session_events([], now=NOW, window_minutes=60)
     assert summary["total_events"] == 0
     assert any("no session events" in finding for finding in summary["findings"])
+
+
+# -- cluster events: why a whole cluster moved -------------------------------
+
+
+def test_cluster_events_names_an_ha_restart_wave() -> None:
+    rows = [
+        {
+            "type": "VmRestartedByHaEvent",
+            "time": NOW - timedelta(minutes=m),
+            "message": "vSphere HA restarted this virtual machine",
+            "host": "esx-31",
+            "vm": f"vm-{m}",
+        }
+        for m in range(5)
+    ]
+    rows.append(
+        {
+            "type": "HostConnectionLostEvent",
+            "time": NOW - timedelta(minutes=6),
+            "message": "Host connection lost",
+            "host": "esx-31",
+            "vm": None,
+        }
+    )
+    summary = clusterevents.summarize_cluster_events(rows, now=NOW, window_minutes=120)
+    assert summary["buckets"]["ha_vm_restart"]["count"] == 5
+    assert "esx-31" in summary["buckets"]["ha_vm_restart"]["hosts"]
+    assert any("HA restarted" in finding for finding in summary["findings"])
+
+
+def test_cluster_events_classify_falls_through_for_noise() -> None:
+    assert clusterevents.classify_event("UserLoginSessionEvent", "logged in") is None
+    assert clusterevents.classify_event("DrsVmMigratedEvent", "migrated")[0] == "drs_migration"
+
+
+# -- task history: what was done ---------------------------------------------
+
+
+def test_task_categories_and_wave_detection() -> None:
+    assert taskhistory.categorize("VirtualMachine.relocate") == "migration"
+    assert taskhistory.categorize("VirtualMachine.reconfigure") == "reconfigure"
+    rows = [
+        {
+            "operation": "Datastore.relocate",
+            "target": f"vm-{i}",
+            "state": "success",
+            "time": NOW,
+            "user": "svc",
+        }
+        for i in range(12)
+    ]
+    rows.append(
+        {"operation": "VirtualMachine.clone", "target": "vm-x", "state": "error", "time": NOW, "user": "bob"}
+    )
+    summary = taskhistory.summarize_tasks(rows, now=NOW, window_minutes=120)
+    assert summary["by_family"]["migration"] == 12
+    assert len(summary["failures"]) == 1
+    assert any("migration" in finding for finding in summary["findings"])
+
+
+# -- Linux boot picture ------------------------------------------------------
+
+
+def test_linux_boot_picture_classifies_dmesg_and_names_slow_units() -> None:
+    output = (
+        "===LAST_BOOT===\n2026-10-29 02:00:00\n"
+        "===BLAME===\n45.123s cloud-init.service\n2.000s sshd.service\n"
+        "===CRITICAL===\ngraphical.target @48.0s\n"
+        "===DMESG===\n[  12.3] INFO: task jbd2:131 blocked for more than 120 seconds.\n"
+        "===JOURNAL===\n2026-10-29T02:00:10 kernel: EXT4-fs error (device sda1): ext4_find_entry\n"
+        "===END==="
+    )
+    summary = linuxboot.summarize_linux_boot(output)
+    kinds = {finding["kind"] for finding in summary["kernel_findings"]}
+    assert "hung_task" in kinds
+    assert "filesystem" in kinds
+    assert summary["slow_units"][0]["unit"] == "cloud-init.service"
+    assert summary["restricted"] is False
+
+
+def test_linux_boot_reports_a_restricted_read() -> None:
+    output = "===LAST_BOOT===\n2026\n===BLAME===\n===CRITICAL===\n===DMESG===\n===JOURNAL===\n===END==="
+    summary = linuxboot.summarize_linux_boot(output)
+    assert summary["restricted"] is True
+    assert any("restricted" in line for line in summary["picture"])
+
+
+# -- PowerFlex backend -------------------------------------------------------
+
+
+def test_powerflex_lun_and_naa_helpers() -> None:
+    assert powerflex.is_powerflex_lun("DellEMC", "ScaleIO") is True
+    assert powerflex.is_powerflex_lun("NETAPP", "LUN") is False
+    assert powerflex.volume_id_from_naa("naa.6e00abcd0123456789abcdef01234567") == "89abcdef01234567"
+    assert powerflex.volume_id_from_naa(None) is None
+
+
+def test_powerflex_health_flags_a_rebuild_and_a_down_sds() -> None:
+    sds = [
+        {
+            "name": "sds-1",
+            "sdsState": "Normal",
+            "mdmConnectionState": "Connected",
+            "membershipState": "Joined",
+        },
+        {"name": "sds-2", "sdsState": "Disconnected", "mdmConnectionState": "Disconnected"},
+    ]
+    devices = [{"id": "d1", "deviceState": "Normal", "errorState": "None"}]
+    stats = {"rebuildPendingCapacityInKb": 5000, "rebalancePendingCapacityInKb": 0}
+    summary = powerflex.summarize_health(sds, devices, stats)
+    assert summary["healthy"] is False
+    assert summary["rebuild_active"] is True
+    assert "sds-2" in summary["sds_down"]
+    assert any("rebuild" in finding for finding in summary["findings"])
+
+
+def test_powerflex_health_is_calm_when_all_is_well() -> None:
+    sds = [
+        {
+            "name": "sds-1",
+            "sdsState": "Normal",
+            "mdmConnectionState": "Connected",
+            "membershipState": "Joined",
+        }
+    ]
+    summary = powerflex.summarize_health(sds, [], {})
+    assert summary["healthy"] is True
+
+
+def test_powerflex_gap_named_only_when_unconfigured() -> None:
+    assert capabilities.powerflex_gap(_settings()) is not None
+    configured = _settings(
+        VSPHERE_POWERFLEX_URL="https://gw", VSPHERE_POWERFLEX_USERNAME="u", VSPHERE_POWERFLEX_PASSWORD="p"
+    )
+    assert capabilities.powerflex_gap(configured) is None
+
+
+# -- VMCI in the hardware view -----------------------------------------------
+
+
+def test_vmci_device_surfaces_its_config_and_flags_unrestricted() -> None:
+    device = vim.vm.device.VirtualVMCIDevice(allowUnrestrictedCommunication=True, filterEnable=False)
+    described, findings, _blocking = describe_devices([device])
+    assert described[0]["category"] == "vmci"
+    assert described[0]["allow_unrestricted_communication"] is True
+    assert any("unrestricted" in finding for finding in findings)

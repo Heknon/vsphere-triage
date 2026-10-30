@@ -286,7 +286,18 @@ class Settings(BaseSettings):
     vrops_auth_source: str | None = None
     """The vROps authentication source for the user, when it is not local."""
 
-    @field_validator("vrops_url")
+    powerflex_url: str | None = None
+    """`VSPHERE_POWERFLEX_URL`: the PowerFlex Gateway/Manager, e.g. `https://pflex-gw.example`.
+
+    Optional backend-storage history for fleets on Dell PowerFlex (ScaleIO /
+    VxFlex): SDS/device health and rebuild/rebalance activity behind the
+    datastores. Not discoverable from vSphere, so it is configured here.
+    """
+
+    powerflex_username: str | None = None
+    powerflex_password: str | None = Field(default=None, repr=False)
+
+    @field_validator("vrops_url", "powerflex_url")
     @classmethod
     def _a_base(cls, value: str | None) -> str | None:
         return value.rstrip("/") if value else None
@@ -309,6 +320,12 @@ class Settings(BaseSettings):
             raise ValueError(msg)
         if self.vrops_url and not self.vrops_username:
             msg = "vrops_url needs vrops_username and vrops_password"
+            raise ValueError(msg)
+        if bool(self.powerflex_username) != bool(self.powerflex_password):
+            msg = "powerflex_username and powerflex_password must be configured together"
+            raise ValueError(msg)
+        if self.powerflex_url and not self.powerflex_username:
+            msg = "powerflex_url needs powerflex_username and powerflex_password"
             raise ValueError(msg)
         return self
 

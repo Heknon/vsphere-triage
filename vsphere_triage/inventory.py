@@ -406,7 +406,7 @@ def serial_files(devices: Iterable[Any]) -> list[str]:
     return files
 
 
-def _device_category(device: Any) -> str:  # noqa: PLR0911 - one classification
+def _device_category(device: Any) -> str:  # noqa: C901, PLR0911 - one isinstance per device kind
     """Which kind of virtual device this is."""
     d = vim.vm.device
     if isinstance(device, d.VirtualEthernetCard):
@@ -427,6 +427,8 @@ def _device_category(device: Any) -> str:  # noqa: PLR0911 - one classification
         return "video"
     if isinstance(device, (d.VirtualKeyboard, d.VirtualPointingDevice)):
         return "input"
+    if isinstance(device, d.VirtualVMCIDevice):
+        return "vmci"
     return "other"
 
 
@@ -482,6 +484,20 @@ def describe_devices(
             "category": category,
             "backing": _backing_summary(device),
         }
+        if category == "vmci":
+            # VMCI is the transport VMware Tools and guest-RPC run over, so its
+            # state bears on "Tools down / guest unreachable from the host". We
+            # can read only its config here (presence, the datagram firewall,
+            # whether unrestricted guest<->host comms are allowed), never traffic.
+            entry["allow_unrestricted_communication"] = getattr(
+                device, "allowUnrestrictedCommunication", None
+            )
+            entry["filter_enabled"] = getattr(device, "filterEnable", None)
+            if entry["allow_unrestricted_communication"]:
+                findings.append(
+                    f"VMCI device {label!r} allows unrestricted guest<->host communication "
+                    "(a security note; it does not block boot)"
+                )
         if connectable is not None:
             entry["connected"] = connectable.connected
             entry["start_connected"] = connectable.startConnected

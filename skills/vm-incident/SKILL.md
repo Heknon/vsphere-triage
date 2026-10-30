@@ -43,6 +43,7 @@ wedged guest write a fresh boot log, never as the fix, and the destructive
 | **The creator/runner** | what it asked the vCenter and when, its errors, how long it waited for the machine | your log store |
 | **vCenter** (the fleet) | live VM state, console, `vmware.log`, events, host and datastore counters | the `vsphere-triage` server (read-only) |
 | **vROps** (optional) | days of host, cluster and datastore history; alerts | `vsphere-triage`'s `vrops_*` tools |
+| **PowerFlex** (optional) | the storage backend behind the datastores: SDS/device health, rebuild/rebalance | `vsphere-triage`'s `powerflex_*` tools |
 
 If the `vsphere-triage` tools are not present, stop and ask: this skill cannot
 reach vCenter without them. If your orchestrator's tools or log store are not
@@ -98,6 +99,20 @@ fleet-wide. When `check_vcenters` shows the session count healthy but the errors
 persist, run **`check_host_time`**: it reports each host's NTP configuration and
 its clock skew from vCenter, and names the hosts that have drifted.
 
+## When a whole cluster moved at once
+
+Before diagnosing many VMs one by one, ask what happened *above* them. Two
+cluster-level reads name a shared cause that no single VM shows:
+
+- **`cluster_events`** — vSphere HA restarts, host isolation/failure/connection
+  loss, and DRS migration waves over a window. If HA restarted a batch of VMs
+  after a host failed, those VMs rebooting is *expected*: judge them from that
+  restart, not as independent hangs. This is the first thing to run when the
+  symptom spans a cluster.
+- **`recent_tasks`** — what was *done* in the window: a storage-vMotion sweep
+  onto one datastore, a mass reconfigure, a snapshot consolidation. A cause
+  someone or an automation introduced shows here and nowhere in a VM's counters.
+
 ## When a read cannot answer: acting on the VM
 
 Most tools read. A few act on the VM — `run_in_guest`, the two reboots, and the
@@ -143,6 +158,9 @@ reboot loop is still named), unclean shutdowns, **service/driver start timeouts
 (which is what "the kernel timed out" usually is on Windows)**, the slow-boot
 components, and the crash dumps / Startup-Repair / update logs. The bugcheck code
 is decoded to the layer it points at. Read `core/windows-boot.md` for the flow.
+For a Linux guest, **`investigate_linux_boot`** is the same move — dmesg,
+`systemd-analyze blame`/`critical-chain`, and `journalctl -b`, after the same
+reboot-if-off step.
 
 **Is the serial console even available?** When serial-console evidence is
 missing, do not just move on — run **`check_ems`** to say *why* it is missing and
@@ -168,6 +186,10 @@ them into the verdict in plain words:
 - **No guest credentials, or Tools down** → nothing inside the guest can be
   read (the Windows event log, the BCD, dmesg); ask for `VSPHERE_GUEST_*` or a
   reboot to bring Tools back.
+- **PowerFlex not configured** → a PowerFlex-backed datastore can read as slow
+  in vSphere while the real cause (a rebuild after a failed drive/node) is only
+  visible in the backend; `check_datastores` names this gap. Ask for
+  `VSPHERE_POWERFLEX_*`, then read `powerflex_health`.
 
 The honest sentence is: *there is something better I could use, but it has not
 been given to me — here is what, and here is how.*

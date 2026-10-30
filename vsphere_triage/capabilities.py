@@ -31,6 +31,7 @@ if TYPE_CHECKING:
 VROPS = "vrops_history"
 SERIAL_CONSOLE = "serial_console"
 GUEST_ACCESS = "guest_access"
+POWERFLEX = "powerflex_backend"
 
 
 def _gap(capability: str, *, impact: str, how_to_enable: str) -> dict[str, Any]:
@@ -58,6 +59,28 @@ def vrops_gap(settings: Settings) -> dict[str, Any] | None:
         how_to_enable=(
             "configure VSPHERE_VROPS_URL, VSPHERE_VROPS_USERNAME and VSPHERE_VROPS_PASSWORD "
             "(Aria / VCF Operations); the 5 vrops_* history tools then appear"
+        ),
+    )
+
+
+def powerflex_gap(settings: Settings) -> dict[str, Any] | None:
+    """The backend-storage gap when PowerFlex is not configured — None when it is.
+
+    Named in storage contexts: a datastore can read as slow in vSphere while the
+    real cause (a rebuild after a failed drive/node) is only visible in PowerFlex.
+    """
+    if settings.powerflex_url:
+        return None
+    return _gap(
+        POWERFLEX,
+        impact=(
+            "a PowerFlex-backed datastore can read as slow in vSphere while the real cause is in the "
+            "backend — an SDS/device failure driving a rebuild or rebalance that saturates the storage "
+            "network. Without the PowerFlex backend, that cause cannot be confirmed, only suspected"
+        ),
+        how_to_enable=(
+            "configure VSPHERE_POWERFLEX_URL (the Gateway/Manager), VSPHERE_POWERFLEX_USERNAME and "
+            "VSPHERE_POWERFLEX_PASSWORD; the powerflex_* tools then appear"
         ),
     )
 

@@ -34,14 +34,18 @@ from starlette.responses import JSONResponse
 from vsphere_triage import (
     ages,
     capabilities,
+    clusterevents,
     connhistory,
     emscheck,
     guestexec,
     hardware,
+    linuxboot,
     power,
+    powerflex,
     resources,
     snapshots,
     storagehealth,
+    taskhistory,
     timecheck,
     winboot,
 )
@@ -63,6 +67,7 @@ from vsphere_triage.diagnose import (
 )
 from vsphere_triage.formatting import bounded
 from vsphere_triage.inventory import find_environment as environment_folders
+from vsphere_triage.powerflex import PowerFlexError
 from vsphere_triage.readonly import ReadOnlyViolationError
 from vsphere_triage.vcenter import VCenterPool, VSphereError
 from vsphere_triage.vmlog import grep, parse_lines
@@ -82,6 +87,7 @@ ANTICIPATED = (
     re.error,
     VSphereError,
     VropsError,
+    PowerFlexError,
     ReadOnlyViolationError,
     vmodl.MethodFault,
     httpx.HTTPError,
@@ -177,6 +183,7 @@ def build_server(settings: Settings | None = None, pool: VCenterPool | None = No
     fleet = pool or VCenterPool(resolved)
     scans = scanning.ScanStore(resolved.max_scans_kept)
     vrops = Vrops(resolved) if resolved.vrops_url else None
+    powerflex_client = powerflex.PowerFlex(resolved) if resolved.powerflex_url else None
 
     @asynccontextmanager
     async def lifespan(_server: MCPServer) -> AsyncGenerator[dict[str, Any]]:
@@ -186,6 +193,8 @@ def build_server(settings: Settings | None = None, pool: VCenterPool | None = No
             fleet.close()
             if vrops is not None:
                 await vrops.aclose()
+            if powerflex_client is not None:
+                await powerflex_client.aclose()
 
     server = MCPServer(
         name="vsphere-triage",
@@ -207,6 +216,8 @@ def build_server(settings: Settings | None = None, pool: VCenterPool | None = No
     _register_infrastructure_tools(tool, fleet, resolved)
     if vrops is not None:
         _register_vrops_tools(tool, vrops)
+    if powerflex_client is not None:
+        _register_powerflex_tools(tool, powerflex_client)
     server.vcenters = fleet  # type: ignore[attr-defined]  # ty: ignore[unresolved-attribute] - attached for the tests to read methods_seen
     return server
 
@@ -367,6 +378,87 @@ def _register_fleet_tools(  # noqa: C901, PLR0915 - one closure per tool
         result = await fleet.run(name, run)
         gap = capabilities.vrops_gap(resolved)
         return result | {"evidence_gaps": [gap] if gap else []}
+
+    @tool()
+    async def cluster_events(*, vcenters: list[str] | None = None, minutes: int = 120) -> dict[str, Any]:
+        """Cluster-level events over a window: HA restarts, host failures, DRS migrations.
+
+        When many VMs reboot or go unreachable together, the cause is usually
+        above them — a vSphere HA restart after a host failed or was isolated, a
+        host dropping out of vCenter, or a DRS migration wave. This reads those
+        events (not per-VM) and names the shape, so a mass incident is explained
+        once rather than diagnosed VM by VM. Run it early when the symptom spans
+        a cluster.
+
+        Args:
+            vcenters: vCenter names; all when empty.
+            minutes: how far back to read (default 120).
+
+        """
+        names = _names(fleet, vcenters)
+
+        def run(session: VCenterSession) -> dict[str, Any]:
+            now = session.now()
+            events = session.events(begin=now - timedelta(minutes=minutes), end=now)
+            rows = [
+                {
+                    "type": type(event).__name__,
+                    "time": getattr(event, "createdTime", None),
+                    "message": getattr(event, "fullFormattedMessage", "") or "",
+                    "host": getattr(getattr(event, "host", None), "name", None),
+                    "vm": getattr(getattr(event, "vm", None), "name", None),
+                }
+                for event in events
+            ]
+            return {"vcenter": session.vcenter.name} | clusterevents.summarize_cluster_events(
+                rows, now=now, window_minutes=minutes
+            )
+
+        results = await asyncio.gather(*(fleet.run(name, run) for name in names), return_exceptions=True)
+        rows = [
+            result if not isinstance(result, BaseException) else {"error": str(result)} for result in results
+        ]
+        return {"vcenters": rows}
+
+    @tool()
+    async def recent_tasks(*, vcenter: str, minutes: int = 120) -> dict[str, Any]:
+        """What was *done* on a vCenter in a window: migrations, reconfigures, snapshots, failures.
+
+        Events say what happened; tasks say what someone or an automation did. A
+        storage-vMotion sweep onto one datastore, a mass reconfigure, a snapshot
+        consolidation — each can stall the VMs caught in it and shows in no single
+        VM's counters. This groups the task stream and flags waves and failures.
+
+        Args:
+            vcenter: the vCenter to read.
+            minutes: how far back to read (default 120).
+
+        """
+        name = fleet.resolve(vcenter)
+
+        def run(session: VCenterSession) -> dict[str, Any]:
+            now = session.now()
+            events = session.events(begin=now - timedelta(minutes=minutes), end=now, types=("TaskEvent",))
+            rows = []
+            for event in events:
+                info = getattr(event, "info", None)
+                if info is None:
+                    continue
+                reason = getattr(info, "reason", None)
+                rows.append(
+                    {
+                        "operation": getattr(info, "descriptionId", None) or getattr(info, "name", "") or "",
+                        "target": getattr(info, "entityName", None),
+                        "state": str(getattr(info, "state", "")),
+                        "time": getattr(event, "createdTime", None),
+                        "user": getattr(reason, "userName", None) or getattr(event, "userName", None),
+                    }
+                )
+            return {"vcenter": session.vcenter.name} | taskhistory.summarize_tasks(
+                rows, now=now, window_minutes=minutes
+            )
+
+        return await fleet.run(name, run)
 
     @tool()
     async def vcenter_sessions(*, vcenter: str) -> dict[str, Any]:
@@ -671,9 +763,13 @@ def _register_fleet_tools(  # noqa: C901, PLR0915 - one closure per tool
 
         """
         names = _names(fleet, vcenters)
-        return await storagehealth.check_datastores(
+        result = await storagehealth.check_datastores(
             fleet, resolved, names, only_problems=only_problems, limit=max(1, min(limit, MAX_LIMIT))
         )
+        # PowerFlex is the backend behind these datastores; name it as the source
+        # that would say whether a rebuild is the cause, when it is not configured.
+        gap = capabilities.powerflex_gap(resolved)
+        return result | {"evidence_gaps": [gap] if gap else []}
 
     @tool()
     async def diagnose_window(
@@ -1025,6 +1121,51 @@ def _register_machine_tools(  # noqa: C901 - one closure per tool
         """
         name = fleet.resolve(vcenter)
         return await winboot.investigate_windows_boot(
+            fleet,
+            resolved,
+            name,
+            moref=moref,
+            env_id=env_id,
+            vm_name=vm_name,
+            username=username,
+            password=password,
+        )
+
+    @tool("investigate_linux_boot", annotations=NOT_READ_ONLY)
+    async def investigate_linux_boot_tool(
+        *,
+        vcenter: str,
+        moref: str | None = None,
+        env_id: str | None = None,
+        vm_name: str | None = None,
+        username: str | None = None,
+        password: str | None = None,
+    ) -> dict[str, Any]:
+        """Build the picture of a Linux boot from the guest's own kernel and systemd logs.
+
+        The Linux counterpart of investigate_windows_boot. Reads, in one pass
+        through the guest (VMware Tools + credentials needed): dmesg (panics,
+        soft-lockups, hung tasks, device I/O timeouts, filesystem errors, a drop
+        to the emergency shell), systemd-analyze blame / critical-chain (what
+        made the boot slow), and journalctl -b warnings. Kernel findings are
+        mapped to the layer they point at. dmesg/journal may be root-only, so a
+        non-privileged run can come back thin; that is reported.
+
+        If the VM is powered off, reboot it first (reboot_guest, else
+        hard_reset) and let it come up. Queries are read-only, run as a guest
+        command, so it is marked not-read-only.
+
+        Args:
+            vcenter: the VM's vCenter.
+            moref: the VM's moref, or give env_id and vm_name.
+            env_id: the environment id, with vm_name.
+            vm_name: the machine's name inside its environment.
+            username: guest-OS account; the configured default when omitted.
+            password: that account's password; the configured default when omitted.
+
+        """
+        name = fleet.resolve(vcenter)
+        return await linuxboot.investigate_linux_boot(
             fleet,
             resolved,
             name,
@@ -1527,6 +1668,64 @@ def _register_vrops_tools(tool: Callable[..., Any], vrops: Vrops) -> None:
         since = datetime.now(UTC) - timedelta(hours=max(0.1, hours))
         alerts = await vrops.alerts(resource_id, since)
         return {"count": len(alerts), "alerts": alerts[:100]}
+
+
+def _register_powerflex_tools(tool: Callable[..., Any], client: powerflex.PowerFlex) -> None:
+    """The PowerFlex backend tools, registered only when PowerFlex is configured."""
+
+    @tool("powerflex_health")
+    async def powerflex_health() -> dict[str, Any]:
+        """PowerFlex backend health: SDS/device state and any rebuild/rebalance in progress.
+
+        The backend behind your datastores. A rebuild after a failed drive or
+        node (SDS) is the usual reason a PowerFlex-backed datastore goes slow and
+        VMs on it stall — and it is invisible from vSphere, which only sees the
+        latency. Run this when the datastore detector shows latency with no
+        vSphere-side cause.
+        """
+        sds = await client.sds()
+        devices = await client.devices()
+        systems = await client.systems()
+        stats: dict[str, Any] = {}
+        for system in systems:
+            identifier = system.get("id")
+            if identifier:
+                merged = await client.system_statistics(identifier)
+                if isinstance(merged, dict):
+                    stats |= merged
+        return {
+            "systems": [{"id": system.get("id"), "name": system.get("name")} for system in systems],
+        } | powerflex.summarize_health(sds, devices, stats)
+
+    @tool("powerflex_find_volume")
+    async def powerflex_find_volume(*, query: str) -> dict[str, Any]:
+        """Find a PowerFlex volume by name, id, or an ESXi device id (naa.*/eui.*).
+
+        Maps a slow datastore to its backend volume: pass the datastore's device
+        id and this decodes the candidate volume id and matches it against the
+        Gateway's volume list (or match by volume name directly).
+
+        Args:
+            query: a volume name, a PowerFlex volume id, or an ESXi naa/eui device id.
+
+        """
+        volumes = await client.volumes()
+        candidate = powerflex.volume_id_from_naa(query) or query.strip().lower()
+        matches = [
+            volume
+            for volume in volumes
+            if candidate in str(volume.get("id", "")).lower()
+            or query.strip().lower() in str(volume.get("name", "")).lower()
+        ]
+        return {
+            "query": query,
+            "decoded_volume_id": powerflex.volume_id_from_naa(query),
+            "matches": [
+                {"id": volume.get("id"), "name": volume.get("name"), "size_kb": volume.get("sizeInKb")}
+                for volume in matches[:20]
+            ],
+            "match_count": len(matches),
+        }
 
 
 def _pick[T](items: Any, wanted: str, keys: Callable[[T], tuple[str, str]]) -> T:

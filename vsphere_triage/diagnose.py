@@ -757,7 +757,7 @@ def next_checks(conclusion: dict[str, Any], vm: VmFacts) -> list[str]:
         steps.append(f"get_host_health on {vm.host!r}: is the host itself out of memory?")
     if leading & {STORAGE, BOOT_STORM}:
         steps.append("get_datastore_health on the VM's datastores over a wider window")
-        steps.append("PowerFlex (if available): the pool behind the datastore, its IOPS and any rebuild")
+        steps.append("powerflex_health (if configured): is a rebuild/rebalance running on the backend?")
     if leading & {EARLY_HANG, CANNOT_BOOT, VM_FAULT}:
         steps.append("does the same base disk boot fine on another host or datastore right now?")
     if leading & {WINDOWS_CRASH, KERNEL_ERROR}:

@@ -133,6 +133,7 @@ Configure it entirely through `VSPHERE_`-prefixed environment variables — only
 | `VSPHERE_GUEST_EXEC_TIMEOUT_SECONDS` | `30` | how long `run_in_guest` waits for a command to finish |
 | `VSPHERE_GUEST_EXEC_MAX_OUTPUT_BYTES` | 1 MiB | most command output `run_in_guest` returns |
 | `VSPHERE_VROPS_URL`, `VSPHERE_VROPS_USERNAME`, `VSPHERE_VROPS_PASSWORD`, `VSPHERE_VROPS_AUTH_SOURCE` | none | **optional** vROps (Aria / VCF Operations); its 5 history tools appear only when the URL is set |
+| `VSPHERE_POWERFLEX_URL`, `VSPHERE_POWERFLEX_USERNAME`, `VSPHERE_POWERFLEX_PASSWORD` | none | **optional** Dell PowerFlex (ScaleIO / VxFlex) Gateway; its backend-health tools appear only when the URL is set |
 
 An MCP client config, over stdio:
 
@@ -194,6 +195,8 @@ internal index.
 | `check_vcenters` | reachability, login time and open-session count per vCenter, for when the vCenter API itself is failing (SSL EOF, resets) — the sign of connection/session exhaustion |
 | `vcenter_sessions` | a vCenter's open sessions grouped by user, source IP and client, with idle counts and the oldest — finds the client leaking sessions behind the exhaustion |
 | `vcenter_history` | a vCenter's session/login events over a past window (login surge, failed logins, one source churning) — for an SSL EOF or exhaustion that has since cleared, which the live `check_vcenters` cannot see |
+| `cluster_events` | cluster-level events over a window: vSphere HA restarts, host isolation/failure/connection-lost, DRS migration waves — names a mass-reboot cause above the VMs instead of inferring it |
+| `recent_tasks` | what was *done* on a vCenter in a window (migrations, reconfigures, snapshots, failures), grouped and wave-flagged — the "someone did X" cause that shows in no single VM |
 | `scan` | abnormal VMs on some or all vCenters, grouped by what they share; hosts over the CPU threshold and slow storage right now |
 | `explain_group` | what a scan group's abnormal VMs share that the healthy ones beside them do not; CPU and storage over its boot window |
 | `find_old_environments` | environments older than N hours (the age of their oldest VM), optionally only under `projects`, `environments`, `projects/team-x` or any other path segments, oldest first, with their VMs' states |
@@ -206,6 +209,9 @@ internal index.
 | `hard_reset` | **not read-only, destructive** — power-cycles the VM (`ResetVM_Task`, no Tools needed) to reboot a fully hung VM; the guest is not asked, so in-flight writes and in-guest evidence can be lost |
 | `check_ems` | **not read-only** (reads the BCD in-guest) — whether the serial console (EMS on Windows) can carry the guest's boot words: serial-port hardware, output seen, and the `bcdedit` EMS state; says why it is unavailable and how to enable it |
 | `investigate_windows_boot` | **not read-only** (reads the guest) — the Windows boot picture from the guest's own event log: last bugcheck (WER 1001, decoded), unclean shutdowns, service/driver timeouts, slow-boot components, crash dumps and repair/update logs |
+| `investigate_linux_boot` | **not read-only** (reads the guest) — the Linux boot picture: dmesg (panics, soft-lockups, hung tasks, device timeouts, filesystem errors), systemd-analyze blame/critical-chain, journalctl -b, mapped to the layer each points at |
+| `powerflex_health` | **optional** (PowerFlex configured) — Dell PowerFlex backend health: SDS/device state and any rebuild/rebalance in progress, the usual cause of a PowerFlex-backed datastore going slow |
+| `powerflex_find_volume` | **optional** — map a slow datastore to its PowerFlex volume by name, id, or ESXi device id (naa/eui) |
 | `get_boot_timeline` | how far the last boot got, from `vmware.log`, plus the serial console |
 | `read_vm_log` | `vmware.log` / `vmware-N.log` lines, filtered on the server |
 | `read_serial_console` | Windows EMS or a Linux kernel console, when the VM has a serial port to a file; stop codes with the layer each points at |

@@ -463,6 +463,7 @@ def test_every_call_the_tools_made_is_on_the_read_list(
         # on the guarded surface, which is what this sweep checks.
         "check_ems",
         "investigate_windows_boot",
+        "investigate_linux_boot",
     ):
         call(server, tool, {"vcenter": "vc-a", "moref": moref})
     call(server, "get_host_health", {"vcenter": "vc-a", "host": "DC0_C0_H0"})
@@ -476,6 +477,8 @@ def test_every_call_the_tools_made_is_on_the_read_list(
     call(server, "check_datastores", {"vcenters": ["vc-a"]})
     call(server, "check_vcenters")
     call(server, "vcenter_history", {"vcenter": "vc-a", "minutes": 60})
+    call(server, "cluster_events", {"vcenters": ["vc-a"], "minutes": 60})
+    call(server, "recent_tasks", {"vcenter": "vc-a", "minutes": 60})
     call(server, "vcenter_sessions", {"vcenter": "vc-a"})
 
     seen = server.vcenters.methods_seen()

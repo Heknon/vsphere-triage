@@ -54,6 +54,25 @@
       "sensitive": true,
       "default": ""
     },
+    "powerflex_url": {
+      "type": "string",
+      "title": "PowerFlex Gateway URL (optional)",
+      "description": "VSPHERE_POWERFLEX_URL: Dell PowerFlex (ScaleIO / VxFlex) Gateway base URL; leave blank to disable the backend-health tools",
+      "default": ""
+    },
+    "powerflex_username": {
+      "type": "string",
+      "title": "PowerFlex username (optional)",
+      "description": "VSPHERE_POWERFLEX_USERNAME: required only if the PowerFlex URL is set",
+      "default": ""
+    },
+    "powerflex_password": {
+      "type": "string",
+      "title": "PowerFlex password (optional)",
+      "description": "Stored in the OS secure credential store",
+      "sensitive": true,
+      "default": ""
+    },
     "guest_username": {
       "type": "string",
       "title": "Guest-OS username (optional)",
@@ -88,6 +107,9 @@
         "VSPHERE_VROPS_URL": "${user_config.vrops_url}",
         "VSPHERE_VROPS_USERNAME": "${user_config.vrops_username}",
         "VSPHERE_VROPS_PASSWORD": "${user_config.vrops_password}",
+        "VSPHERE_POWERFLEX_URL": "${user_config.powerflex_url}",
+        "VSPHERE_POWERFLEX_USERNAME": "${user_config.powerflex_username}",
+        "VSPHERE_POWERFLEX_PASSWORD": "${user_config.powerflex_password}",
         "VSPHERE_GUEST_USERNAME": "${user_config.guest_username}",
         "VSPHERE_GUEST_PASSWORD": "${user_config.guest_password}"
       }

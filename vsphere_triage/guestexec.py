@@ -63,6 +63,18 @@ def encode_powershell(script: str) -> str:
     return f"powershell -NoProfile -NonInteractive -EncodedCommand {encoded}"
 
 
+def encode_shell(script: str) -> str:
+    """A shell-safe command that runs a multi-line `script` under /bin/sh.
+
+    The script is base64-encoded and piped through `base64 -d | sh`, so the whole
+    thing — pipes, quotes, greps — travels as one token with nothing for the
+    guest's shell wrapper to mis-parse, the Linux counterpart of
+    `encode_powershell`.
+    """
+    encoded = base64.b64encode(script.encode()).decode("ascii")
+    return f"echo {encoded}|base64 -d|sh"
+
+
 def rewrite_transfer_url(url: str, host: str) -> str:
     """Resolve the guest file-transfer URL, whose host vCenter returns as `*` ('where you connected')."""
     return url.replace("://*", f"://{host}", 1) if "://*" in url else url
