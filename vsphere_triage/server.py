@@ -31,7 +31,7 @@ from PIL import Image
 from pyVmomi import vim, vmodl
 from starlette.responses import JSONResponse
 
-from vsphere_triage import ages, guestexec, hardware, resources, snapshots, storagehealth, timecheck
+from vsphere_triage import ages, guestexec, hardware, power, resources, snapshots, storagehealth, timecheck
 from vsphere_triage import scan as scanning
 from vsphere_triage.checks import classify, count_states
 from vsphere_triage.config import Settings
@@ -77,8 +77,9 @@ ANTICIPATED = (
 )
 
 READ_ONLY = ToolAnnotations(readOnlyHint=True, destructiveHint=False, idempotentHint=True, openWorldHint=True)
-# run_in_guest is the one tool that acts on a VM; it is not read-only and says so.
-GUEST_EXEC = ToolAnnotations(
+# The tools that act on a VM rather than only reading it — guest exec and the
+# two power operations. They are not read-only, and say so to a client.
+NOT_READ_ONLY = ToolAnnotations(
     readOnlyHint=False, destructiveHint=True, idempotentHint=False, openWorldHint=True
 )
 MAX_LIMIT = 500
@@ -89,10 +90,11 @@ that are stuck — on first boot, after a reboot, or hung at any point — slow 
 come up, losing VMware Tools, blocked on a question, starved, or wedged by a
 virtual device; and for when the vCenter API itself is the problem (SSL EOF
 errors, resets, timeouts, often connection or session exhaustion). Every tool
-reads only, with one deliberate exception: run_in_guest executes a command
-inside a guest OS (it needs VMware Tools running and guest credentials) for a
-diagnostic a read cannot answer. It is marked not-read-only; nothing else can
-change a VM.
+reads only, with three deliberate exceptions that act on a VM: run_in_guest
+executes a command inside a guest OS (needs VMware Tools and guest credentials)
+for a diagnostic a read cannot answer, and reboot_guest / hard_reset reboot a
+wedged VM so it writes a fresh boot log. They are marked not-read-only; prefer a
+graceful reboot_guest over a destructive hard_reset, and nothing else changes a VM.
 
 When the symptom is SSL EOF / reset / timeout against a vCenter that many
 clients hit (this server included), start with check_vcenters: a high session
@@ -131,6 +133,11 @@ Reading the answers:
   carry the guest's words when present; their absence is normal.
 - Every result says what it could not read. Missing data is not evidence that
   nothing happened.
+- A wedged VM may have to be rebooted before it writes a fresh boot log, serial
+  console and (on Windows) its next-boot bugcheck. Try reboot_guest first
+  (graceful, needs Tools); fall back to hard_reset (destructive, no Tools) only
+  when Tools is down or the graceful reboot never came back. Then re-read
+  get_boot_timeline and read_serial_console.
 """
 
 
@@ -200,8 +207,8 @@ def _registrar(server: MCPServer, resolved: Settings) -> Callable[[str | None], 
     ) -> Callable[[Callable[..., Awaitable[dict[str, Any]]]], Any]:
         """Register a tool: admitted, bounded, a lookup miss answered rather than raised.
 
-        Read-only by default; `annotations=GUEST_EXEC` marks the one tool that acts
-        on a VM, so a client sees it is not read-only.
+        Read-only by default; `annotations=NOT_READ_ONLY` marks a tool that acts
+        on a VM (guest exec, the power operations), so a client sees it is not read-only.
         """
 
         def register(function: Callable[..., Awaitable[dict[str, Any]]]) -> Any:
@@ -759,7 +766,7 @@ def _register_machine_tools(  # noqa: C901 - one closure per tool
         name = fleet.resolve(vcenter)
         return await fleet.run(name, lambda session: diagnose_environment(session, resolved, env_id=env_id))
 
-    @tool("run_in_guest", annotations=GUEST_EXEC)
+    @tool("run_in_guest", annotations=NOT_READ_ONLY)
     async def run_in_guest_tool(
         *,
         vcenter: str,
@@ -808,6 +815,69 @@ def _register_machine_tools(  # noqa: C901 - one closure per tool
             username=username,
             password=password,
         )
+
+    @tool("reboot_guest", annotations=NOT_READ_ONLY)
+    async def reboot_guest_tool(
+        *,
+        vcenter: str,
+        moref: str | None = None,
+        env_id: str | None = None,
+        vm_name: str | None = None,
+    ) -> dict[str, Any]:
+        """Ask the guest OS to reboot gracefully through VMware Tools. NOT read-only.
+
+        TRY THIS BEFORE hard_reset. It hands the request to VMware Tools, which
+        shuts the OS down cleanly and lets it boot again — no data loss. It needs
+        Tools running and a guest responsive enough to obey, so it will not reboot
+        a fully hung VM; for that, fall back to hard_reset.
+
+        Why reboot at all: a wedged VM often has to be rebooted before it produces
+        a fresh boot log, serial console, and (on Windows) the bugcheck its next
+        boot records. After it comes back, read get_boot_timeline / read_serial_console.
+
+        Find the VM by moref, or by env_id plus vm_name (never by name alone).
+
+        Args:
+            vcenter: the VM's vCenter.
+            moref: the VM's moref, or give env_id and vm_name.
+            env_id: the environment id, with vm_name.
+            vm_name: the machine's name inside its environment.
+
+        """
+        name = fleet.resolve(vcenter)
+        return await power.reboot_guest(fleet, resolved, name, moref=moref, env_id=env_id, vm_name=vm_name)
+
+    @tool("hard_reset", annotations=NOT_READ_ONLY)
+    async def hard_reset_tool(
+        *,
+        vcenter: str,
+        moref: str | None = None,
+        env_id: str | None = None,
+        vm_name: str | None = None,
+    ) -> dict[str, Any]:
+        """Power-cycle the VM immediately, without asking the guest. NOT read-only, and DESTRUCTIVE.
+
+        This is the virtual reset button. The guest is never asked and gets no
+        chance to flush, so IN-FLIGHT WRITES CAN BE LOST and in-guest evidence can
+        be destroyed — an unwritten crash dump, "Working on updates" progress, the
+        current hung state itself. It needs no VMware Tools, so it is the only way
+        to reboot a fully hung VM.
+
+        Use reboot_guest first; reach for this only when Tools is down or a
+        graceful reboot was issued and the VM never came back. After it resets,
+        read get_boot_timeline / read_serial_console for the fresh boot.
+
+        Find the VM by moref, or by env_id plus vm_name (never by name alone).
+
+        Args:
+            vcenter: the VM's vCenter.
+            moref: the VM's moref, or give env_id and vm_name.
+            env_id: the environment id, with vm_name.
+            vm_name: the machine's name inside its environment.
+
+        """
+        name = fleet.resolve(vcenter)
+        return await power.hard_reset(fleet, resolved, name, moref=moref, env_id=env_id, vm_name=vm_name)
 
 
 def _register_piece_tools(  # noqa: C901 - one closure per tool

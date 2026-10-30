@@ -20,10 +20,11 @@ vROps (Aria / VCF Operations) is an **optional** integration: configure
 than vCenter keeps). Everything else — the whole diagnosis — runs on vCenter
 alone, so the server is fully useful with no vROps at all.
 
-It is read-only with one deliberate exception: `run_in_guest` executes a
-command inside a guest OS for a diagnostic a read cannot answer. It is marked
-not-read-only and routed outside the read-only guard on purpose (see below);
-nothing else can change a VM.
+It is read-only with three deliberate exceptions that act on a VM: `run_in_guest`
+executes a command inside a guest OS for a diagnostic a read cannot answer, and
+`reboot_guest` / `hard_reset` reboot a wedged VM so it writes a fresh boot log.
+They are marked not-read-only and routed outside the read-only guard on purpose
+(see below); nothing else can change a VM.
 
 It answers two kinds of question:
 
@@ -35,7 +36,7 @@ It answers two kinds of question:
   linked-clone base disk, environment, ...) against their population, and
   `explain_group` says why a group is abnormal.
 
-## Read-only, by construction (with one marked exception)
+## Read-only, by construction (with marked exceptions)
 
 The accounts it may run with can write, so the guarantee is in the code, not
 the account:
@@ -54,16 +55,25 @@ the account:
   reset, answer, reconfigure, destroy and screenshot-to-datastore through a
   live session and expects each to be refused.
 
-**The one exception is `run_in_guest`**, enabled deliberately: it runs a
-command inside a guest OS through VMware Tools, so it cannot be read-only. It
-does **not** go through `ReadOnlyStub` — it uses the session's raw stub on
-purpose (`VCenterSession.run_in_guest`) and is the only path that can change a
-VM. It needs VMware Tools running in the guest and guest-OS credentials (per
-call, or `VSPHERE_GUEST_USERNAME` / `VSPHERE_GUEST_PASSWORD`), captures output
-via a temp file in the guest that it downloads and deletes, and a test proves
-that invoking it never adds a method to the read-only (guarded) surface.
-Everything else is read-only: nothing is created, changed, answered, powered or
-deleted, and the server runs nothing in the background.
+**The exceptions are the three tools that act on a VM**, enabled deliberately
+and all routed outside the guard on the session's raw stub, never through
+`ReadOnlyStub`; a test proves that invoking each one never adds a method to the
+read-only (guarded) surface:
+
+- **`run_in_guest`** runs a command inside a guest OS through VMware Tools, for a
+  diagnostic a read cannot answer. It needs Tools running and guest-OS
+  credentials (per call, or `VSPHERE_GUEST_USERNAME` / `VSPHERE_GUEST_PASSWORD`),
+  and captures output via a temp file in the guest that it downloads and deletes.
+- **`reboot_guest`** asks the guest to reboot gracefully through Tools — no data
+  loss, but needs Tools and a responsive guest. Try it first.
+- **`hard_reset`** power-cycles the VM (`ResetVM_Task`) with no Tools, so it can
+  reboot a fully hung VM — but it is destructive: the guest is never asked, so
+  in-flight writes and in-guest evidence (an unwritten crash dump, update
+  progress) can be lost. Both exist because a wedged VM often has to be rebooted
+  before it writes a fresh boot log; prefer the graceful one.
+
+Everything else is read-only: nothing is created, changed, answered or deleted,
+and the server runs nothing in the background.
 
 ## Concepts, not constants
 
@@ -189,6 +199,8 @@ internal index.
 | `diagnose_vm` | one VM: machine, CPU, storage, environment, boot timeline, serial console (EMS), console; the likely cause with evidence for and against |
 | `diagnose_environment` | every VM of an environment, grouped, with CPU and storage |
 | `run_in_guest` | **not read-only** — runs a command inside a guest OS (needs VMware Tools and guest credentials) and returns its output and exit code, for a diagnostic a read cannot answer |
+| `reboot_guest` | **not read-only** — asks the guest to reboot gracefully through VMware Tools (no data loss, needs Tools); try this before `hard_reset` to make a wedged VM write a fresh boot log |
+| `hard_reset` | **not read-only, destructive** — power-cycles the VM (`ResetVM_Task`, no Tools needed) to reboot a fully hung VM; the guest is not asked, so in-flight writes and in-guest evidence can be lost |
 | `get_boot_timeline` | how far the last boot got, from `vmware.log`, plus the serial console |
 | `read_vm_log` | `vmware.log` / `vmware-N.log` lines, filtered on the server |
 | `read_serial_console` | Windows EMS or a Linux kernel console, when the VM has a serial port to a file; stop codes with the layer each points at |

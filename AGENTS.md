@@ -55,9 +55,11 @@ version PyPI will not let you reclaim.
 
 ## The read-only guarantee
 
-Every tool reads only, with one marked exception (`run_in_guest`). A test sweeps
-every read-only tool and asserts the vSphere methods sent are a subset of
-`readonly.ALLOWED_METHODS`; another asserts guest exec never dirties that
-surface. If you add a tool or a vSphere call, keep both tests passing — do not
-add a method to the allowlist to silence the sweep without understanding why it
-is being sent.
+Every tool reads only, with three marked exceptions that act on a VM through the
+session's raw (unguarded) stub: `run_in_guest`, `reboot_guest` and `hard_reset`.
+A test sweeps every read-only tool and asserts the vSphere methods sent are a
+subset of `readonly.ALLOWED_METHODS`; others assert that guest exec and the two
+power operations never dirty that guarded surface. If you add a tool or a vSphere
+call, keep those tests passing — do not add a method to the allowlist to silence
+the sweep without understanding why it is being sent, and route any new
+non-read-only operation through the raw stub, never by widening the allowlist.

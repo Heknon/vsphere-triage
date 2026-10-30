@@ -524,6 +524,37 @@ def test_guest_exec_never_dirties_the_read_only_surface(
         built.vcenters.close()
 
 
+def test_reboot_guest_refuses_a_guest_without_tools(
+    server: MCPServer, worlds: tuple[scenario.World, ...]
+) -> None:
+    # web-01 is powered on but Tools is not running: a graceful reboot is impossible,
+    # and it is refused in words before any power method is sent.
+    moref = worlds[0].moref("environments/env-1001", "web-01")
+
+    result = call(server, "reboot_guest", {"vcenter": "vc-a", "moref": moref})
+
+    assert result["rebooted"] is False
+    assert "Tools is not running" in result["reason"]
+
+
+def test_power_tools_never_dirty_the_read_only_surface(
+    settings: Settings, worlds: tuple[scenario.World, ...], plan: object
+) -> None:
+    # Both power operations go through the raw stub, like guest exec, so whatever
+    # the simulator does with them the guarded (read-only) surface stays untouched.
+    _ = plan
+    built = build_server(settings)
+    try:
+        moref = worlds[0].moref("environments/env-1003", "ok-01")
+        for tool in ("reboot_guest", "hard_reset"):
+            with contextlib.suppress(ToolError):
+                asyncio.run(built.call_tool(tool, {"vcenter": "vc-a", "moref": moref}))
+        seen = built.vcenters.methods_seen()
+        assert seen <= ALLOWED_METHODS, seen - ALLOWED_METHODS
+    finally:
+        built.vcenters.close()
+
+
 def test_a_write_cannot_be_sent_even_from_inside(
     server: MCPServer, worlds: tuple[scenario.World, ...]
 ) -> None:

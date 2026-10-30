@@ -1,6 +1,6 @@
 ---
 name: vm-incident
-description: Diagnose why a test environment's machines are stuck or unreachable across a vSphere fleet, from the symptom to a named cause, with the evidence for and against. Use when your monitoring or orchestrator reports VMware Tools errors, a machine is stuck on boot or after a reboot, hung mid-run, slow to come up, an environment will not come up, a test hangs waiting for its environment, a machine is blocked on a VM question or wedged by a virtual device (a disconnected adapter, a stuck ISO), or someone asks to find stuck, hung or leftover VMs across the vCenters and understand why. Also when the vCenter API itself is failing - SSL EOF errors, connection resets or timeouts, often connection or session exhaustion. Covers the recurring causes - ESXi CPU overcommit and storage-array saturation - and tells a VM that is booting slowly from one that is hung. It reads; it changes nothing. Written so the answer comes from a ladder and a cause table, not from judgment.
+description: Diagnose why a test environment's machines are stuck or unreachable across a vSphere fleet, from the symptom to a named cause, with the evidence for and against. Use when your monitoring or orchestrator reports VMware Tools errors, a machine is stuck on boot or after a reboot, hung mid-run, slow to come up, an environment will not come up, a test hangs waiting for its environment, a machine is blocked on a VM question or wedged by a virtual device (a disconnected adapter, a stuck ISO), or someone asks to find stuck, hung or leftover VMs across the vCenters and understand why. Also when the vCenter API itself is failing - SSL EOF errors, connection resets or timeouts, often connection or session exhaustion. Covers the recurring causes - ESXi CPU overcommit and storage-array saturation - and tells a VM that is booting slowly from one that is hung. It reads, with three deliberate exceptions it names - running a diagnostic command in the guest, and rebooting a wedged VM (gracefully, or a destructive hard reset) to regenerate its boot logs. Written so the answer comes from a ladder and a cause table, not from judgment.
 ---
 
 # VM incident
@@ -89,17 +89,37 @@ its clock skew from vCenter, and names the hosts that have drifted.
 
 ## When a read cannot answer: run_in_guest
 
-Every tool above reads. One does not: **`run_in_guest`** executes a command
-inside the guest OS through VMware Tools. Reach for it only when the read-only
-evidence leaves a real gap a command would close — "is the guest actually
-responsive, or just painting a static console?", reading a file or a service
-state from inside the guest — and the guest has Tools running (without Tools
-there is no guest-ops channel; fall back to the console, serial and boot log).
-It needs guest credentials, it is the one tool that acts on the VM rather than
-observing it, and it runs exactly the command given — so prefer a read first,
-keep the command a diagnostic (not a change), and record what you ran in the
-verdict. It is not a substitute for the shared-cause checks: a responsive guest
-on a starved host is still starved.
+Most tools read. Three do not, and they act on the VM — use them only when the
+read-only evidence leaves a real gap, and record what you did in the verdict.
+
+**`run_in_guest`** executes a command inside the guest OS through VMware Tools.
+Reach for it only when a command would close a gap a read cannot — "is the guest
+actually responsive, or just painting a static console?", reading a file or a
+service state from inside — and the guest has Tools running (without Tools there
+is no guest-ops channel; fall back to the console, serial and boot log). It
+needs guest credentials and runs exactly the command given, so prefer a read
+first and keep the command a diagnostic, not a change. It is not a substitute
+for the shared-cause checks: a responsive guest on a starved host is still starved.
+
+**Rebooting to regenerate logs.** A wedged VM often has to be rebooted before it
+writes a fresh `vmware.log` boot timeline, serial console, and (on Windows) the
+bugcheck its next boot records to the event log. Two tools, **in this order**:
+
+1. **`reboot_guest`** — asks the guest to reboot cleanly through Tools. No data
+   loss, but it needs Tools running and a guest responsive enough to obey. Try
+   this first.
+2. **`hard_reset`** — the virtual reset button; needs no Tools, so it is the only
+   way to reboot a fully hung VM. But it is **destructive**: the guest is never
+   asked, so in-flight writes can be lost and in-guest evidence can be destroyed
+   — an unwritten crash dump, "Working on updates" progress, the hung state
+   itself. Reach for it only when Tools is down or a `reboot_guest` never came
+   back. Before you hard-reset a VM whose live state is itself the evidence
+   (blocked on a question, mid-crash with a dump still writing), capture that
+   evidence first (console, serial, events) — the reset erases it.
+
+After either, re-read `get_boot_timeline` and `read_serial_console` for the
+fresh boot. Rebooting is a diagnostic step, not a fix: if the cause is a starved
+host or a saturated datastore, the VM will wedge again on the way back up.
 
 ## The steps
 
