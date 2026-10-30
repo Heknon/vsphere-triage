@@ -2931,7 +2931,8 @@ def test_a_boot_entry_without_an_ems_line_is_ems_off_not_access_denied() -> None
 
     dump = (
         "Windows Boot Loader\n-------------------\nidentifier              {current}\n"
-        "path                    \\Windows\\system32\\winload.efi\nbootstatuspolicy        IgnoreAllFailures\n"
+        "path                    \\Windows\\system32\\winload.efi\n"
+        "bootstatuspolicy        IgnoreAllFailures\n"
     )
     localized = dump + "ems                     Ja\n"
 
