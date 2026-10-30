@@ -1,0 +1,102 @@
+{
+  "skill_name": "vm-incident",
+  "notes": "Scenarios for checking that a weak model (GLM 5.3 is the target in the user's deployment) using this skill reaches a correct, evidence-backed verdict across the four layers and does not fall into the traps the skill exists to prevent: identifying a VM by name across environments, explaining one VM when a group is stuck, blaming a host or datastore the healthy VMs also sit on, calling a slowly-booting VM hung, counting a no_tools VM as stuck, reading a gap as a clean result, or taking an action. These are table-top evals: the model is given the skill plus a transcript of tool results (the vsphere-mcp results are those the server in servers/vsphere-mcp/ actually returns against the integration scenario, captured on vcsim; the Sahara MCP and Elastic results are fixtures written to match the shapes the real services return), not a live vCenter, because a live nine-vCenter incident cannot be reproduced on demand. Each scenario names the tool-result fixtures it provides and the lines the verdict must and must not contain. Grade by the verdict headings in core/verdict.md. Verified by hand against the skill text on 2026-10-29; not yet run through an automated grader, and not yet validated against a live vCenter (see servers/vsphere-mcp 'To confirm on a real vCenter').",
+  "how_to_run": [
+    "copy the skill folder without evals/ to <skill>",
+    "give the model the fixtures under evals/fixtures/<scenario>/ as the results of the tool calls it makes, in the order the ladder calls them",
+    "start the model with: 'Load the skill at <skill>/SKILL.md and follow it. Task: <prompt>'",
+    "grade each expectation against the verdict the model writes"
+  ],
+  "fixtures_status": "fixture files are NOT yet written; the scenarios below specify what each must contain. This is the next build step for whoever runs the evals.",
+  "scenarios": [
+    {
+      "id": "cpu-overcommit",
+      "prompt": "Sahara reports a VMware Tools error on the reboot step for web-01 in env-8812 on vc-04 at 02:14. Why did it not come back?",
+      "provides": "Sahara summarize_failures (Tools error in 3 envs on vc-04); the error's extra data (vc-04, web-01, env-8812, 02:14:02Z); Elastic (Sims rebooted at 02:13:40, waited 5 min); diagnose_vm (busy_not_up, 4 of 6 env VMs on esx-31/32 at 118% demand, ready 38%, storage normal, 2 healthy on esx-40); vrops_compare_window (118% above every prior night).",
+      "must": [
+        "names the cause as CPU overcommit / starvation, not a fault in web-01",
+        "says explicitly the VM is booting slowly, not hung",
+        "notes the Sims 5-min wait vs the longer boot as why the error is a timeout",
+        "cites the healthy VMs on esx-40 as evidence the host, not the datastore, is the cause",
+        "the action is for a person (host load or the timeout); the model takes none"
+      ],
+      "must_not": [
+        "says web-01 is broken or should be reset",
+        "blames the datastore",
+        "calls it hung"
+      ]
+    },
+    {
+      "id": "storage-boot-storm",
+      "prompt": "We're getting VMware Tools errors across lots of environments on vc-04 since about 02:10. Find what's stuck and why.",
+      "provides": "scan (33 hung; strongest group datastore vc-04:ds-17 1.9x, base_disk 3x; ds-17 latency 180 ms); explain_group on ds-17 (29 rebooted 02:10-02:16, healthy ones rebooted before; device latency >150 ms on 4 hosts, host CPU normal); diagnose_vm on a representative (boot stops after firmware, ds-17 latency 180 ms at 02:13); vrops_compare_window (nightly spike at 02:10).",
+      "must": [
+        "leads with the group (29 of 33 on ds-17), not one VM",
+        "names PowerFlex/storage saturation on the ds-17 pool as the cause",
+        "qualifies it to the 02:10-02:16 window, citing the healthy VMs that rebooted outside it",
+        "names the device-vs-queue split (array side) from the storage check",
+        "records the PowerFlex pool internals as a gap (adapter not configured)"
+      ],
+      "must_not": [
+        "diagnoses each of the 29 VMs separately",
+        "blames CPU",
+        "omits that the healthy VMs on ds-17 argue the datastore is only a cause in the window"
+      ]
+    },
+    {
+      "id": "name-reuse-trap",
+      "prompt": "There's a web-01 that's stuck on vc-04. Diagnose it.",
+      "provides": "find_environment or scan showing TWO powered-on VMs named web-01 on vc-04, in env-8812 and env-9001, different morefs, one healthy and one hung.",
+      "must": [
+        "does not pick one web-01 silently",
+        "reports that the name is ambiguous and asks for the environment id or the moref",
+        "treats identity as vcenter+moref"
+      ],
+      "must_not": [
+        "diagnoses whichever web-01 came back first",
+        "assumes the hung one is the one meant"
+      ]
+    },
+    {
+      "id": "no-tools-not-stuck",
+      "prompt": "scan says notools-01 on vc-04 has been up 25 minutes with Tools not running. Is it stuck?",
+      "provides": "diagnose_vm (state no_tools, guest.toolsStatus toolsNotInstalled, CPU 600 MHz, console shows a login prompt on a real run).",
+      "must": [
+        "says the VM is not necessarily stuck: Tools is not installed, so its absence says nothing",
+        "judges by CPU / console / boot log instead of Tools",
+        "if the console shows a login prompt, concludes it booted"
+      ],
+      "must_not": [
+        "counts it as hung or booted_not_up because Tools is not running"
+      ]
+    },
+    {
+      "id": "destroyed-gap",
+      "prompt": "Last night env-7777 on vc-04 had Tools errors. What happened? (it's 09:00 now; the environment was torn down at 03:00)",
+      "provides": "diagnose_vm returns found:false destroyed; diagnose_window for 02:00-03:00 shows resets on two hosts and a datastore latency spike, but no console or vmware.log.",
+      "must": [
+        "uses diagnose_window since the VMs are gone",
+        "reports the destroyed VMs' console and vmware.log as a gap, not as 'nothing found'",
+        "gives the cause the events and counters do support, at the confidence they allow"
+      ],
+      "must_not": [
+        "reports a clean result because diagnose_vm found nothing",
+        "invents a guest-level cause it cannot have read"
+      ]
+    },
+    {
+      "id": "healthy-neighbour-rules-it-out",
+      "prompt": "db-02 in env-5050 on vc-04 is hung. Is it the datastore ds-9 it's on?",
+      "provides": "diagnose_vm (hung; environment shows 1 of 5 VMs abnormal; the 4 healthy VMs are on ds-9 too; ds-9 latency normal); boot timeline stops after drivers; console frozen and black across two captures.",
+      "must": [
+        "rules out ds-9 because the healthy VMs share it and its latency is normal",
+        "concludes a guest hang in early boot (CPU near zero, console frozen, boot stops after drivers)",
+        "names the next check (same base disk elsewhere / the serial console)"
+      ],
+      "must_not": [
+        "blames ds-9",
+        "ignores that only 1 of 5 VMs is affected"
+      ]
+    }
+  ]
+}

@@ -1,0 +1,234 @@
+name: Release
+
+# Bump the version in pyproject.toml, merge to main, and the release runs
+# itself: a push to main whose version has no vX.Y.Z tag yet builds the sdist +
+# wheel, verifies the wheel installs and imports on Linux, publishes to PyPI,
+# then tags the commit vX.Y.Z and makes the GitHub release. A merge that does
+# not change the version stops at the gate. Tagging by hand still works:
+#
+#     git tag v0.2.0 && git push origin v0.2.0
+#
+# Publishing uses PyPI Trusted Publishing (OIDC) — there is no token in the
+# repo. Configure the publisher once at pypi.org/manage/account/publishing
+# (project: vsphere-triage, workflow: release.yml, environment: pypi), and the
+# same for test.pypi.org if you use the testpypi dispatch.
+#
+# Linux only, on purpose: this is a pure-Python package, so one platform
+# verifies the artifact and keeps the Actions bill small.
+on:
+  push:
+    branches: [main]
+    tags: ["v*"]
+  workflow_dispatch:
+    inputs:
+      repository:
+        description: "Where to publish from the current branch"
+        type: choice
+        options: [testpypi, pypi]
+        default: testpypi
+
+permissions:
+  contents: read
+
+# Two merges in quick succession release one after the other, never at once.
+concurrency:
+  group: release
+  cancel-in-progress: false
+
+jobs:
+  gate:
+    name: Anything to release?
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    outputs:
+      release: ${{ steps.gate.outputs.release }}
+    steps:
+      - uses: actions/checkout@v4
+      - name: Is pyproject.toml's version tagged yet?
+        id: gate
+        shell: bash
+        run: |
+          set -euo pipefail
+          # A tag push or a manual dispatch is a release by definition.
+          if [ "$GITHUB_EVENT_NAME" != push ] || [ "$GITHUB_REF_TYPE" = tag ]; then
+            echo "release=true" >> "$GITHUB_OUTPUT"; exit 0
+          fi
+          version=$(python3 -c "import pathlib,tomllib;print(tomllib.loads(pathlib.Path('pyproject.toml').read_text())['project']['version'])")
+          if git ls-remote --exit-code origin "refs/tags/v$version" >/dev/null; then
+            echo "v$version is already released and this merge does not bump the version: nothing to do."
+            echo "release=false" >> "$GITHUB_OUTPUT"
+          else
+            echo "v$version is not tagged yet: releasing it."
+            echo "release=true" >> "$GITHUB_OUTPUT"
+          fi
+
+  build:
+    name: Build
+    needs: gate
+    if: needs.gate.outputs.release == 'true'
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    outputs:
+      version: ${{ steps.version.outputs.version }}
+      prerelease: ${{ steps.version.outputs.prerelease }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Read the version, and check a tag agrees with it
+        id: version
+        shell: bash
+        run: |
+          set -euo pipefail
+          version=$(python -c "import pathlib,tomllib;print(tomllib.loads(pathlib.Path('pyproject.toml').read_text())['project']['version'])")
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+          # A tag vX.Y.Z that builds a different version uploads the wrong thing
+          # under the right name, and PyPI will not let you take it back.
+          if [ "${GITHUB_REF_TYPE:-}" = "tag" ]; then
+            tagged="${GITHUB_REF_NAME#v}"
+            if [ "$tagged" != "$version" ]; then
+              echo "::error::tag $GITHUB_REF_NAME does not match pyproject version $version"; exit 1
+            fi
+          fi
+          # A tag for this version that already exists must be on this commit —
+          # checked here, before the irreversible publish, not only after it.
+          at=$(git ls-remote origin "refs/tags/v$version" "refs/tags/v$version^{}" | awk 'END {print $1}')
+          if [ -n "$at" ] && [ "$at" != "$GITHUB_SHA" ]; then
+            echo "::error::v$version is already on $at, not the commit this run would publish ($GITHUB_SHA)"; exit 1
+          fi
+          # PEP 440 prereleases: 1.2.0rc1, no separator.
+          if printf '%s' "$version" | grep -Eq '(a|b|rc|dev)[0-9]*$'; then
+            echo "prerelease=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "prerelease=false" >> "$GITHUB_OUTPUT"
+          fi
+      - name: Build the sdist and the wheel
+        run: |
+          python -m pip install --upgrade pip build twine
+          python -m build
+          twine check --strict dist/*
+      - run: ls -l dist/
+      - uses: actions/upload-artifact@v4
+        with:
+          name: distribution
+          path: dist/
+          if-no-files-found: error
+
+  verify:
+    # Verify the built artifact, not the checkout: install the wheel into a
+    # clean venv, import the package, construct the server, and run the console
+    # script — so a packaging mistake (a missing module, a broken entry point)
+    # is caught before publish, not after.
+    name: Verify the wheel
+    needs: build
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - uses: actions/download-artifact@v4
+        with:
+          name: distribution
+          path: dist
+      - name: Install the built wheel and smoke-test it
+        shell: bash
+        run: |
+          set -euo pipefail
+          python -m venv /tmp/venv
+          /tmp/venv/bin/pip install --upgrade pip
+          /tmp/venv/bin/pip install "$(ls dist/*.whl)"
+          /tmp/venv/bin/python - <<'CHECK'
+          import vsphere_triage
+          from vsphere_triage.config import Settings
+          from vsphere_triage.server import build_server
+          located = vsphere_triage.__file__.replace("\\", "/")
+          assert "site-packages" in located, f"tested the checkout, not the wheel: {located}"
+          settings = Settings.from_environment({
+              "VSPHERE_VCENTERS": '[{"name": "vc", "host": "h"}]',
+              "VSPHERE_USERNAME": "u",
+              "VSPHERE_PASSWORD": "p",
+          })
+          build_server(settings)  # the whole tool surface wires up
+          print("imported from:", located)
+          CHECK
+          /tmp/venv/bin/vsphere-triage --help > /dev/null
+          echo "console script runs"
+
+  publish:
+    name: Publish to ${{ (github.event_name == 'push' && 'pypi') || inputs.repository }}
+    needs: [build, verify]
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    # Trusted publishing: PyPI verifies this workflow's OIDC identity, so there
+    # is no long-lived token in the repo. A manual approval gate, if wanted, is
+    # a property of the environment (Settings -> Environments -> pypi ->
+    # Required reviewers), not of this file, so it cannot be removed by editing
+    # a branch.
+    environment:
+      name: ${{ (github.event_name == 'push' && 'pypi') || inputs.repository }}
+      url: ${{ ((github.event_name == 'push' || inputs.repository == 'pypi') && 'https://pypi.org/p/vsphere-triage') || 'https://test.pypi.org/p/vsphere-triage' }}
+    permissions:
+      id-token: write
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          name: distribution
+          path: dist
+      - uses: pypa/gh-action-pypi-publish@release/v1
+        with:
+          repository-url: ${{ ((github.event_name == 'push' || inputs.repository == 'pypi') && 'https://upload.pypi.org/legacy/') || 'https://test.pypi.org/legacy/' }}
+          print-hash: true
+          # So a run that uploaded and then failed later can be re-run: PyPI
+          # never replaces a file it already has, whatever this is set to.
+          skip-existing: true
+
+  release:
+    # Last, and only once PyPI has accepted the upload. The runner's token
+    # writes the tag, so a release need not be tagged up front.
+    name: Tag and release
+    needs: [build, publish]
+    if: github.event_name == 'push' || inputs.repository == 'pypi'
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/download-artifact@v4
+        with:
+          name: distribution
+          path: dist
+      - name: Make sure the published commit is tagged
+        shell: bash
+        run: |
+          set -euo pipefail
+          tag="v${{ needs.build.outputs.version }}"
+          at=$(git ls-remote origin "refs/tags/$tag" "refs/tags/$tag^{}" | awk 'END {print $1}')
+          if [ -n "$at" ]; then
+            if [ "$at" != "$GITHUB_SHA" ]; then
+              echo "::error::$tag is already on $at, not the commit this run published ($GITHUB_SHA)"; exit 1
+            fi
+            echo "$tag already exists here (tag-push path)"
+          else
+            git config user.name "github-actions[bot]"
+            git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+            git tag -a "$tag" -m "vsphere-triage ${{ needs.build.outputs.version }}"
+            git push origin "$tag"
+          fi
+          echo "TAG=$tag" >> "$GITHUB_ENV"
+      - name: Create the GitHub release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          if gh release view "$TAG" >/dev/null 2>&1; then
+            gh release upload "$TAG" dist/* --clobber
+          else
+            gh release create "$TAG" dist/* \
+              --title "$TAG" \
+              --generate-notes \
+              --verify-tag \
+              ${{ needs.build.outputs.prerelease == 'true' && '--prerelease' || '' }}
+          fi

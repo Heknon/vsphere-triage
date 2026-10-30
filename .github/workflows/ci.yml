@@ -1,0 +1,59 @@
+name: CI
+
+# The per-commit gate: lint, format and the unit suite, on Linux only. The
+# vcsim integration suite pulls two Docker images and builds two simulated
+# vCenters, so it is NOT run on every push — dispatch it by hand when you need
+# it (Actions -> CI -> Run workflow -> integration = true), or before a release.
+# release.yml reuses this file via workflow_call.
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_call:
+  workflow_dispatch:
+    inputs:
+      integration:
+        description: "Also run the vcsim integration suite (Docker)"
+        type: boolean
+        default: false
+
+# One cheap runner per ref. Superseded pull-request runs are cancelled; pushes
+# to main are left to finish.
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+permissions:
+  contents: read
+
+jobs:
+  check:
+    name: Lint & unit tests
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+      - uses: astral-sh/setup-uv@v5
+        with:
+          enable-cache: true
+      - name: Lint
+        run: uv run --extra dev ruff check .
+      - name: Format
+        run: uv run --extra dev ruff format --check .
+      - name: Unit tests
+        run: uv run --extra dev python -m pytest -m "not integration" -q
+
+  integration:
+    name: vcsim integration (Docker)
+    # Expensive: pulls vmware/vcsim + vmware/govc and builds two simulated
+    # vCenters. Manual only, so it never runs on an ordinary push.
+    if: ${{ github.event_name == 'workflow_dispatch' && inputs.integration }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+    steps:
+      - uses: actions/checkout@v4
+      - uses: astral-sh/setup-uv@v5
+        with:
+          enable-cache: true
+      - name: Full suite (unit + vcsim integration)
+        run: uv run --extra dev python -m pytest -q
