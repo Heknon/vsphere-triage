@@ -1783,3 +1783,61 @@ def test_affected_vms_says_so_when_nothing_maps() -> None:
     result = powerflex.affected_vms({"vol-x": "pd"}, [], {})
     assert result["affected_datastores"] == []
     assert any("no datastore" in finding for finding in result["findings"])
+
+
+def _powerflex_client(handler: object) -> object:
+    settings = _settings(
+        VSPHERE_POWERFLEX_URL="https://gw",
+        VSPHERE_POWERFLEX_USERNAME="u",
+        VSPHERE_POWERFLEX_PASSWORD="p",
+    )
+    return powerflex.PowerFlex(settings, transport=httpx.MockTransport(handler))
+
+
+def test_powerflex_client_is_get_only_and_reuses_its_token() -> None:
+    logins = {"count": 0}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        assert request.method == "GET"  # the read-only proof: the client never writes
+        path = request.url.path
+        if path == "/api/login":
+            logins["count"] += 1
+            return httpx.Response(200, text='"tok-123"')
+        if path == "/api/logout":
+            return httpx.Response(200, text='""')
+        bodies: dict[str, object] = {
+            "/api/types/Sds/instances": [
+                {"name": "sds-1", "sdsState": "Normal", "mdmConnectionState": "Connected"}
+            ],
+            "/api/types/ProtectionDomain/instances": [{"id": "pd1", "name": "prod"}],
+            "/api/types/StoragePool/instances": [{"id": "sp1", "protectionDomainId": "pd1"}],
+            "/api/types/Volume/instances": [{"id": "VOL1", "name": "ds-a", "storagePoolId": "sp1"}],
+        }
+        if path in bodies:
+            return httpx.Response(200, json=bodies[path])
+        if "Statistics" in path:
+            return httpx.Response(
+                200, json={"userDataReadBwc": {"numOccured": 100, "numSeconds": 10, "totalWeightInKb": 4000}}
+            )
+        return httpx.Response(404, json={})
+
+    client = _powerflex_client(handler)
+
+    async def drive() -> tuple:
+        sds = await client.sds()
+        pds = await client.protection_domains()
+        stats = await client.protection_domain_statistics("pd1")
+        await client.aclose()
+        return sds, pds, stats
+
+    sds, pds, stats = asyncio.run(drive())
+    assert sds[0]["name"] == "sds-1"
+    assert pds[0]["id"] == "pd1"
+    assert powerflex.traffic_of(stats)["read_iops"] == 10.0
+    assert logins["count"] == 1  # token acquired once, then reused across calls
+
+
+def test_powerflex_login_failure_is_reported() -> None:
+    client = _powerflex_client(lambda _request: httpx.Response(401, text="denied"))
+    with pytest.raises(powerflex.PowerFlexError):
+        asyncio.run(client.sds())

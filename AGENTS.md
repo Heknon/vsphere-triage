@@ -62,7 +62,9 @@ session's raw (unguarded) stub: `run_in_guest`, the two power operations
 only when they run a command in the guest). The optional vROps and PowerFlex
 clients are separate GET-only HTTP clients, not vSphere stubs. A test sweeps every read-only tool and asserts the
 vSphere methods sent are a subset of `readonly.ALLOWED_METHODS`; others assert
-that guest exec and the power operations never dirty that guarded surface. If
+that guest exec and the power operations never dirty that guarded surface, and
+that the PowerFlex client issues only GET requests (its own read-only proof,
+via a mock transport). If
 you add a tool or a vSphere call, keep those tests passing — do not add a method
 to the allowlist to silence the sweep without understanding why it is being
 sent, and route any new non-read-only operation through the raw stub, never by
