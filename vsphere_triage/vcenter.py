@@ -25,7 +25,7 @@ from dataclasses import dataclass, field
 from datetime import UTC, datetime, timedelta
 from http.client import HTTPException
 from typing import TYPE_CHECKING, Any, TypeVar
-from urllib.parse import quote
+from urllib.parse import quote, unquote
 
 import httpx
 from pyVim.connect import Disconnect, SmartConnect
@@ -48,10 +48,30 @@ PAGE_SIZE = 500
 QUERY_EVENTS_CAP = 1000
 TASK_POLL_SECONDS = 0.1
 REALTIME_INTERVAL_SECONDS = 20
-HISTORICAL_INTERVAL_SECONDS = 300
 # vCenter keeps 20-second samples for about an hour; older windows come from
 # the first historical rollup, if the statistics level kept the counter at all.
 REALTIME_SPAN = timedelta(minutes=60)
+# vCenter's default historical rollups: (interval, how long it is kept). A window
+# is read from the finest rollup still kept for its age; the 300 s one is gone
+# after a day, though the 1800 s one holds the same window for a week.
+HISTORICAL_ROLLUPS = (
+    (300, timedelta(days=1)),
+    (1800, timedelta(days=7)),
+    (7200, timedelta(days=30)),
+    (86400, timedelta(days=365)),
+)
+
+
+def perf_interval(age: timedelta) -> int:
+    """The QueryPerf intervalId for a window that began `age` ago: realtime, then the rollups."""
+    if age <= REALTIME_SPAN:
+        return REALTIME_INTERVAL_SECONDS
+    for interval, kept in HISTORICAL_ROLLUPS:
+        if age <= kept:
+            return interval
+    return HISTORICAL_ROLLUPS[-1][0]
+
+
 # vCenter refuses a historical query naming more entity-counter pairs than
 # `config.vpxd.stats.maxQueryMetrics` (64 by default); realtime comes from the
 # hosts and has no such limit, but is still sent in batches to bound each reply.
@@ -134,13 +154,13 @@ def _declared_size(response: httpx.Response, *, ranged: bool) -> int | None:
 
 _OWN_ONLY_NOTE = (
     "only this server's own session is visible: either it is the only one open, or (far more "
-    "likely) the account lacks the Sessions.View privilege, which vCenter answers with just the "
+    "likely) the account lacks the Sessions.TerminateSession privilege, which vCenter answers with just the "
     "caller's session rather than an error; grant it to see the global count"
 )
 
 
 def _only_own(sessions: Sequence[Any], manager: Any) -> bool:
-    """Whether the session list is just this server's own session, as a role without Sessions.View sees it."""
+    """Whether the session list holds only this server's session, as an unprivileged account sees it."""
     own = getattr(getattr(manager, "currentSession", None), "key", None)
     return len(sessions) <= 1 and all(getattr(entry, "key", None) == own for entry in sessions)
 
@@ -319,7 +339,10 @@ class VCenterSession:
         except vim.fault.NoPermission:
             return {
                 "visible": "own_only",
-                "note": "the account may not list all sessions; grant Sessions.View to see the global count",
+                "note": (
+                    "the account may not list all sessions; reading SessionManager.sessionList needs "
+                    "Sessions.TerminateSession (vSphere has no separate view privilege for it)"
+                ),
                 "current_user": current,
             }
         if _only_own(sessions, manager):
@@ -360,7 +383,7 @@ class VCenterSession:
             return {
                 "visible": "own_only",
                 "note": (
-                    "this account may not list all sessions; grant the Sessions.View privilege (or a role "
+                    "this account may not list all sessions; grant Sessions.TerminateSession (or a role "
                     "that carries it) to diagnose exhaustion, or read the vCenter's session count from vROps"
                 ),
                 "current_user": getattr(manager.currentSession, "userName", None),
@@ -415,8 +438,10 @@ class VCenterSession:
         """The configured API idle-session timeout, if the setting is readable."""
         with contextlib.suppress(Exception):
             values = self.content.setting.QueryOptions("config.vmacore.soap.sessionTimeout")
-            if values and isinstance(values[0].value, (int, float)):
-                return float(values[0].value) / 60
+            # Read back as a string from vpxd.cfg, in minutes (the default is 30).
+            raw = values[0].value if values else None
+            if raw is not None and not isinstance(raw, bool):
+                return float(raw)
         return None
 
     def now(self) -> datetime:
@@ -613,12 +638,22 @@ class VCenterSession:
             with contextlib.suppress(Exception):
                 process_manager.TerminateProcessInGuest(vm, auth, pid)
                 terminated = True
-        output, truncated = "", False
+        output, truncated, output_error = "", False, None
         try:
             transfer = file_manager.InitiateFileTransferFromGuest(vm, auth, out_path)
-            output, truncated = self._download_text(
-                rewrite_transfer_url(transfer.url, self.vcenter.host), max_output_bytes
-            )
+            # Through vCenter the URL names the ESXi host itself: it must be reachable
+            # from this server and trusted by the CA bundle. If not, the command still
+            # ran: keep its exit code and say why the output is missing.
+            try:
+                output, truncated = self._download_text(
+                    rewrite_transfer_url(transfer.url, self.vcenter.host), max_output_bytes
+                )
+            except (httpx.HTTPError, ssl.SSLError, OSError) as error:
+                output_error = (
+                    f"the command ran, but its output could not be downloaded from the ESXi host "
+                    f"({type(error).__name__}: {error}); the host must be reachable from this server "
+                    "and its certificate trusted (VSPHERE_CA_BUNDLE)"
+                )
         finally:
             with contextlib.suppress(Exception):
                 file_manager.DeleteFileInGuest(vm, auth, out_path)
@@ -628,6 +663,7 @@ class VCenterSession:
             "pid": pid,
             "exit_code": exit_code,
             "timed_out": exit_code is None,
+            "output_error": output_error,
             # Only the shell Tools started is terminated: processes it spawned (a
             # pipeline, a background job) can outlive it.
             "shell_terminated_after_timeout": terminated,
@@ -756,7 +792,7 @@ class VCenterSession:
         if not wanted or not entities:
             return {}, unknown
         now = self.now()
-        interval = REALTIME_INTERVAL_SECONDS if now - begin <= REALTIME_SPAN else HISTORICAL_INTERVAL_SECONDS
+        interval = perf_interval(now - begin)
         by_key = {known[name].key: name for name in wanted}
         specs = [
             vim.PerformanceManager.QuerySpec(
@@ -886,7 +922,9 @@ class VCenterSession:
         # with the whole file, which the stream below caps and tails itself.
         request = self._get_request(
             "/folder/" + quote(inside),
-            {"dcPath": datacenter, "dsName": datastore},
+            # vSphere returns names with %, / and \\ already escaped (%25, %2f, %5c);
+            # undo that, or the request's own encoding would escape them twice.
+            {"dcPath": unquote(datacenter), "dsName": unquote(datastore)},
             headers={"Range": f"bytes=-{max_bytes}"},
         )
         assert self._http is not None  # noqa: S101 - set by _get_request

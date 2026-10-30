@@ -54,6 +54,17 @@ def guest_program_spec(command: str, out_path: str, *, windows: bool) -> tuple[s
     return LINUX_SHELL, f"-c \"exec > '{out_path}' 2>&1; {command}\""
 
 
+# PowerShell writes what it prints in the guest's OEM codepage (437, 850, 932,
+# 866, ...), which the server cannot know. Switching the console to UTF-8 before
+# the JSON is printed makes every guest's output decode the same way; on a
+# Japanese or Chinese guest the OEM bytes otherwise corrupt the JSON itself.
+# Set it after any native command (bcdedit) has run: PowerShell decodes a native
+# command's output with this same setting.
+PS_UTF8_OUTPUT = "[Console]::OutputEncoding=New-Object System.Text.UTF8Encoding $false;"
+# No progress records or error noise on the redirected streams.
+PS_QUIET = "$ProgressPreference='SilentlyContinue';$ErrorActionPreference='SilentlyContinue';"
+
+
 def encode_powershell(script: str) -> str:
     """A cmd.exe-safe command that runs `script` in PowerShell.
 

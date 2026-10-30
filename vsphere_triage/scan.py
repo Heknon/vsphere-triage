@@ -545,7 +545,8 @@ def window_on_vcenter(
 ) -> dict[str, Any]:
     """Resets, failures and pressure on one vCenter over a past window. Blocking."""
     thresholds = settings.thresholds
-    events = session.events(begin=begin, end=end, types=WINDOW_EVENTS)
+    # Read in pieces when the window holds more than one QueryEvents answer.
+    events, events_cut = session.events_covering(begin=begin, end=end, types=WINDOW_EVENTS)
     by_host: Counter[str] = Counter()
     by_type: Counter[str] = Counter()
     by_folder_vm: Counter[str] = Counter()
@@ -581,7 +582,7 @@ def window_on_vcenter(
     storage_matched = any(entry.get("matched_instance") for entry in disk.get("datastores", []))
     return {
         "events_read": len(events),
-        "events_capped": len(events) >= QUERY_EVENTS_CAP,
+        "events_capped": events_cut,
         "events_by_type": dict(by_type),
         "events_by_host": dict(by_host.most_common(15)),
         "vms_with_most_events": {

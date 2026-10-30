@@ -30,7 +30,7 @@ from typing import TYPE_CHECKING, Any
 
 from vsphere_triage import capabilities
 from vsphere_triage.diagnose import locate, read_serial_files
-from vsphere_triage.guestexec import encode_powershell
+from vsphere_triage.guestexec import PS_QUIET, PS_UTF8_OUTPUT, encode_powershell
 
 if TYPE_CHECKING:
     from vsphere_triage.config import Settings
@@ -60,6 +60,9 @@ def bcd_probe_powershell() -> str:
         ' catch { $out.current = "ERROR: $_" };'
         "try { $out.emssettings = (bcdedit /enum '{emssettings}' | Out-String) }"
         ' catch { $out.emssettings = "ERROR: $_" };'
+        # UTF-8 only now: bcdedit's localized output above was decoded with the OEM
+        # codepage, which is right for it; the JSON below must not be.
+        f"{PS_QUIET}{PS_UTF8_OUTPUT}"
         "$out | ConvertTo-Json -Compress"
     )
 
@@ -88,7 +91,8 @@ def parse_bcd_output(output: str) -> dict[str, Any]:
     current = str(parsed.get("current", "")) if parsed else output
     settings = str(parsed.get("emssettings", "")) if parsed else output
     flag = _EMS_FLAG.search(current)
-    access_denied = bool(_ACCESS_DENIED.search(current))
+    # Anywhere in the output: bcdedit may write the refusal to stderr, outside the JSON.
+    access_denied = bool(_ACCESS_DENIED.search(current) or _ACCESS_DENIED.search(output))
     if flag is not None:
         enabled: bool | None = flag.group(1).lower() in _YES
     elif not access_denied and _BOOT_ENTRY.search(current):

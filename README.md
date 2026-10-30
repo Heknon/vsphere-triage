@@ -370,13 +370,23 @@ methods; that power, reset, answer, reconfigure, destroy and
 screenshot-to-datastore are refused through a live session; and that the acting
 tools never add a method to the guarded surface.
 
-Running with a dedicated vCenter role limits the account as well. The
-read-only tools need inventory read, datastore browse and file download,
-diagnostics (host logs), the console-screen privilege (confirm which one
-`/screen` needs on your version) and `Sessions.View` for the global session
-list. The acting tools also need `VirtualMachine.GuestOperations.Query`,
-`.Modify` and `.Execute` for guest commands, and `VirtualMachine.Interact.Reset`
-for both `RebootGuest` and `ResetVM_Task`.
+Running with a dedicated vCenter role limits the account as well. The stock
+Read-only role is not enough for every read:
+
+| Privilege | Needed for |
+| --- | --- |
+| Read-only (System.View, System.Read) | inventory, events, performance counters |
+| `Datastore.Browse` | `vmware.log`, serial-console files and datastore listings (`read_vm_log`, `get_boot_timeline`, `read_serial_console`); without it these return HTTP 403 |
+| `Global.Diagnostics` | host logs (`read_host_log`) |
+| the console privilege `/screen` needs (confirm on your version) | `get_vm_console` |
+| `Sessions.TerminateSession` | the full session list in `check_vcenters` / `vcenter_sessions`; vSphere has no separate view privilege for it, and without it only this server's own session is visible |
+| `VirtualMachine.GuestOperations.Query`, `.Modify`, `.Execute` | the guest-command tools |
+| `VirtualMachine.Interact.Reset` | `reboot_guest` and `hard_reset` |
+
+vCenter's default statistics level is 1. Host CPU demand, co-stop and the
+per-device storage counters are level 2 or 3, so on a stock vCenter they are
+kept only in the realtime hour; for older windows raise the statistics level, or
+use vROps. Each result says when a window's counters could not be read.
 
 ## Development
 
@@ -429,8 +439,7 @@ The simulator's limits, and how the tests handle them:
   returned with its line.
 - What EMS writes on your Windows versions, and the vROps stat keys on your
   version (`vrops_list_stat_keys` lists them).
-- The privilege that lets an account list every session (`Sessions.View` is
-  assumed), and snapshot sizes from `layoutEx` (the simulator reports 0).
+- Snapshot sizes from `layoutEx` (the simulator reports 0).
 - Guest exec: the guest-operation privileges, and that output capture works on
   your Windows and Linux guests.
 - That an in-guest reboot logs a reset or guest-reboot event. If yours are

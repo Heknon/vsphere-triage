@@ -1964,7 +1964,7 @@ def test_only_the_servers_own_session_is_reported_as_a_restricted_view() -> None
     counted = session.session_count()
 
     assert counted["visible"] == "own_only"
-    assert "Sessions.View" in counted["note"]
+    assert "Sessions.TerminateSession" in counted["note"]
 
 
 def test_an_ocr_failure_loses_the_text_not_the_console(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -3330,3 +3330,86 @@ def test_an_sds_state_field_that_is_null_is_not_a_down_sds() -> None:
 
     assert summary["sds_down"] == []
     assert summary["healthy"] is True
+
+
+# -- review against real guests and the vSphere API --------------------------------------------
+
+
+def test_a_localized_bugcheck_is_read_from_the_event_data() -> None:
+    parsed = {
+        "last_boot": "2026-10-29T02:00:00+00:00",
+        "bugchecks": [
+            {
+                "time": "2026-10-29T02:01:00+00:00",
+                "message": "Der Computer wurde nach einem Fehler neu gestartet. Fehlercode: ...",
+                "data": "0x0000007a (0xffffd7ec, 0xc000000e, 0x0, 0x0) | C:\\Windows\\MEMORY.DMP",
+            }
+        ],
+    }
+
+    summary = winboot.summarize_windows_boot(parsed)
+
+    assert summary["bugchecks"][0]["stop_codes"][0]["code"] == "0x0000007A"
+
+
+def test_every_windows_probe_prints_its_json_as_utf8() -> None:
+    from vsphere_triage import crashdump, emscheck  # noqa: PLC0415
+
+    for script in (
+        winboot.boot_probe_powershell(),
+        emscheck.bcd_probe_powershell(),
+        crashdump.dump_probe_powershell(),
+    ):
+        assert guestexec.PS_UTF8_OUTPUT in script
+    # The BCD probe switches only after bcdedit ran, so bcdedit's output is decoded right.
+    bcd = emscheck.bcd_probe_powershell()
+    assert bcd.index("bcdedit") < bcd.index(guestexec.PS_UTF8_OUTPUT)
+
+
+def test_every_windows_probe_fits_cmds_command_line_limit() -> None:
+    from vsphere_triage import crashdump, emscheck  # noqa: PLC0415
+
+    for script in (
+        winboot.boot_probe_powershell(),
+        emscheck.bcd_probe_powershell(),
+        crashdump.dump_probe_powershell(),
+    ):
+        _program, arguments = guestexec.guest_program_spec(
+            guestexec.encode_powershell(script), r"C:\Windows\Temp\vsphere-triage-x.txt", windows=True
+        )
+        assert len(arguments) < 8191
+
+
+def test_a_slow_unit_over_a_minute_keeps_its_name() -> None:
+    output = (
+        "===BLAME===\n1min 30.012s systemd-networkd-wait-online.service\n  2.100s sshd.service\n===END===\n"
+    )
+
+    summary = linuxboot.summarize_linux_boot(output)
+
+    assert summary["slow_units"][0] == {
+        "time": "1min 30.012s",
+        "unit": "systemd-networkd-wait-online.service",
+    }
+
+
+def test_no_entries_from_a_restricted_journal_is_not_a_clean_read() -> None:
+    output = (
+        "===DMESG_LINES===\n0\n===DMESG===\n===JOURNAL===\n-- No entries --\n"
+        "===BOOTS===\n3\n===PREVIOUS===\n-- No entries --\n===END===\n"
+    )
+
+    summary = linuxboot.summarize_linux_boot(output)
+
+    assert summary["restricted"] is True
+    assert summary["previous_boot_read"] is False
+
+
+def test_the_perf_rollup_matches_the_windows_age() -> None:
+    from vsphere_triage.vcenter import perf_interval  # noqa: PLC0415
+
+    assert perf_interval(timedelta(minutes=30)) == 20
+    assert perf_interval(timedelta(hours=12)) == 300
+    assert perf_interval(timedelta(days=3)) == 1800
+    assert perf_interval(timedelta(days=20)) == 7200
+    assert perf_interval(timedelta(days=200)) == 86400

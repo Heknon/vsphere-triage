@@ -24,7 +24,7 @@ from typing import TYPE_CHECKING, Any
 from vsphere_triage import capabilities, vmlog
 from vsphere_triage.diagnose import locate
 from vsphere_triage.emscheck import _extract_json
-from vsphere_triage.guestexec import encode_powershell, probe_failed
+from vsphere_triage.guestexec import PS_QUIET, PS_UTF8_OUTPUT, encode_powershell, probe_failed
 
 if TYPE_CHECKING:
     from vsphere_triage.config import Settings
@@ -39,6 +39,7 @@ def dump_probe_powershell() -> str:
     `PAGEDU64`); a 32-bit dump is reported with its signature so the reader knows.
     """
     return (
+        f"{PS_QUIET}{PS_UTF8_OUTPUT}"
         "$md='C:\\Windows\\Minidump';"
         # Missing folder, unreadable folder (non-admin) and no dump are three answers.
         'if(-not (Test-Path $md)){\'{"found":false,"folder":false}\';exit};'
