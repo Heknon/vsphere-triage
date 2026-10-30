@@ -31,12 +31,20 @@ def _by_template(rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
     """
     templates: dict[str, dict[str, Any]] = {}
     for row in rows:
-        key = row.get("base_disk")
-        if not key:
+        base = row.get("base_disk")
+        if not base:
             continue
+        # The same path on two vCenters is two templates.
         entry = templates.setdefault(
-            key,
-            {"base_disk": key, "clones": 0, "total_bytes": 0, "oldest_age_hours": None, "names": []},
+            f"{row['vcenter']}:{base}",
+            {
+                "vcenter": row["vcenter"],
+                "base_disk": base,
+                "clones": 0,
+                "total_bytes": 0,
+                "oldest_age_hours": None,
+                "names": [],
+            },
         )
         entry["clones"] += 1
         entry["total_bytes"] += row["total_bytes"]
@@ -137,7 +145,7 @@ async def find_vms_by_snapshot(  # noqa: PLR0913 - one filtered fleet query
     if by_template and by_template[0]["clones"] > 1:
         worst = by_template[0]
         findings.append(
-            f"template-wide: {worst['clones']} clones of {worst['base_disk']} carry "
+            f"template-wide: {worst['clones']} clones of {worst['vcenter']}:{worst['base_disk']} carry "
             f"{worst['total_gb']} GB of snapshots between them — the template is the common factor, "
             "whatever the clones are named"
         )

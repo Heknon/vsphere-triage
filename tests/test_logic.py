@@ -1303,24 +1303,33 @@ def test_snapshots_roll_up_by_template_base_disk() -> None:
     gb = 1024**3
     rows = [
         {
+            "vcenter": "vc-a",
             "base_disk": "[DS] Cool/Cool.vmdk",
             "name": "vm-b",
             "total_bytes": 30 * gb,
             "oldest_age_hours": 40.0,
         },
         {
+            "vcenter": "vc-a",
             "base_disk": "[DS] Cool/Cool.vmdk",
             "name": "vm-a",
             "total_bytes": 50 * gb,
             "oldest_age_hours": 10.0,
         },
         {
+            "vcenter": "vc-a",
             "base_disk": "[DS] Other/Other.vmdk",
             "name": "vm-c",
             "total_bytes": 5 * gb,
             "oldest_age_hours": 1.0,
         },
-        {"base_disk": None, "name": "full-clone", "total_bytes": 90 * gb, "oldest_age_hours": 2.0},
+        {
+            "vcenter": "vc-a",
+            "base_disk": None,
+            "name": "full-clone",
+            "total_bytes": 90 * gb,
+            "oldest_age_hours": 2.0,
+        },
     ]
 
     rolled = snapshots._by_template(rows)
@@ -1337,9 +1346,38 @@ def test_snapshots_roll_up_by_template_base_disk() -> None:
 
 def test_resource_limits_roll_up_by_template_base_disk() -> None:
     rows = [
-        {"base_disk": "[DS] Cool/Cool.vmdk", "name": "a", "cpu_limit_mhz": 600, "memory_limit_mb": None},
-        {"base_disk": "[DS] Cool/Cool.vmdk", "name": "b", "cpu_limit_mhz": 600, "memory_limit_mb": 2048},
-        {"base_disk": None, "name": "loner", "cpu_limit_mhz": 400, "memory_limit_mb": None},
+        {
+            "vcenter": "vc-a",
+            "base_disk": "[DS] Cool/Cool.vmdk",
+            "name": "a",
+            "cpu_limit_mhz": 600,
+            "memory_limit_mb": None,
+            "memory_mb": 4096,
+        },
+        {
+            "vcenter": "vc-a",
+            "base_disk": "[DS] Cool/Cool.vmdk",
+            "name": "b",
+            "cpu_limit_mhz": 600,
+            "memory_limit_mb": 2048,
+            "memory_mb": 4096,
+        },
+        {
+            "vcenter": "vc-b",
+            "base_disk": "[DS] Cool/Cool.vmdk",
+            "name": "c",
+            "cpu_limit_mhz": 600,
+            "memory_limit_mb": None,
+            "memory_mb": 4096,
+        },
+        {
+            "vcenter": "vc-a",
+            "base_disk": None,
+            "name": "loner",
+            "cpu_limit_mhz": 400,
+            "memory_limit_mb": None,
+            "memory_mb": 4096,
+        },
     ]
 
     rolled = resources._by_template(rows)
@@ -1348,6 +1386,8 @@ def test_resource_limits_roll_up_by_template_base_disk() -> None:
     assert rolled[0]["clones"] == 2
     assert rolled[0]["cpu_limited"] == 2
     assert rolled[0]["memory_limited"] == 1
+    # The same path on another vCenter is another template.
+    assert [(entry["vcenter"], entry["clones"]) for entry in rolled] == [("vc-a", 2), ("vc-b", 1)]
 
 
 # -- guest run-command: command shaping (the one non-read-only tool) -----------------------
@@ -1603,3 +1643,200 @@ def test_a_window_with_resets_never_opens_with_nothing_found() -> None:
 
     assert not result["findings"][0].startswith("no resets")
     assert "50 resets" in result["findings"][0]
+
+
+# -- fleet reports ------------------------------------------------------------------------------
+
+
+def test_a_device_kind_is_the_short_name_not_pyvmomis_class_path() -> None:
+    from vsphere_triage.inventory import device_kind  # noqa: PLC0415
+
+    assert device_kind(vim.vm.device.VirtualVmxnet3()) == "Vmxnet3"
+    assert device_kind(vim.vm.device.VirtualHdAudioCard()) == "HdAudioCard"
+
+
+class _ProfilePool:
+    def __init__(self, rows: list[dict]) -> None:
+        self.rows = rows
+
+    async def run(self, _name: str, _work: object) -> list[dict]:
+        return self.rows
+
+
+def _device_row(moref: str, nics: int, folder_moref: str = "group-1", environment: str = "env-1") -> dict:
+    kinds = ["Vmxnet3"] * nics
+    return {
+        "vcenter": "vc-a",
+        "moref": moref,
+        "name": moref,
+        "template": False,
+        "folder": f"/DC0/vm/{environment}",
+        "folder_moref": folder_moref,
+        "environment": environment,
+        "categories": ["ethernet"],
+        "kinds": sorted(set(kinds)),
+        "by_category": {"ethernet": kinds},
+    }
+
+
+def test_an_extra_nic_of_the_same_kind_is_an_outlier() -> None:
+    from vsphere_triage import hardware  # noqa: PLC0415
+
+    rows = [_device_row("vm-1", 1), _device_row("vm-2", 1), _device_row("vm-3", 2)]
+    result = asyncio.run(
+        hardware.hardware_profile(
+            _ProfilePool(rows),  # type: ignore[arg-type]
+            Settings(),
+            ["vc-a"],
+            under=[],
+            include_templates=False,
+            limit=10,
+        )
+    )
+
+    assert [(row["moref"], row["extra"]) for row in result["environment_outliers"]] == [("vm-3", ["Vmxnet3"])]
+
+
+def test_two_environments_of_the_same_name_are_not_one_norm() -> None:
+    from vsphere_triage import hardware  # noqa: PLC0415
+
+    rows = [
+        _device_row("vm-1", 1, "group-1"),
+        _device_row("vm-2", 1, "group-1"),
+        _device_row("vm-3", 2, "group-2"),
+        _device_row("vm-4", 2, "group-2"),
+    ]
+    result = asyncio.run(
+        hardware.hardware_profile(
+            _ProfilePool(rows),  # type: ignore[arg-type]
+            Settings(),
+            ["vc-a"],
+            under=[],
+            include_templates=False,
+            limit=10,
+        )
+    )
+
+    assert result["environment_outliers"] == []
+
+
+class _SnapLayout:
+    def __init__(self, disks: list) -> None:
+        self.disk = disks
+
+
+def test_a_linked_clones_own_delta_is_not_counted_as_a_snapshot() -> None:
+    gb = 1024**3
+    layoutex = _LayoutEx(
+        files=[
+            _File(1, "diskExtent", 40 * gb),  # the template's base disk
+            _File(2, "diskExtent", 10 * gb),  # the clone's own delta, from before any snapshot
+            _File(3, "diskExtent", 3 * gb),  # the one snapshot's delta
+        ],
+        disks=[_Disk(200, [_Unit(1), _Unit(2), _Unit(3)])],
+    )
+    layoutex.snapshot = [_SnapLayout([_Disk(200, [_Unit(1), _Unit(2)])])]  # ty: ignore[unresolved-attribute]
+    info = _Info([_Tree("snap1", NOW - timedelta(hours=2), "snapshot-1")])
+
+    usage = snapshot_usage(info, layoutex, NOW)
+
+    assert usage["max_chain_depth"] == 1
+    assert usage["delta_bytes"] == 3 * gb
+
+
+def test_a_cpu_limit_above_the_vms_full_speed_caps_nothing() -> None:
+    # 2 vCPUs x 2000 MHz = 4000 MHz full speed; the default warns at or under 90%.
+    loose = checks.classify(vm(cpu_limit_mhz=100_000), LIMITS)
+    tight = checks.classify(vm(cpu_limit_mhz=1000), LIMITS)
+    unknown_speed = checks.classify(vm(cpu_limit_mhz=100_000, host_core_mhz=None), LIMITS)
+
+    assert checks.CPU_LIMITED not in loose.flags
+    assert checks.CPU_LIMITED in tight.flags
+    assert checks.CPU_LIMITED in unknown_speed.flags
+
+
+def _policy_row(name: str, **fields: object) -> dict:
+    base: dict[str, object] = {
+        "vcenter": "vc-a",
+        "moref": name,
+        "name": name,
+        "folder": "/DC0/vm/env",
+        "base_disk": None,
+        "template": False,
+        "num_cpu": 2,
+        "memory_mb": 4096,
+        "cpu_limit_mhz": None,
+        "cpu_reservation_mhz": None,
+        "memory_limit_mb": None,
+        "memory_reservation_mb": None,
+    }
+    return base | fields
+
+
+def test_the_tightest_limit_leads_and_a_memory_limit_at_ram_is_not_a_limit() -> None:
+    rows = [
+        _policy_row("loose-cpu", cpu_limit_mhz=50_000),
+        _policy_row("tight-cpu", cpu_limit_mhz=100),
+        _policy_row("tight-mem", memory_limit_mb=512),
+        _policy_row("mem-at-ram", memory_limit_mb=4096),
+    ]
+    result = asyncio.run(
+        resources.find_resource_limits(
+            _ProfilePool(rows),  # type: ignore[arg-type]
+            Settings(),
+            ["vc-a"],
+            kind="limits",
+            include_templates=False,
+            under=[],
+            limit=10,
+        )
+    )
+
+    assert [row["name"] for row in result["vms"]] == ["tight-cpu", "loose-cpu", "tight-mem"]
+
+
+def test_a_memory_limit_with_unknown_ram_does_not_say_none_mb() -> None:
+    reasons = resources._findings_for(_policy_row("x", memory_limit_mb=512, memory_mb=None))
+
+    assert reasons == ["memory limit 512 MB set (RAM not read) — forces balloon/swap"]
+
+
+class _ClockSession:
+    def __init__(self, delay: float) -> None:
+        self.delay = delay
+        self.vcenter_clock = NOW
+
+    def now(self) -> datetime:
+        return self.vcenter_clock
+
+    def host_datetime(self, _moref: str) -> datetime:
+        import time  # noqa: PLC0415
+
+        time.sleep(self.delay)
+        return NOW + timedelta(seconds=time.monotonic() - self.started)
+
+
+def test_host_clock_skew_does_not_grow_with_the_number_of_hosts(monkeypatch: pytest.MonkeyPatch) -> None:
+    import time  # noqa: PLC0415
+
+    rows = [
+        {"moref": f"host-{n}", "connection_state": "connected", "datetime_system_moref": f"dts-{n}"}
+        for n in range(20)
+    ]
+    monkeypatch.setattr(timecheck, "read_host_time", lambda _session: rows)
+    session = _ClockSession(delay=0.02)
+    session.started = time.monotonic()  # ty: ignore[unresolved-attribute]
+
+    measured = timecheck._scan_host_time(session, measure_skew=True)  # type: ignore[arg-type]
+
+    # 20 hosts x 20 ms would be 0.4 s of false skew by the last host.
+    assert max(abs(row["skew_seconds"]) for row in measured) < 0.1
+
+
+def test_the_last_resort_cut_still_fits_the_budget() -> None:
+    # A dict of many short keys is not cut by list cutting, so this reaches the last resort.
+    huge = {"findings": ["x" * 1000] * 10_000, "by_key": {f"k{n}": "y" * 100 for n in range(5000)}}
+
+    result = formatting.bounded(huge)
+
+    assert len(json.dumps(result)) <= formatting.MAX_RESPONSE_CHARACTERS
