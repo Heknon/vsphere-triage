@@ -7,7 +7,7 @@
     "start the model with: 'Load the skill at <skill>/SKILL.md and follow it. Task: <prompt>'",
     "grade each expectation against the verdict the model writes"
   ],
-  "fixtures_status": "fixture files are NOT yet written; the scenarios below specify what each must contain. This is the next build step for whoever runs the evals.",
+  "fixtures_status": "fixture files are not written. The same kinds of scenario run live instead, against the real tools over the integration scenario's simulated vCenters: see evals/live/ (scenarios.json and README.md), which grades verdicts with the same must / must_not form.",
   "scenarios": [
     {
       "id": "cpu-overcommit",
