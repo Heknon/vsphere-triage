@@ -30,6 +30,7 @@ is `investigate_windows_boot`.
 
 from __future__ import annotations
 
+from datetime import UTC, datetime, timedelta
 from typing import TYPE_CHECKING, Any
 
 from vsphere_triage import capabilities, vmlog
@@ -105,13 +106,47 @@ def _decode_bugchecks(rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
     return decoded
 
 
-def summarize_windows_boot(parsed: dict[str, Any]) -> dict[str, Any]:
-    """Turn the raw probe JSON into a boot picture: what Windows says went wrong."""
-    bugchecks = _decode_bugchecks(parsed.get("bugchecks") or [])
-    service_timeouts = parsed.get("service_timeouts") or []
-    boot_perf = parsed.get("boot_performance") or []
-    dirty = parsed.get("dirty_shutdown") or []
-    kernel_power = parsed.get("kernel_power") or []
+# How far before the latest boot an event still counts as this incident's: the
+# boot that failed and the reboot after it. Older events are history, kept apart.
+RECENT_BEFORE_BOOT = timedelta(hours=24)
+
+
+def _when(text: Any) -> datetime | None:
+    try:
+        moment = datetime.fromisoformat(str(text))
+    except (TypeError, ValueError):
+        return None
+    return moment if moment.tzinfo else moment.replace(tzinfo=UTC)
+
+
+def _recent(
+    rows: list[dict[str, Any]], cutoff: datetime | None
+) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
+    """Rows at or after `cutoff` (or of unknown time), and the older ones."""
+    if cutoff is None:
+        return rows, []
+    recent, older = [], []
+    for row in rows:
+        moment = _when(row.get("time"))
+        (older if moment is not None and moment < cutoff else recent).append(row)
+    return recent, older
+
+
+def summarize_windows_boot(parsed: dict[str, Any], *, since: datetime | None = None) -> dict[str, Any]:
+    """Turn the raw probe JSON into a boot picture: what Windows says went wrong.
+
+    The event queries return the newest events of any age, so only those at or
+    after `since` (by default a day before the latest boot) make the picture;
+    older ones are reported as history, never as this incident's cause.
+    """
+    last_boot = _when(parsed.get("last_boot"))
+    cutoff = since or (last_boot - RECENT_BEFORE_BOOT if last_boot else None)
+    bugchecks_all = _decode_bugchecks(parsed.get("bugchecks") or [])
+    bugchecks, old_bugchecks = _recent(bugchecks_all, cutoff)
+    service_timeouts, _ = _recent(parsed.get("service_timeouts") or [], cutoff)
+    boot_perf, _ = _recent(parsed.get("boot_performance") or [], cutoff)
+    dirty, _ = _recent(parsed.get("dirty_shutdown") or [], cutoff)
+    kernel_power, _ = _recent(parsed.get("kernel_power") or [], cutoff)
     picture: list[str] = []
     latest_code = next((code for row in bugchecks for code in row["stop_codes"]), None)
     if latest_code:
@@ -127,7 +162,10 @@ def summarize_windows_boot(parsed: dict[str, Any]) -> dict[str, Any]:
             "not the kernel, may be what hung the boot"
         )
     if dirty or kernel_power:
-        picture.append("the system went down without a clean shutdown (Kernel-Power 41 / EventLog 6008)")
+        picture.append(
+            "the system went down without a clean shutdown (Kernel-Power 41 / EventLog 6008) — a "
+            "hard_reset, including one issued by this server, records exactly this too"
+        )
     slow = [row for row in boot_perf if row.get("id") in (101, 102, 103)]
     if slow:
         picture.append(f"{len(slow)} slow-boot component(s) named by Diagnostics-Performance (101/102/103)")
@@ -135,10 +173,23 @@ def summarize_windows_boot(parsed: dict[str, Any]) -> dict[str, Any]:
         picture.append("Startup Repair ran and left SrtTrail.txt — read it for its own diagnosis")
     if parsed.get("panther_present"):
         picture.append("a Windows Update Panther log is present — a 'Working on updates' hang is possible")
+    if old_bugchecks:
+        picture.append(
+            f"{len(old_bugchecks)} older bugcheck(s) from before {cutoff:%Y-%m-%d %H:%M}Z — history, not "
+            "this incident; see older_bugchecks"
+            if cutoff
+            else f"{len(old_bugchecks)} older bugcheck(s)"
+        )
     return {
         "last_boot": parsed.get("last_boot"),
-        "picture": picture or ["no boot faults found in the event log window read"],
+        "events_since": cutoff,
+        "picture": picture
+        or [
+            "no boot faults found in the event log since "
+            + (f"{cutoff:%Y-%m-%d %H:%M}Z" if cutoff else "the newest events read")
+        ],
         "bugchecks": bugchecks,
+        "older_bugchecks": old_bugchecks,
         "service_timeouts": service_timeouts,
         "boot_performance": boot_perf,
         "dirty_shutdowns": dirty,

@@ -13,6 +13,9 @@ let it come up, then read, in one pass:
 - **`systemd-analyze blame` / `critical-chain`** — which units made the boot
   slow, and the critical path through them.
 - **`journalctl -b`** — the current boot's warnings and errors.
+- **`journalctl -b -1`** — the *previous* boot's: after a reboot of a hung VM
+  the current boot is the healthy one, and the hang is in the boot before it.
+  Only there when the journal is persistent; said when it is not.
 
 dmesg and the journal may be restricted to root/adm, so a non-privileged run can
 come back thin; that is reported, not hidden. The script-building and the
@@ -32,7 +35,7 @@ if TYPE_CHECKING:
     from vsphere_triage.vcenter import VCenterPool, VCenterSession
 
 # Section markers the probe prints, so the combined output parses back apart.
-_MARKERS = ("LAST_BOOT", "BLAME", "CRITICAL", "DMESG", "JOURNAL")
+_MARKERS = ("LAST_BOOT", "BLAME", "CRITICAL", "DMESG_LINES", "DMESG", "JOURNAL", "BOOTS", "PREVIOUS")
 
 
 def boot_probe_shell() -> str:
@@ -44,8 +47,15 @@ def boot_probe_shell() -> str:
         "echo ===LAST_BOOT===; (uptime -s 2>/dev/null || who -b 2>/dev/null);"
         "echo ===BLAME===; systemd-analyze blame 2>/dev/null | head -n 15;"
         "echo ===CRITICAL===; systemd-analyze critical-chain 2>/dev/null | head -n 20;"
+        # The unfiltered line count tells "dmesg was readable and nothing matched"
+        # from "dmesg was restricted" — the filtered section alone cannot.
+        "echo ===DMESG_LINES===; dmesg 2>/dev/null | wc -l;"
         f"echo ===DMESG===; dmesg 2>/dev/null | grep -iE '{patterns}' | tail -n 40;"
         "echo ===JOURNAL===; journalctl -b -p warning -o short-iso --no-pager 2>/dev/null | tail -n 60;"
+        # How many boots the journal holds: one means it is not persistent, and the
+        # boot before a reboot (the one that hung) is gone.
+        "echo ===BOOTS===; journalctl --list-boots --no-pager 2>/dev/null | wc -l;"
+        "echo ===PREVIOUS===; journalctl -b -1 -p warning -o short-iso --no-pager 2>/dev/null | tail -n 60;"
         "echo ===END==="
     )
 
@@ -87,14 +97,37 @@ def summarize_linux_boot(output: str) -> dict[str, Any]:
             kernel_findings.append(
                 {"kind": name, "points_at": hint, "count": len(hits), "examples": hits[:3]}
             )
+    previous_findings: list[dict[str, Any]] = []
+    for name, hint, pattern in vmlog.LINUX_MARKS:
+        hits = [line for line in sections["PREVIOUS"] if pattern.search(line)]
+        if hits:
+            previous_findings.append(
+                {"kind": name, "points_at": hint, "count": len(hits), "examples": hits[:3]}
+            )
+    boots_text = " ".join(sections["BOOTS"]).strip()
+    boots = int(boots_text) if boots_text.isdigit() else None
     slow = _slow_units(sections["BLAME"])
     picture: list[str] = []
+    for finding in previous_findings:
+        layer = f" — {finding['points_at']}" if finding["points_at"] else ""
+        picture.append(f"previous boot: {finding['count']}x {finding['kind']}{layer}")
     for finding in kernel_findings:
         layer = f" — {finding['points_at']}" if finding["points_at"] else ""
-        picture.append(f"{finding['count']}x {finding['kind']}{layer}")
+        picture.append(f"current boot: {finding['count']}x {finding['kind']}{layer}")
+    previous_read = bool(sections["PREVIOUS"]) or (boots is not None and boots > 1)
+    if not previous_read:
+        picture.append(
+            "the previous boot's journal is not available (the journal is not persistent, or was not "
+            "readable): if this VM was rebooted after hanging, the boot that hung was NOT read — "
+            "the serial console and vmware.log are the record of it"
+        )
     if slow:
         picture.append(f"slowest unit at boot: {slow[0]['unit']} ({slow[0]['time']})")
-    thin = not sections["DMESG"] and not sections["JOURNAL"]
+    dmesg_text = " ".join(sections["DMESG_LINES"]).strip()
+    dmesg_lines = int(dmesg_text) if dmesg_text.isdigit() else None
+    # Thin only when nothing could be read at all: a readable dmesg with no fault
+    # lines is a clean result, not a restricted one.
+    thin = not dmesg_lines and not sections["DMESG"] and not sections["JOURNAL"]
     if thin:
         picture.append(
             "dmesg and the journal came back empty — likely restricted to root/adm; run as a "
@@ -104,6 +137,9 @@ def summarize_linux_boot(output: str) -> dict[str, Any]:
         "last_boot": " ".join(sections["LAST_BOOT"]) or None,
         "picture": picture or ["no kernel faults found in what could be read"],
         "kernel_findings": kernel_findings,
+        "previous_boot_findings": previous_findings,
+        "previous_boot_read": previous_read,
+        "boots_in_journal": boots,
         "slow_units": slow,
         "critical_chain": sections["CRITICAL"],
         "restricted": thin,

@@ -55,7 +55,15 @@ from vsphere_triage import (
     winboot,
 )
 from vsphere_triage import scan as scanning
-from vsphere_triage.checks import ABNORMAL, classify, count_states
+from vsphere_triage.checks import (
+    BOOTED_NOT_UP,
+    BUSY_NOT_UP,
+    HUNG,
+    LOST_HEARTBEAT,
+    NO_BOOT_TIME,
+    classify,
+    count_states,
+)
 from vsphere_triage.config import NotFoundError, Settings
 from vsphere_triage.contention import hosts_cpu, storage
 from vsphere_triage.diagnose import (
@@ -212,6 +220,10 @@ CAP_NOTE = (
     "even split into {n} reads, part of the window still held over 1000 events, so the oldest events "
     "of that part are missing: narrow the window for a complete count"
 )
+
+
+# The VM states a stalled or slow storage backend produces.
+STORAGE_SUFFERING = frozenset({HUNG, BUSY_NOT_UP, BOOTED_NOT_UP, LOST_HEARTBEAT, NO_BOOT_TIME})
 
 
 def _event_type(event: Any) -> str:
@@ -1201,9 +1213,11 @@ def _register_machine_tools(  # noqa: C901, PLR0915 - one closure per tool
         (Get-WinEvent / Get-Content), run as a guest command, so it is marked
         not-read-only.
 
-        If the VM is powered off, reboot it first (reboot_guest, else hard_reset)
-        and let it come up — the running event log is what this reads. The result
-        says so rather than failing silently.
+        If the VM is hung, reboot it first (reboot_guest, else hard_reset); if it
+        is powered off, power it on from your orchestrator or vCenter (this server
+        has no power-on tool). Let it come up — the running event log is what this
+        reads, and only events from about the last boot count. The result says so
+        rather than failing silently.
 
         Args:
             vcenter: the VM's vCenter.
@@ -1246,9 +1260,11 @@ def _register_machine_tools(  # noqa: C901, PLR0915 - one closure per tool
         mapped to the layer they point at. dmesg/journal may be root-only, so a
         non-privileged run can come back thin; that is reported.
 
-        If the VM is powered off, reboot it first (reboot_guest, else
-        hard_reset) and let it come up. Queries are read-only, run as a guest
-        command, so it is marked not-read-only.
+        If the VM is hung, reboot it first (reboot_guest, else hard_reset); if it
+        is powered off, power it on from your orchestrator or vCenter (this server
+        has no power-on tool). The previous boot's journal (the one that hung) is
+        read too when the journal is persistent, and said when it is not. Queries
+        change nothing but run as a guest command, so it is marked not-read-only.
 
         Args:
             vcenter: the VM's vCenter.
@@ -1884,7 +1900,9 @@ def _register_powerflex_tools(  # noqa: C901, PLR0915 - one closure per tool
                     "moref": vm.moref,
                     "vcenter": vm.vcenter,
                     "state": verdict.state,
-                    "suffering": verdict.state in ABNORMAL,
+                    # States a slow backend can cause; a VM blocked on a question or
+                    # paused is abnormal for its own reasons, not the storage's.
+                    "suffering": verdict.state in STORAGE_SUFFERING,
                 }
                 for datastore_moref in vm.datastore_morefs:
                     key = powerflex.datastore_key(session.vcenter.name, datastore_moref)

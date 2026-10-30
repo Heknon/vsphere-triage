@@ -2403,7 +2403,8 @@ def test_windows_boot_picture_decodes_the_bugcheck_and_names_timeouts() -> None:
 
 def test_windows_boot_picture_is_calm_when_nothing_is_wrong() -> None:
     summary = winboot.summarize_windows_boot({"last_boot": "t"})
-    assert summary["picture"] == ["no boot faults found in the event log window read"]
+    assert len(summary["picture"]) == 1
+    assert summary["picture"][0].startswith("no boot faults found in the event log")
 
 
 # -- vCenter session history --------------------------------------------------
@@ -3182,3 +3183,82 @@ def test_ha_wordings_the_patterns_had_missed(kind: str, message: str, bucket: st
 
     assert hit is not None
     assert hit[0] == bucket
+
+
+# -- review of main, round five -----------------------------------------------------------------
+
+
+def test_the_linux_probe_reads_the_boot_before_the_reboot() -> None:
+    script = linuxboot.boot_probe_shell()
+    output = (
+        "===LAST_BOOT===\n2026-10-29 02:10:00\n===DMESG_LINES===\n812\n===DMESG===\n===JOURNAL===\n"
+        "===BOOTS===\n2\n===PREVIOUS===\n"
+        "2026-10-29T01:50:00 host kernel: Kernel panic - not syncing\n===END===\n"
+    )
+
+    summary = linuxboot.summarize_linux_boot(output)
+
+    assert "journalctl -b -1" in script
+    assert summary["previous_boot_read"] is True
+    assert any(finding.startswith("previous boot:") for finding in summary["picture"])
+    assert summary["restricted"] is False  # dmesg was readable; it just had no fault lines
+
+
+def test_a_volatile_journal_says_the_hung_boot_was_not_read() -> None:
+    output = "===DMESG_LINES===\n500\n===BOOTS===\n1\n===END===\n"
+
+    summary = linuxboot.summarize_linux_boot(output)
+
+    assert summary["previous_boot_read"] is False
+    assert any("the boot that hung was NOT read" in finding for finding in summary["picture"])
+
+
+def test_an_old_bugcheck_is_history_not_this_incidents_cause() -> None:
+    parsed = {
+        "last_boot": "2026-10-29T02:00:00+00:00",
+        "bugchecks": [
+            {
+                "time": "2024-03-01T10:00:00+00:00",
+                "message": "The computer has rebooted from a bugcheck. The bugcheck was: 0x0000007a (...)",
+            }
+        ],
+    }
+
+    summary = winboot.summarize_windows_boot(parsed)
+
+    assert summary["bugchecks"] == []
+    assert len(summary["older_bugchecks"]) == 1
+    assert not any(finding.startswith("last bugcheck") for finding in summary["picture"])
+
+
+def test_host_sensors_that_are_all_unknown_are_not_healthy() -> None:
+    verdict = hostsensors.classify_sensors(
+        [{"name": "CPU1", "health": "unknown"}, {"name": "PSU1", "health": None}]
+    )
+
+    assert verdict["healthy"] is None
+    assert any("CIM provider" in finding for finding in verdict["findings"])
+
+
+def test_drs_power_on_placements_are_not_a_vmotion_wave() -> None:
+    assert taskhistory.categorize("Drm.ExecuteVmPowerOnLRO") == "power"
+    assert taskhistory.categorize("Drm.ExecuteVMotionLRO") == "migration"
+    assert taskhistory.categorize("VirtualMachine.reset") == "power"
+    assert taskhistory.categorize("VirtualMachine.resetGuestInformation") == "other"
+    assert taskhistory.categorize("VirtualMachine.consolidateDisks") == "snapshot"
+
+
+def test_vcenters_own_loopback_logins_are_not_a_churning_client() -> None:
+    rows = [
+        {
+            "type": "UserLoginSessionEvent",
+            "time": NOW - timedelta(minutes=n),
+            "user": "vpxd",
+            "source": "127.0.0.1",
+        }
+        for n in range(30)
+    ]
+
+    summary = connhistory.summarize_session_events(rows, now=NOW, window_minutes=60)
+
+    assert not any("churning" in finding for finding in summary["findings"])

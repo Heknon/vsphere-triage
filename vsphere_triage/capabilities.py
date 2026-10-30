@@ -106,8 +106,8 @@ def guest_gap(settings: Settings, vm: VmFacts) -> dict[str, Any] | None:
                 "out of reach, and the console and serial console are the only view of the guest"
             ),
             how_to_enable=(
-                f"get VMware Tools running in the guest (Tools status is {vm.tools_running!r}); a "
-                "reboot_guest or hard_reset may bring it back if the guest is wedged"
+                f"get VMware Tools running in the guest (Tools status is {vm.tools_running!r}); if the "
+                "guest is wedged, hard_reset may bring it back (reboot_guest needs Tools, so it cannot)"
             ),
         )
     return _gap(

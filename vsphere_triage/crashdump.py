@@ -54,7 +54,8 @@ def dump_probe_powershell() -> str:
         "$code=[BitConverter]::ToUInt32($buf,0x38);"
         "$p=@([BitConverter]::ToUInt64($buf,0x40),[BitConverter]::ToUInt64($buf,0x48),"
         "[BitConverter]::ToUInt64($buf,0x50),[BitConverter]::ToUInt64($buf,0x58));"
-        "@{found=$true;name=$f.Name;signature=$sig;code=$code;params=$p}|ConvertTo-Json -Compress"
+        "@{found=$true;name=$f.Name;time=$f.LastWriteTime.ToUniversalTime().ToString('o');"
+        "signature=$sig;code=$code;params=$p}|ConvertTo-Json -Compress"
     )
 
 
@@ -104,6 +105,8 @@ def decode_dump(parsed: dict[str, Any]) -> dict[str, Any]:  # noqa: PLR0911 - on
     return {
         "found": True,
         "dump": parsed.get("name"),
+        # When the dump was written: an old dump is an old crash, not this incident's.
+        "written": parsed.get("time"),
         "signature": parsed.get("signature"),
         "bugcheck": {
             "code": f"0x{code:08X}" if isinstance(code, int) else None,

@@ -19,11 +19,13 @@ from typing import Any
 # Operation-key substrings grouped into what they do, lowercased. The first
 # matching category wins.
 CATEGORIES: tuple[tuple[str, tuple[str, ...]], ...] = (
-    ("migration", ("relocate", "migrate", "vmotion", "drm.execute")),
+    # Power first: DRS's 'Drm.ExecuteVmPowerOnLRO' (initial placement of a power-on)
+    # is a power-on, not a migration, and a routine burst of them is no vMotion wave.
+    ("power", ("poweroff", "poweron", "resetvm", "suspend", "rebootguest", "shutdown", "standbyguest")),
+    ("migration", ("relocate", "migrate", "vmotion", "drm.executevmotion")),
     ("reconfigure", ("reconfig",)),
-    ("snapshot", ("snapshot",)),
+    ("snapshot", ("snapshot", "consolidate")),
     ("clone", ("clone", "createvm", "deploy")),
-    ("power", ("poweroff", "poweron", "reset", "suspend", "reboot", "shutdown")),
     ("destroy", ("destroy", "delete", "unregister")),
 )
 
@@ -31,6 +33,8 @@ CATEGORIES: tuple[tuple[str, tuple[str, ...]], ...] = (
 def categorize(operation: str) -> str:
     """Which family a task operation belongs to: migration, reconfigure, …, or other."""
     lowered = operation.lower()
+    if lowered.endswith(".reset"):  # VirtualMachine.reset, but not resetGuestInformation
+        return "power"
     for name, needles in CATEGORIES:
         if any(needle in lowered for needle in needles):
             return name

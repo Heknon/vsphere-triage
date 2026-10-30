@@ -33,6 +33,8 @@ SESSION_EVENT_TYPES = (
 )
 _FAILED = {"BadUsernameSessionEvent", "NoAccessUserEvent", "com.vmware.sso.LoginFailure"}
 _LOGIN = "UserLoginSessionEvent"
+# Sources that are vCenter itself (its own services), never a leaking client.
+LOCAL_SOURCES = frozenset({"127.0.0.1", "::1", "localhost", None, ""})
 
 
 def summarize_session_events(
@@ -83,9 +85,12 @@ def summarize_session_events(
         )
     if failed:
         findings.append(
-            f"{failed} failed login(s) (bad username / no access) — a client with stale credentials"
+            f"{failed} failed login(s) (bad username / no access) — often a client with stale "
+            "credentials, or someone guessing; see by_type and top_sources"
         )
-    top_source = max(by_source.items(), key=lambda item: item[1], default=None)
+    # vCenter's own services log in from loopback all the time; that is not a client.
+    external = {source: count for source, count in by_source.items() if source not in LOCAL_SOURCES}
+    top_source = max(external.items(), key=lambda item: item[1], default=None)
     if top_source and top_source[1] >= max(5, logins // 2):
         findings.append(
             f"{top_source[1]} of {logins} logins came from {top_source[0]} — one client may be churning"
