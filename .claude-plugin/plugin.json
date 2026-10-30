@@ -26,7 +26,7 @@
     "index_url": {
       "type": "string",
       "title": "Python package index",
-      "description": "Where uvx fetches vsphere-triage from. Leave as public PyPI for internet-connected installs; set to your internal PyPI mirror (e.g. a GitLab Package Registry simple index) for air-gapped installs.",
+      "description": "Where uvx fetches vsphere-triage from. Leave as public PyPI for internet-connected installs; set to an internal PyPI mirror for air-gapped installs.",
       "default": "https://pypi.org/simple"
     },
     "ca_bundle": {
