@@ -3262,3 +3262,31 @@ def test_vcenters_own_loopback_logins_are_not_a_churning_client() -> None:
     summary = connhistory.summarize_session_events(rows, now=NOW, window_minutes=60)
 
     assert not any("churning" in finding for finding in summary["findings"])
+
+
+# -- review of main, round six ------------------------------------------------------------------
+
+
+def test_the_journal_boot_count_ignores_the_list_boots_header() -> None:
+    script = linuxboot.boot_probe_shell()
+
+    assert "--list-boots --no-pager 2>/dev/null | grep -cE '^ *-?[0-9]+ '" in script
+
+
+def test_older_boot_events_are_kept_and_named_not_dropped() -> None:
+    parsed = {
+        "last_boot": "2026-10-29T02:00:00+00:00",
+        "service_timeouts": [{"time": "2026-10-26T09:00:00+00:00", "id": 7009, "message": "timeout"}],
+    }
+
+    summary = winboot.summarize_windows_boot(parsed)
+
+    assert summary["older_events"]["service_timeouts"]
+    assert any("1 older boot event(s)" in finding for finding in summary["picture"])
+
+
+def test_vms_stunned_on_a_question_by_a_full_datastore_count_as_suffering() -> None:
+    from vsphere_triage.server import STORAGE_SUFFERING  # noqa: PLC0415
+
+    assert {checks.BLOCKED_ON_QUESTION, checks.PAUSED, checks.INACCESSIBLE} <= STORAGE_SUFFERING
+    assert checks.HEALTHY not in STORAGE_SUFFERING

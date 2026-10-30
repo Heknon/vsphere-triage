@@ -56,11 +56,14 @@ from vsphere_triage import (
 )
 from vsphere_triage import scan as scanning
 from vsphere_triage.checks import (
+    BLOCKED_ON_QUESTION,
     BOOTED_NOT_UP,
     BUSY_NOT_UP,
     HUNG,
+    INACCESSIBLE,
     LOST_HEARTBEAT,
     NO_BOOT_TIME,
+    PAUSED,
     classify,
     count_states,
 )
@@ -222,8 +225,21 @@ CAP_NOTE = (
 )
 
 
-# The VM states a stalled or slow storage backend produces.
-STORAGE_SUFFERING = frozenset({HUNG, BUSY_NOT_UP, BOOTED_NOT_UP, LOST_HEARTBEAT, NO_BOOT_TIME})
+# The VM states a stalled, full or unreachable storage backend produces: a slow
+# boot or hang, and — when a thin disk cannot grow or all paths are down — a VM
+# stunned into a pending question, paused, or inaccessible.
+STORAGE_SUFFERING = frozenset(
+    {
+        HUNG,
+        BUSY_NOT_UP,
+        BOOTED_NOT_UP,
+        LOST_HEARTBEAT,
+        NO_BOOT_TIME,
+        BLOCKED_ON_QUESTION,
+        PAUSED,
+        INACCESSIBLE,
+    }
+)
 
 
 def _event_type(event: Any) -> str:

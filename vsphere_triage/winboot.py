@@ -143,10 +143,17 @@ def summarize_windows_boot(parsed: dict[str, Any], *, since: datetime | None = N
     cutoff = since or (last_boot - RECENT_BEFORE_BOOT if last_boot else None)
     bugchecks_all = _decode_bugchecks(parsed.get("bugchecks") or [])
     bugchecks, old_bugchecks = _recent(bugchecks_all, cutoff)
-    service_timeouts, _ = _recent(parsed.get("service_timeouts") or [], cutoff)
-    boot_perf, _ = _recent(parsed.get("boot_performance") or [], cutoff)
-    dirty, _ = _recent(parsed.get("dirty_shutdown") or [], cutoff)
-    kernel_power, _ = _recent(parsed.get("kernel_power") or [], cutoff)
+    service_timeouts, old_timeouts = _recent(parsed.get("service_timeouts") or [], cutoff)
+    boot_perf, old_perf = _recent(parsed.get("boot_performance") or [], cutoff)
+    dirty, old_dirty = _recent(parsed.get("dirty_shutdown") or [], cutoff)
+    kernel_power, old_power = _recent(parsed.get("kernel_power") or [], cutoff)
+    older_events = {
+        "service_timeouts": old_timeouts,
+        "boot_performance": old_perf,
+        "dirty_shutdowns": old_dirty,
+        "kernel_power": old_power,
+    }
+    older_total = sum(len(rows) for rows in older_events.values())
     picture: list[str] = []
     latest_code = next((code for row in bugchecks for code in row["stop_codes"]), None)
     if latest_code:
@@ -173,10 +180,18 @@ def summarize_windows_boot(parsed: dict[str, Any], *, since: datetime | None = N
         picture.append("Startup Repair ran and left SrtTrail.txt — read it for its own diagnosis")
     if parsed.get("panther_present"):
         picture.append("a Windows Update Panther log is present — a 'Working on updates' hang is possible")
+    if older_total and cutoff:
+        # Not dropped: a VM that hung for more than a day before this boot has the
+        # hang's events here. Kept apart, named, for the reader to place in time.
+        picture.append(
+            f"{older_total} older boot event(s) from before {cutoff.astimezone(UTC):%Y-%m-%d %H:%M}Z "
+            "(service timeouts, unclean shutdowns, slow boots) — history unless the VM hung for over a "
+            "day before this boot; see older_events"
+        )
     if old_bugchecks:
         picture.append(
-            f"{len(old_bugchecks)} older bugcheck(s) from before {cutoff:%Y-%m-%d %H:%M}Z — history, not "
-            "this incident; see older_bugchecks"
+            f"{len(old_bugchecks)} older bugcheck(s) from before "
+            f"{cutoff.astimezone(UTC):%Y-%m-%d %H:%M}Z — history, not this incident; see older_bugchecks"
             if cutoff
             else f"{len(old_bugchecks)} older bugcheck(s)"
         )
@@ -186,10 +201,11 @@ def summarize_windows_boot(parsed: dict[str, Any], *, since: datetime | None = N
         "picture": picture
         or [
             "no boot faults found in the event log since "
-            + (f"{cutoff:%Y-%m-%d %H:%M}Z" if cutoff else "the newest events read")
+            + (f"{cutoff.astimezone(UTC):%Y-%m-%d %H:%M}Z" if cutoff else "the newest events read")
         ],
         "bugchecks": bugchecks,
         "older_bugchecks": old_bugchecks,
+        "older_events": older_events,
         "service_timeouts": service_timeouts,
         "boot_performance": boot_perf,
         "dirty_shutdowns": dirty,

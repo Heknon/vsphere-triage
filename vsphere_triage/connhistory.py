@@ -34,7 +34,8 @@ SESSION_EVENT_TYPES = (
 _FAILED = {"BadUsernameSessionEvent", "NoAccessUserEvent", "com.vmware.sso.LoginFailure"}
 _LOGIN = "UserLoginSessionEvent"
 # Sources that are vCenter itself (its own services), never a leaking client.
-LOCAL_SOURCES = frozenset({"127.0.0.1", "::1", "localhost", None, ""})
+# "unknown" is no source recorded at all: not a client either.
+LOCAL_SOURCES = frozenset({"127.0.0.1", "::1", "localhost", "unknown", None, ""})
 
 
 def summarize_session_events(

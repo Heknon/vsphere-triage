@@ -21,7 +21,7 @@ from typing import Any
 CATEGORIES: tuple[tuple[str, tuple[str, ...]], ...] = (
     # Power first: DRS's 'Drm.ExecuteVmPowerOnLRO' (initial placement of a power-on)
     # is a power-on, not a migration, and a routine burst of them is no vMotion wave.
-    ("power", ("poweroff", "poweron", "resetvm", "suspend", "rebootguest", "shutdown", "standbyguest")),
+    ("power", ("poweroff", "poweron", "resetvm", "suspend", "reboot", "shutdown", "standbyguest")),
     ("migration", ("relocate", "migrate", "vmotion", "drm.executevmotion")),
     ("reconfigure", ("reconfig",)),
     ("snapshot", ("snapshot", "consolidate")),

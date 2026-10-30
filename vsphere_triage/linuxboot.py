@@ -54,7 +54,9 @@ def boot_probe_shell() -> str:
         "echo ===JOURNAL===; journalctl -b -p warning -o short-iso --no-pager 2>/dev/null | tail -n 60;"
         # How many boots the journal holds: one means it is not persistent, and the
         # boot before a reboot (the one that hung) is gone.
-        "echo ===BOOTS===; journalctl --list-boots --no-pager 2>/dev/null | wc -l;"
+        # Count the boot rows only (they start with an index, 0 or -N): systemd 251+
+        # prints a header line, which a plain line count would take for a second boot.
+        "echo ===BOOTS===; journalctl --list-boots --no-pager 2>/dev/null | grep -cE '^ *-?[0-9]+ ';"
         "echo ===PREVIOUS===; journalctl -b -1 -p warning -o short-iso --no-pager 2>/dev/null | tail -n 60;"
         "echo ===END==="
     )
