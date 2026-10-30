@@ -349,6 +349,10 @@ def test_snapshot_findings_roll_up_to_the_template_even_when_clones_are_renamed(
     assert cool["clones"] == 2
     assert set(cool["names"]) == {"coolwin-blue", "coolwin-green"}
     assert any("template-wide" in finding for finding in result["findings"])
+    # vcsim reports no snapshot file sizes: said as unknown, not as 0 GB.
+    assert all(vm["total_gb"] is None for vm in result["vms"])
+    assert "no size reported" in result["findings"][0]
+    assert not any("0.0 GB" in finding for finding in result["findings"])
 
 
 def test_resource_limits_carry_the_template_base_disk(server: MCPServer) -> None:

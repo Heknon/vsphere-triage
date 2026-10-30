@@ -700,7 +700,7 @@ def fleet(work: Path) -> tuple[World, World]:
             base_disk="[LocalDS_0] tmpl-coolwin/tmpl-coolwin.vmdk",
             tools="guestToolsRunning",
             heartbeat="green",
-            cpu_mhz=400,
+            cpu_mhz=590,  # at its 600 MHz limit: throttled by it
             cpu_limit_mhz=600,
             mem_size_mb=8192,
             mem_limit_mb=2048,

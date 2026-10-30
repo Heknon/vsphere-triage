@@ -1413,20 +1413,26 @@ def test_a_memory_limit_below_configured_ram_flags_memory_limited() -> None:
 
 
 def test_a_vm_that_is_up_but_capped_names_its_limits_and_says_it_is_up() -> None:
-    machine = vm(
-        tools_running="guestToolsRunning",
-        heartbeat="green",
-        cpu_mhz=400.0,
-        cpu_limit_mhz=600,
-        memory_mb=8192,
-        memory_limit_mb=2048,
-    )
+    def capped(cpu_mhz: float) -> VmFacts:
+        return vm(
+            tools_running="guestToolsRunning",
+            heartbeat="green",
+            cpu_mhz=cpu_mhz,
+            cpu_limit_mhz=600,
+            memory_mb=8192,
+            memory_limit_mb=2048,
+        )
 
-    result = _conclude_on(machine)
+    at_limit = _conclude_on(capped(590.0))
+    under_limit = _conclude_on(capped(200.0))
 
-    causes = [cause["cause"] for cause in result["causes"]]
+    causes = [cause["cause"] for cause in at_limit["causes"]]
     assert causes[:2] == [diagnose.CPU_LIMIT_CAUSE, diagnose.MEMORY_LIMIT_CAUSE]
-    assert "VM up (Tools running)" in result["headline"]
+    assert "at the limit" in at_limit["causes"][0]["for"][0]
+    assert "VM up (Tools running)" in at_limit["headline"]
+    limit = next(cause for cause in under_limit["causes"] if cause["cause"] == diagnose.CPU_LIMIT_CAUSE)
+    assert "not holding it back" in limit["for"][0]
+    assert limit["score"] < at_limit["causes"][0]["score"]
 
 
 def test_a_cpu_limit_on_a_stuck_vm_is_weighed_as_throttled_not_host_starvation() -> None:

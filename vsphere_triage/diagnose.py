@@ -112,6 +112,8 @@ DIAGNOSE_PATHS = (
     "layoutEx",
 )
 LAYOUT_TTL_SECONDS = 60.0
+# A VM using this share of its CPU limit is running at the limit, held back by it.
+LIMIT_BINDING_SHARE = 0.9
 EVENTS_KEPT = 40
 HOST_LOG_LINES = 2000
 SERIAL_BYTES = 256 * 1024
@@ -741,13 +743,17 @@ def conclude(  # noqa: C901, PLR0912, PLR0913, PLR0915 - one ordered list of cau
     if HEARTBEAT_INTERMITTENT in verdict.flags:
         evidence(TOOLS_FLAPPING_CAUSE, weight=2, text="Tools runs but its heartbeat is intermittent (yellow)")
     if CPU_LIMITED in verdict.flags and verdict.state not in (OFF, SUSPENDED):
-        # Strongest when it is stuck; on a VM that is up but slow it is still the
-        # first thing to rule out, since it looks exactly like host starvation.
+        # Strongest when it is stuck, or running at the limit; a VM well under its
+        # limit is not being held back by it right now, only capped for a burst.
+        limit, used = values.get("cpu_limit_mhz") or 0, values.get("cpu_mhz") or 0
+        binding = bool(limit) and used >= LIMIT_BINDING_SHARE * limit
+        stuck = verdict.state in (BUSY_NOT_UP, HUNG, BOOTED_NOT_UP)
         evidence(
             CPU_LIMIT_CAUSE,
-            weight=3 if verdict.state in (BUSY_NOT_UP, HUNG, BOOTED_NOT_UP) else 2,
-            text=f"a CPU limit of {values.get('cpu_limit_mhz')} MHz is set: the VM is capped below its "
-            "full speed, which looks like host starvation but is configured, not the host",
+            weight=3 if stuck or binding else 1,
+            text=f"a CPU limit of {limit} MHz is set (using {used:g} MHz now"
+            + (", at the limit" if binding else ", under it, so not holding it back at this moment")
+            + "): a limit looks like host starvation but is configured, not the host",
         )
     if MEMORY_LIMITED in verdict.flags and MEMORY_RECLAIMED in verdict.flags:
         evidence(
