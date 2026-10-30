@@ -66,8 +66,12 @@ def environments(
     by_folder: dict[str, list[VmFacts]] = {}
     for vm in inventory.vms:
         if under_any(vm.folder_path, under):
-            # A VM in a vApp has no parent folder; it is grouped, not dropped.
-            by_folder.setdefault(vm.folder_moref or OUTSIDE_FOLDERS, []).append(vm)
+            # A VM in a vApp has no parent folder: grouped by its own vApp, not dropped,
+            # and never merged with the VMs of other vApps.
+            key = vm.folder_moref or (
+                f"{OUTSIDE_FOLDERS} {vm.vapp_moref}" if vm.vapp_moref else OUTSIDE_FOLDERS
+            )
+            by_folder.setdefault(key, []).append(vm)
     old, unknown = [], []
     for moref, vms in by_folder.items():
         folder = inventory.folders.get(moref)
@@ -76,7 +80,7 @@ def environments(
         states = Counter(verdict.state for verdict in verdicts.values())
         entry: dict[str, Any] = {
             "vcenter": inventory.vcenter,
-            "environment": folder.name if folder else (OUTSIDE_FOLDERS if moref == OUTSIDE_FOLDERS else None),
+            "environment": folder.name if folder else (moref if moref.startswith(OUTSIDE_FOLDERS) else None),
             "folder": folder.path if folder else None,
             "parent": folder.parent_name if folder else None,
             # The datacenter's own VM folder holds VMs outside any environment.

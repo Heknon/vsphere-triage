@@ -2193,3 +2193,69 @@ def test_a_still_update_screen_is_still_read_as_working() -> None:
 
     assert result["causes"][0]["cause"] == diagnose.STILL_WORKING
     assert diagnose.EARLY_HANG not in [entry["cause"] for entry in result["causes"]]
+
+
+# -- round three ------------------------------------------------------------------------------
+
+
+def test_an_old_panic_matching_several_kinds_is_weighed_once() -> None:
+    serial = {
+        "available": True,
+        "files": [
+            {
+                "windows_stop_codes": [],
+                "linux_findings": [],
+                "linux_findings_earlier_boots": [
+                    {"kind": kind, "points_at": None, "count": 1, "examples": ["x"]}
+                    for kind in ("kernel_panic", "hung_task", "oops")
+                ],
+            }
+        ],
+    }
+
+    result = conclude(serial=serial)
+
+    kernel = next(entry for entry in result["causes"] if entry["cause"] == diagnose.KERNEL_ERROR)
+    assert kernel["score"] == 1
+
+
+def test_a_login_prompt_on_a_dark_screen_is_not_a_blank_hang() -> None:
+    image = Image.new("RGB", (640, 480))
+    for x in range(10, 120):  # a line of light text, "host login:"
+        for y in range(10, 22):
+            if (x + y) % 3:
+                image.putpixel((x, y), (200, 200, 200))
+    buffer = io.BytesIO()
+    image.save(buffer, format="PNG")
+    capture = buffer.getvalue()
+
+    read = console.read_captures([capture, capture], black_fraction=0.98, frozen_difference=0.5)
+
+    assert read["black"] is True
+    assert read["text_on_black"] is True
+    result = conclude(console={"available": True, "screen_states": [], "stop_codes": [], **read})
+    assert diagnose.EARLY_HANG not in [entry["cause"] for entry in result["causes"]]
+
+
+def test_a_truly_black_screen_still_has_no_text() -> None:
+    buffer = io.BytesIO()
+    Image.new("RGB", (640, 480)).save(buffer, format="PNG")
+
+    read = console.read_captures([buffer.getvalue()] * 2, black_fraction=0.98, frozen_difference=0.5)
+
+    assert read["black"] is True
+    assert read["text_on_black"] is False
+
+
+def test_an_absurd_look_back_is_capped_without_overflowing() -> None:
+    from vsphere_triage.server import MAX_LOOKBACK, _ago  # noqa: PLC0415
+
+    assert _ago(minutes=10**13) == MAX_LOOKBACK
+
+
+def test_a_session_expiry_inside_a_diagnosis_piece_reaches_the_pool() -> None:
+    def expire() -> dict:
+        raise vim.fault.NotAuthenticated
+
+    with pytest.raises(vim.fault.NotAuthenticated):
+        diagnose.piece("events", expire)

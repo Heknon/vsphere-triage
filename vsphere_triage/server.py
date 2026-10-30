@@ -170,8 +170,13 @@ MAX_LOOKBACK = timedelta(days=366)
 
 def _ago(*, minutes: float = 0, hours: float = 0, least: timedelta = timedelta(minutes=1)) -> timedelta:
     """A caller's look-back as a timedelta: at least `least`, at most `MAX_LOOKBACK`."""
-    seconds = minutes * 60 + hours * 3600
-    return min(max(timedelta(seconds=max(seconds, 0)), least), MAX_LOOKBACK)
+    # Clamped as a number first: a timedelta of a huge number would itself overflow.
+    seconds = min(max(minutes * 60 + hours * 3600, least.total_seconds()), MAX_LOOKBACK.total_seconds())
+    return timedelta(seconds=seconds)
+
+
+def _clock(moment: datetime | None) -> str:
+    return moment.strftime("%Y-%m-%d %H:%M:%SZ") if moment else "unknown"
 
 
 def _ordered(begin: datetime, end: datetime) -> tuple[datetime, datetime]:
@@ -342,8 +347,9 @@ def _register_fleet_tools(  # noqa: C901, PLR0915 - one closure per tool
             sessions = result.get("sessions", {})
             if sessions.get("total") is not None:
                 findings.append(
-                    f"{result['name']}: {sessions['total']} open sessions, last login "
-                    f"{result['login_seconds']}s, round trip {result['round_trip_seconds']}s"
+                    f"{result['name']}: {sessions['total']} open sessions, this server's last login "
+                    f"took {result['login_seconds']}s (at {_clock(result['login_at'])}), "
+                    f"round trip now {result['round_trip_seconds']}s"
                 )
         return {"vcenters": rows, "findings": findings or ["all configured vCenters reachable"]}
 

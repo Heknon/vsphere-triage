@@ -28,6 +28,8 @@ if TYPE_CHECKING:
 VM_PATHS = (
     "name",
     "parent",
+    # A VM inside a vApp has no parent folder; the vApp is what groups it.
+    "parentVApp",
     "config.template",
     "config.instanceUuid",
     "config.createDate",
@@ -135,6 +137,7 @@ class VmFacts:
     name: str
     folder: str | None = None
     folder_moref: str | None = None
+    vapp_moref: str | None = None
     folder_path: str | None = None
     folder_parent: str | None = None
     datacenter: str | None = None
@@ -1040,6 +1043,9 @@ def vm_facts(  # noqa: C901, PLR0913, PLR0915 - one flattening of one row
 ) -> VmFacts:
     """Flatten one property-collector row into `VmFacts`, noting what disagrees."""
     facts = VmFacts(vcenter=vcenter, moref=row["moref"], name=row.get("name", row["moref"]), read_at=read_at)
+    vapp = row.get("parentVApp")
+    if vapp is not None:
+        facts.vapp_moref = vapp._moId  # noqa: SLF001
     parent = row.get("parent")
     if parent is not None and isinstance(parent, vim.Folder):
         folder = folders.get(parent._moId)  # noqa: SLF001

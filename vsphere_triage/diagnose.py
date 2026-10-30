@@ -136,7 +136,12 @@ class Layout:
         if hit and time.monotonic() - hit[0] < LAYOUT_TTL_SECONDS:
             return hit[1]
         layout = cls(session)
-        cls._cache[key] = (time.monotonic(), layout)
+        now = time.monotonic()
+        # Drop expired entries (older sessions and generations) so a long-running
+        # server's cache does not grow with every re-login.
+        for stale in [name for name, (at, _) in cls._cache.items() if now - at >= LAYOUT_TTL_SECONDS]:
+            cls._cache.pop(stale, None)
+        cls._cache[key] = (now, layout)
         return layout
 
 
@@ -227,6 +232,8 @@ def locate(  # noqa: C901, PLR0911, PLR0912 - one lookup, each way it can fail b
                 matches.append((folder, vm, row))
     if len(matches) == 1:
         folder, vm, row = matches[0]
+        # Nested matching folders: name the folder the VM actually sits in.
+        folder = next((item for item in candidates if item.moref == vm.folder_moref), folder)
         if len(candidates) > 1:
             vm.notes.append(f"{len(candidates)} folders match {env_id!r}; the VM was found in {folder.path}")
         return {"found": True, "vm": vm, "row": row, "layout": layout, "folder": folder}
@@ -270,6 +277,8 @@ def piece(name: str, work: Callable[[], dict[str, Any]]) -> dict[str, Any]:
     """Run one part of a diagnosis; if it fails, say what failed and go on."""
     try:
         return work()
+    except vim.fault.NotAuthenticated:
+        raise  # the session expired: let the pool re-login and run the diagnosis again
     except VSphereError as error:
         return {"available": False, "reason": str(error)}
     except Exception as error:  # noqa: BLE001 - a missing piece must not fail the whole
@@ -675,14 +684,13 @@ def conclude(  # noqa: C901, PLR0912, PLR0913, PLR0915 - one ordered list of cau
                 evidence(STORAGE, weight=1, text=f"{label} usually means {hint}")
             if hint.startswith("CPU"):
                 evidence(CPU, weight=1, text=f"{label} usually means {hint}")
-        for finding in item.get("linux_findings_earlier_boots", []):
+        earlier = item.get("linux_findings_earlier_boots", [])
+        if earlier:
             # A panic before the latest boot: often the very crash a kdump or capture
-            # kernel (which prints its own banner) then booted after. Weighed lightly.
-            evidence(
-                KERNEL_ERROR,
-                weight=1,
-                text=f"serial console, an earlier boot: {finding['kind']}: {finding['examples'][0]}",
-            )
+            # kernel (which prints its own banner) then booted after. Weighed once, lightly,
+            # however many kinds it matched, so an old crash cannot outweigh today's cause.
+            kinds = ", ".join(finding["kind"] for finding in earlier)
+            evidence(KERNEL_ERROR, weight=1, text=f"serial console, an earlier boot: {kinds}")
         for finding in item.get("linux_findings", []):
             evidence(
                 KERNEL_ERROR, weight=3, text=f"serial console: {finding['kind']}: {finding['examples'][0]}"
@@ -710,7 +718,15 @@ def conclude(  # noqa: C901, PLR0912, PLR0913, PLR0915 - one ordered list of cau
                 evidence(CANNOT_BOOT, weight=4, text=f"console: {state['meaning']}")
             elif name in ("windows_logon", "linux_login"):
                 evidence(TOOLS_DID_NOT_START, weight=4, text=f"console: {state['meaning']}")
-        if console.get("frozen") and console.get("black"):
+        if console.get("frozen") and console.get("text_on_black"):
+            # A text console or login prompt, which is mostly black but not blank:
+            # the guest got far enough to print, so this is no early hang.
+            evidence(
+                TOOLS_DID_NOT_START,
+                weight=1,
+                text="console shows text on a dark screen (a text console or login prompt), unchanged",
+            )
+        elif console.get("frozen") and console.get("black"):
             evidence(EARLY_HANG, weight=2, text="console black and unchanged across captures")
         elif console.get("frozen"):
             # A boot screen that does not move is not a boot that is progressing; but
