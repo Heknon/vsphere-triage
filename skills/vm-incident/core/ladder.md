@@ -6,42 +6,42 @@ bottom.
 
 The verdict you are building is in `core/verdict.md`. Fill it in as you climb.
 
-## Rung 1 — Sahara: what failed, which environment, when
+## Rung 1 — your orchestrator: what failed, which environment, when
 
-The Sahara MCP holds the test results. From the VMware Tools error:
+Your orchestrator or monitoring holds the test results. From the VMware Tools
+error:
 
-1. `summarize_failures` on the cycle when more than a few tests failed: it
-   groups them, so you read the handful of distinct problems. A Tools error
-   spanning several environments is an infrastructure problem; one confined to
-   one environment is that environment's.
+1. Group the failures when more than a few tests failed, so you read the handful
+   of distinct problems. A Tools error spanning several environments is an
+   infrastructure problem; one confined to one environment is that environment's.
 2. From the failing step and its logs, read **the vCenter, the machine name and
    the environment id** out of the error's extra data, and **the time of the
    reboot**. These three plus the time are the whole of what the lower rungs
    need. Write them into the verdict's *identity* line.
 
-If Sahara is not reachable, a person gives you the vCenter, env id, machine and
-time; say you are starting at rung 3 on their word.
+If the orchestrator is not reachable, a person gives you the vCenter, env id,
+machine and time; say you are starting at rung 3 on their word.
 
-## Rung 2 — Sims / Twix: what Sims did, and how long it waited
+## Rung 2 — the creator/runner: what it did, and how long it waited
 
-In Elastic, for that environment id and time window:
+In your log store, for that environment id and time window:
 
-1. What Sims asked the vCenter to do (create, reboot, destroy) and when.
-2. What the vCenter answered, and any error Sims logged.
-3. **How long Sims or Sahara waited for the machine before giving up.** This is
+1. What the orchestrator asked the vCenter to do (create, reboot, destroy) and when.
+2. What the vCenter answered, and any error it logged.
+3. **How long the orchestrator waited for the machine before giving up.** This is
    the number that turns a slow boot into a Tools error. Write it into the
    verdict; a VM that comes up in nine minutes is not broken if the wait was
    fifteen, and is "lost to a timeout" if the wait was five.
 
-If Elastic is not reachable, say so and climb on; the vCenter rungs do not
+If the log store is not reachable, say so and climb on; the vCenter rungs do not
 depend on it, but the "slow vs timed out" judgement is weaker without the wait.
 
 ## Rung 3 — vCenter: the machine, and the infrastructure under it
 
-This is the rung the `vsphere-mcp` server was built for. Pick the entry that
+This is the rung the `vsphere-triage` server was built for. Pick the entry that
 matches how you came in.
 
-### From a Sahara error — one machine
+### From a Tools error — one machine
 
 `diagnose_vm(vcenter, env_id=…, vm_name=…)`. One call runs every check in a
 fixed order and returns a `finding`, a `conclusion` (causes with evidence for
@@ -60,7 +60,7 @@ Read it in this order, which is invariants 2–5 made concrete:
    do too (argues against it).
 3. **`cpu`** and **`storage`** — the two recurring causes. `cpu.host` over 100%
    demand with the VM's `vm_ready_percent_per_vcpu` high is starvation.
-   `storage.where` says device (the array / PowerFlex) or the host's own queue.
+   `storage.where` says device (the storage array) or the host's own queue.
 4. **`conclusion.causes`** — already weighed, strongest first, each with
    `confidence` and the evidence lists. This is your draft verdict; do not
    discard it, but check it against `core/correlation.md` before you trust it.

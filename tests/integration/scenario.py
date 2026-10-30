@@ -777,7 +777,7 @@ def fleet(work: Path) -> tuple[World, World]:
         ),
     ]
     a = build(
-        "vsphere-mcp-test-a",
+        "vsphere-triage-test-a",
         [
             "environments/env-1001",
             "environments/env-1002",
@@ -792,7 +792,7 @@ def fleet(work: Path) -> tuple[World, World]:
         work=work,
     )
     b = build(
-        "vsphere-mcp-test-b",
+        "vsphere-triage-test-b",
         ["projects/env-2001", "projects/env-20015", "projects/env-1001", "projects/team-x/env-3001"],
         b_machines,
         work=work,

@@ -1,6 +1,6 @@
 ---
 name: vm-incident
-description: Diagnose why a Sahara test environment's machines are stuck or unreachable, from the symptom to a named cause, across the four layers Sahara, Sims/Twix, vCenter and vROps. Use when Sahara reports VMware Tools errors, a machine is stuck on boot or after a reboot, hung mid-run, slow to come up, an environment will not come up, a test hangs waiting for its environment, a machine is blocked on a VM question or wedged by a virtual device (a disconnected adapter, a stuck ISO), or someone asks to find stuck, hung or leftover VMs across the vCenters and understand why. Also when the vCenter API itself is failing - SSL EOF errors, connection resets or timeouts, often connection or session exhaustion. Covers the recurring causes seen here - ESXi CPU overcommit and PowerFlex storage saturation - and tells a VM that is booting slowly from one that is hung. It reads; it changes nothing. Written so the answer comes from a ladder and a cause table, not from judgment.
+description: Diagnose why a test environment's machines are stuck or unreachable across a vSphere fleet, from the symptom to a named cause, with the evidence for and against. Use when your monitoring or orchestrator reports VMware Tools errors, a machine is stuck on boot or after a reboot, hung mid-run, slow to come up, an environment will not come up, a test hangs waiting for its environment, a machine is blocked on a VM question or wedged by a virtual device (a disconnected adapter, a stuck ISO), or someone asks to find stuck, hung or leftover VMs across the vCenters and understand why. Also when the vCenter API itself is failing - SSL EOF errors, connection resets or timeouts, often connection or session exhaustion. Covers the recurring causes - ESXi CPU overcommit and storage-array saturation - and tells a VM that is booting slowly from one that is hung. It reads; it changes nothing. Written so the answer comes from a ladder and a cause table, not from judgment.
 ---
 
 # VM incident
@@ -18,7 +18,7 @@ all this skill's work. So is a vCenter that is throwing SSL EOF errors or
 resetting connections — see "When the vCenter is the problem" below.
 
 The machines are short-lived (minutes to a day), their names are reused by the
-next environment, and they are spread by load across nine vCenters. So the
+next environment, and they are spread by load across the fleet's vCenters. So the
 first rule is the one that everything else rests on: **carry the identity, not
 the name.** A VM is its vCenter and its moref. A name means something only
 inside its environment folder.
@@ -28,27 +28,29 @@ Read this file, then load only the file the step names. Every path ends in a
 means you write what is missing and ask a person.
 
 This skill does not act. Every tool it calls reads. It never powers, resets,
-answers a question, or changes a VM: that is Sims' job and a person's decision.
-When the evidence says an action is needed, the verdict says which, and stops.
+answers a question, or changes a VM: that is the orchestrator's job and a
+person's decision. When the evidence says an action is needed, the verdict says
+which, and stops.
 
 ## The four layers, and the tools for each
 
 | Layer | Holds | Reached by |
 | --- | --- | --- |
-| **Sahara** | the failing tests, the environment id, the machine names, the reboot time, the VMware Tools error | the Sahara MCP |
-| **Sims / Twix** | what Sims asked the vCenter and when, its errors, how long it waited | their logs in Elastic |
-| **vCenter** (×9) | live VM state, console, `vmware.log`, events, host and datastore counters | the `vsphere-mcp` server (read-only) |
-| **vROps** | days of host, cluster and datastore history; alerts | `vsphere-mcp`'s `vrops_*` tools |
+| **Your orchestrator / monitoring** | the failing tests, the environment id, the machine names, the reboot time, the VMware Tools error | its own tools or logs |
+| **The creator/runner** | what it asked the vCenter and when, its errors, how long it waited for the machine | your log store |
+| **vCenter** (the fleet) | live VM state, console, `vmware.log`, events, host and datastore counters | the `vsphere-triage` server (read-only) |
+| **vROps** (optional) | days of host, cluster and datastore history; alerts | `vsphere-triage`'s `vrops_*` tools |
 
-If the `vsphere-mcp` tools are not present, stop and ask: this skill cannot
-reach vCenter without them. If the Sahara MCP or Elastic is not present, say
-which rungs of the ladder you cannot climb, and work the ones you can.
+If the `vsphere-triage` tools are not present, stop and ask: this skill cannot
+reach vCenter without them. If your orchestrator's tools or log store are not
+present, say which rungs of the ladder you cannot climb, and work the ones you
+can.
 
 ## The two ways in
 
 | You have | Start at |
 | --- | --- |
-| A Sahara VMware Tools error (it names the vCenter, the env id, the machine) | `core/ladder.md`, rung 3: `diagnose_vm` |
+| A VMware Tools error from your monitoring (it names the vCenter, the env id, the machine) | `core/ladder.md`, rung 3: `diagnose_vm` |
 | A question about the fleet ("anything stuck on these vCenters?") | `core/ladder.md`, rung 3: `scan`, then `explain_group` |
 | An incident from earlier, the environment now gone | `core/ladder.md`, rung 3: `diagnose_window` |
 | "Which environments have lived too long?" | `find_old_environments`; this is a cleanup question, not an incident — read `core/ladder.md` only if the old ones are also stuck |
@@ -59,9 +61,9 @@ VM's counters mean nothing without the time and the symptom from the top.
 ## When the vCenter is the problem, not a VM
 
 Sometimes the symptom is the vCenter API itself: SSL EOF errors, connection
-resets, or timeouts, hitting Sims, Sahara and this server alike. That is not a
-stuck VM — it is usually the vCenter at its connection or session limit, and no
-amount of looking at one machine explains it.
+resets, or timeouts, hitting every client that talks to the vCenter, this
+server included. That is not a stuck VM — it is usually the vCenter at its
+connection or session limit, and no amount of looking at one machine explains it.
 
 Start with **`check_vcenters`** for the counts, then **`vcenter_sessions`** on
 the vCenter that is throwing errors: it groups the open sessions by user, source
@@ -122,7 +124,7 @@ on a starved host is still starved.
 
 3. **Shared cause before guest cause.** Read the host and the storage before
    blaming the guest. Both recurring causes here are shared infrastructure:
-   ESXi CPU overcommit and PowerFlex storage saturation.
+   ESXi CPU overcommit and storage-array saturation.
 
 4. **A healthy neighbour is evidence.** Before blaming a host, datastore or
    base disk, check whether the *healthy* VMs beside the stuck ones share it.
@@ -130,8 +132,8 @@ on a starved host is still starved.
    report this; read it.
 
 5. **Starved is not hung.** A VM busy on CPU with a changing console is booting
-   slowly, not hung; the Tools error is then a timeout in Sims or Sahara, not a
-   dead VM. `core/causes.md` has the split. Say which in the verdict.
+   slowly, not hung; the Tools error is then a timeout in the orchestrator, not
+   a dead VM. `core/causes.md` has the split. Say which in the verdict.
 
 6. **A shared timestamp is not a cause.** Name the evidence for each claim, the
    competing explanation, and the one check that would separate them
@@ -139,11 +141,12 @@ on a starved host is still starved.
 
 7. **Missing data is not "nothing happened".** A tool that says "no events in
    window", "counters not kept at this statistics level", "console endpoint
-   404", "PowerFlex not configured" or "VM destroyed" has told you what it could
+   404", "vROps not configured" or "VM destroyed" has told you what it could
    not see. Record it as a gap; do not read it as a clean result.
 
-8. **Clocks differ.** Sahara, Sims, each ESXi host, vCenter and vROps keep their
-   own clocks, and every result is in UTC with its source's clock named. A
+8. **Clocks differ.** Your orchestrator, your log store, each ESXi host, vCenter
+   and vROps keep their own clocks, and every result is in UTC with its source's
+   clock named. A
    correlation across layers is only as good as the alignment; when two clocks
    disagree by more than the window, say so.
 
@@ -161,8 +164,8 @@ action for a person. Nothing more; no cause the data does not support.
 
 The `vsphere-triage` tool names, result shapes and thresholds in this skill are
 those of the server in this repository (the README is the reference).
-The recurring causes — host CPU demand past 100%, PowerFlex datastore latency
-in the hundreds of milliseconds — are the two incidents this fleet has seen;
+The recurring causes — host CPU demand past 100%, datastore/array latency
+in the hundreds of milliseconds — are the two this skill is tuned for;
 `core/causes.md` carries the rest. When a tool's result shape here and the
 server disagree, the server is right and this skill is stale: say so.
 

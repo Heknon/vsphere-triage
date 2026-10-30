@@ -10,7 +10,7 @@ population-before-individual and the linked-clone base disk.
 
 ## Rungs
 
-1. **Sahara.** The errors span ~12 environments on vc-04, all after a reboot
+1. **Orchestrator.** The errors span ~12 environments on vc-04, all after a reboot
    around 02:10. No single environment; this is infrastructure. Skip to the
    fleet entry.
 

@@ -1,11 +1,10 @@
-# Using it with an orchestrator (e.g. Sahara)
+# Using it with an orchestrator
 
 The server is generic: it discovers each vCenter's layout and never hard-codes a
 folder path, a naming pattern or a product. Nothing below is required to run it.
 This page is how to make it fit a platform that creates short-lived VMs in
 per-environment folders and raises VMware Tools errors when one does not come
-up — Sahara is the example it was first built for, but any orchestrator with the
-same shape fits the same way.
+up. Any orchestrator with that shape fits the same way.
 
 The integration is two things: **configuration** (so the server speaks your
 layout's vocabulary) and **a skill** (so the model follows your incident
@@ -44,8 +43,7 @@ skills channel, not `pip install`.
 An orchestrator-specific skill names the layers above vCenter that the server
 cannot see (the orchestrator's own logs, the system that waited for Tools, your
 metrics store) and threads them into the diagnosis the server produces. The
-`vm-incident` skill in this repository is such a procedure written for the
-Sahara stack (its orchestrator, its creator/runner, its metrics). Treat it as a
+`vm-incident` skill in this repository is such a procedure. Treat it as a
 template: keep the rungs that read this server's tools, and swap the top rungs
 for your own platform's logs and timeouts.
 

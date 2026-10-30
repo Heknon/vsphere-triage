@@ -21,7 +21,7 @@ One VM has exactly one state. The state is the symptom; the cause is below it.
 | `lost_heartbeat` | Tools was up, heartbeat red | the guest or Tools died after boot |
 | `inaccessible` | vCenter cannot reach it | the host's connection state |
 | `no_boot_time` | powered on, no boot time reported | fall back to the console and events |
-| `suspended`, `off` | as named | whether Sims did it (rung 2) |
+| `suspended`, `off` | as named | whether the orchestrator did it (rung 2) |
 
 ## The causes
 
@@ -29,7 +29,7 @@ One VM has exactly one state. The state is the symptom; the cause is below it.
 | --- | --- | --- |
 | **ESXi CPU overcommit** | affected VMs on hosts past 100% demand; `vm_ready_percent_per_vcpu` high during boot; CPU busy, console changing; Windows clock-watchdog `0x101` or Linux soft lockup | host below capacity; ready time low; the VM uses almost no CPU |
 | **A configured CPU limit (not the host)** | `diagnose_vm` / `scan` flags `cpu_limited`, or `find_resource_limits` lists it: a CPU limit (MHz) is set, so the VM is capped below full speed — the same symptom as starvation. A linked clone inherits it from its template | no CPU limit set; the host itself is overcommitted (then it is starvation, not a config cap) |
-| **PowerFlex / storage saturation** | affected VMs share datastores on one pool; device latency and IOPS high in the boot window; a rebuild or a noisy volume; Windows `0x7A`/`0x77`/`0xF4`/`0x7B`; `vmkernel` path or latency warnings | latency normal; the healthy VMs boot fine from the same datastore |
+| **Storage-array / datastore saturation** | affected VMs share datastores on one pool; device latency and IOPS high in the boot window; a rebuild or a noisy volume; Windows `0x7A`/`0x77`/`0xF4`/`0x7B`; `vmkernel` path or latency warnings | latency normal; the healthy VMs boot fine from the same datastore |
 | **Datastore full, over-provisioned, or APD/PDL** | `check_datastores`: the datastore is nearly full (a thin disk then stalls on write), thin disks are provisioned past capacity, or a host has it mounted but unreachable (all-paths-down / permanent-device-loss) — every VM on it there wedges at once. A datastore holding a template's base disk takes every clone down | the datastore has room, is under capacity, and every host reaches it |
 | **Linked-clone boot storm** | many clones of one base disk stuck together, while clones of other bases are fine; the shared datastore slow | clones of the same base booted fine at the same time |
 | **Host memory pressure** | the VM's host near memory capacity; the VM ballooned, swapped or compressed (`memory_reclaimed` flag) | host memory healthy; nothing reclaimed |
@@ -44,7 +44,7 @@ One VM has exactly one state. The state is the symptom; the cause is below it.
 | **Guest hung early in boot** | near-zero CPU; console black and unchanged across two captures; `vmware.log` stops after the firmware or the first disk I/O; host and storage healthy | the console changes; the boot reached the drivers or Tools |
 | **Guest booted, Tools did not start** | a logon prompt or a guest IP reported; Tools not running; host and storage healthy | Tools running |
 | **The host fell off vCenter** | `host_not_connected` flag; many VMs on that host inaccessible at once | the host is connected |
-| **Something reset or moved it** | HA, migration or reset events not from Sims (rung 2) in the window | no such event |
+| **Something reset or moved it** | HA, migration or reset events not from the orchestrator (rung 2) in the window | no such event |
 
 ## Starved versus hung — the split that matters most here
 
@@ -62,7 +62,7 @@ readings, in order:
    *shared* cause: look at the host's other VMs, not this one.
 
 Write the split explicitly: "booting slowly under CPU starvation, would have
-come up after the Sims timeout" is a different verdict, and a different fix,
+come up after the orchestrator's timeout" is a different verdict, and a different fix,
 from "hung in early boot".
 
 ## The stop codes worth knowing

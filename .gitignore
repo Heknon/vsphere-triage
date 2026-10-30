@@ -3,6 +3,5 @@ __pycache__/
 .ruff_cache/
 *.egg-info/
 .venv/
-uv.lock
 dist/
 build/

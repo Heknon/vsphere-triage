@@ -27,6 +27,10 @@ dependencies = [
 [project.optional-dependencies]
 # OCR of the console screen. Needs the tesseract binary on PATH as well.
 ocr = ["pytesseract>=0.3.10"]
+
+[dependency-groups]
+# Dev tooling. A uv dependency-group (installed by default by `uv sync` /
+# `uv run`), not a published extra.
 dev = ["pytest>=8", "ruff>=0.16.7,<0.17", "ty>=0.0.1a10"]
 
 [project.scripts]

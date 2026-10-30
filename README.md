@@ -5,10 +5,9 @@ back after a reboot, or keep losing VMware Tools — across a fleet of vCenters
 where VMs are short-lived and their names are reused. It sweeps the fleet,
 groups the abnormal VMs by what they share, weighs the causes, and ends in a
 verdict. It discovers each vCenter's layout rather than assuming it, so it is
-not tied to any one platform; it plugs into an orchestrator like Sahara through
-configuration and a skill (see [Using it with an
-orchestrator](docs/orchestrator-integration.md)). The design it implements is in
-[`docs/design.md`](docs/design.md).
+not tied to any one platform; it plugs into whatever orchestrator creates your
+VMs through configuration and a skill (see [Using it with an
+orchestrator](docs/orchestrator-integration.md)).
 
 This repo ships two things: the **MCP server** (the `vsphere_triage` package,
 installed as the `vsphere-triage` command) and a **diagnosis skill** under
@@ -234,13 +233,19 @@ fit a context window.
   (Windows EMS, a Linux kernel console) and the console screen. A VM without
   them is normal and the result says so.
 
-## Testing
+## Developing and testing
+
+The project is managed with [uv](https://docs.astral.sh/uv/); `uv.lock` is
+committed, so `uv sync` reproduces the exact dev environment (the `dev`
+dependency group — pytest, ruff, ty — installs by default). CI runs `uv sync
+--frozen`.
 
 ```sh
-uv run --extra dev python -m pytest -m "not integration"   # the fast unit suite (what CI runs)
-uv run --extra dev python -m pytest                         # everything, including the vcsim integration tests
-uv run --extra dev ruff check . && uv run --extra dev ruff format --check .
-uv run --extra dev ty check vsphere_triage                  # type check (Astral's ty)
+uv sync                                        # set up the dev environment from the lock
+uv run python -m pytest -m "not integration"   # the fast unit suite (what CI runs)
+uv run python -m pytest                         # everything, including the vcsim integration tests
+uv run ruff check . && uv run ruff format --check .
+uv run ty check vsphere_triage                  # type check (Astral's ty)
 ```
 
 Lint is `ruff` with `select = ["ALL"]` (a short, documented ignore list in

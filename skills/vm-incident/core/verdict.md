@@ -5,7 +5,7 @@ are the whole of what you say; no cause the evidence does not carry.
 
 ```
 ## Symptom
-<what was seen, copied: the Sahara Tools error, which tests, when; or the fleet question asked>
+<what was seen, copied: the VMware Tools error, which tests, when; or the fleet question asked>
 
 ## Identity
 <the machine(s) as vcenter + moref, the environment id and its folder path, the vCenter,
@@ -15,14 +15,14 @@ are the whole of what you say; no cause the evidence does not carry.
 <the likely cause from core/causes.md, with its confidence, and:
  for:     <each piece of evidence, with the number it rests on>
  against: <each piece that argues the other way, including healthy neighbours sharing the blamed thing>
- If busy_not_up: say explicitly whether it is booting slowly (and whether past the Sims timeout) or hung.>
+ If busy_not_up: say explicitly whether it is booting slowly (and whether past the orchestrator's timeout) or hung.>
 
 ## Ruled out
 <the competing causes you weighed and dropped, each with the one fact that dropped it>
 
 ## Gaps
 <what no tool could read: destroyed VM, no console endpoint, counters not kept, vROps not
- configured, Elastic unreachable, clocks that disagreed. Each is a gap, not a clean result.>
+ configured, the log store unreachable, clocks that disagreed. Each is a gap, not a clean result.>
 
 ## Next
 <the one check that would raise the confidence or separate the two leading causes
@@ -48,7 +48,7 @@ are the whole of what you say; no cause the evidence does not carry.
 
 **Shared infrastructure (the common case):**
 
-> Cause: PowerFlex storage saturation on the pool behind datastore ds-17, high
+> Cause: storage-array saturation on the pool behind datastore ds-17, high
 > confidence. for: 29 of 33 stuck VMs are on ds-17; device latency peaked at
 > 170 ms on four hosts from 02:09–02:17; all 29 rebooted in that window; boot
 > timeline stops after the firmware. against: the four healthy VMs on ds-17
@@ -60,10 +60,10 @@ are the whole of what you say; no cause the evidence does not carry.
 > Cause: the VM is booting slowly under CPU starvation, not hung, medium
 > confidence. for: host esx-31 at 118% demand; ready time 38% per vCPU; the
 > console is changing. against: nothing rules out a slow guest as well. The
-> Sims wait was 5 min (rung 2) and boot-to-Tools here is past 9 min, so the
+> orchestrator wait was 5 min (rung 2) and boot-to-Tools here is past 9 min, so the
 > Tools error is a timeout on a VM that would likely have come up. Next:
 > re-capture the console in 3 min — is it at the logon screen? Action: none in
-> vCenter; the fix is the host's load or the Sims timeout, for a person.
+> vCenter; the fix is the host's load or the orchestrator's timeout, for a person.
 
 ## Stop and ask, not a weak verdict
 

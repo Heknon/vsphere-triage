@@ -262,7 +262,7 @@ def storage(  # noqa: C901, PLR0912, PLR0915 - one report over many counters
     `hosts` maps the morefs of the hosts to read to their names. `with_devices`
     reads the per-device (per-LUN) counters that split the array's side from the
     host's queue; a fleet scan turns it off, because reading every device
-    instance on every host across nine vCenters is a vast query, and leaves it
+    instance on every host across the whole fleet is a vast query, and leaves it
     to diagnose_vm / explain_group to read devices for the one host in question.
     """
     host_morefs = list(hosts)

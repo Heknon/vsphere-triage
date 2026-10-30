@@ -27,7 +27,7 @@ disable a rule globally, and keep `ty check vsphere_triage` at zero.
 `vmware/govc` (two image pulls, ~90 s of work). It is marked with the
 `integration` pytest marker and is **never** on the per-commit path. Run it:
 
-- locally: `uv run --extra dev python -m pytest` (needs a running Docker), or
+- locally: `uv run python -m pytest` (needs a running Docker), or
 - on CI by hand: Actions → CI → Run workflow → `integration = true`.
 
 Dispatch it before a release, or when you change anything that touches the
@@ -36,9 +36,9 @@ wire it into `ci.yml`'s automatic triggers.
 
 ## Local iteration
 
-- `uv run --extra dev python -m pytest -m "not integration" -q` — the fast gate
+- `uv run python -m pytest -m "not integration" -q` — the fast gate
   (no Docker, ~1 s).
-- `uv run --extra dev python -m pytest -q` — everything, Docker required.
+- `uv run python -m pytest -q` — everything, Docker required.
 - `pytest --lf` / `pytest --ff` — re-run last failures first while iterating;
   don't delete `.pytest_cache` mid-investigation.
 

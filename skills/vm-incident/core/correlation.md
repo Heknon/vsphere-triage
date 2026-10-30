@@ -39,11 +39,11 @@ Every timestamp is UTC with its source named, but the sources are different
 clocks. Before you say "the latency spike at 02:13 caused the reset at 02:13":
 
 - The reset time comes from a vCenter event (vCenter's clock). The latency
-  comes from a host counter (the host's clock). The Sahara reboot time comes
-  from the runner (another clock).
+  comes from a host counter (the host's clock). The orchestrator's reboot time
+  comes from the runner (another clock).
 - If they agree to within a sample interval (20 s realtime, 5 min historical),
-  trust the correlation. If the reboot time from Sahara and the power-on event
-  from vCenter disagree by minutes, say so and widen the window rather than
+  trust the correlation. If the reboot time from the orchestrator and the
+  power-on event from vCenter disagree by minutes, say so and widen the window rather than
   trusting either to the second.
 
 ## Weak evidence, named as weak

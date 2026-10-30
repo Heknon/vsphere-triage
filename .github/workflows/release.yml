@@ -73,15 +73,16 @@ jobs:
       prerelease: ${{ steps.version.outputs.prerelease }}
     steps:
       - uses: actions/checkout@v4
-      - uses: actions/setup-python@v5
+      - uses: astral-sh/setup-uv@v5
         with:
           python-version: "3.12"
+          enable-cache: true
       - name: Read the version, and check a tag agrees with it
         id: version
         shell: bash
         run: |
           set -euo pipefail
-          version=$(python -c "import pathlib,tomllib;print(tomllib.loads(pathlib.Path('pyproject.toml').read_text())['project']['version'])")
+          version=$(uv run --no-project python -c "import pathlib,tomllib;print(tomllib.loads(pathlib.Path('pyproject.toml').read_text())['project']['version'])")
           echo "version=$version" >> "$GITHUB_OUTPUT"
           # A tag vX.Y.Z that builds a different version uploads the wrong thing
           # under the right name, and PyPI will not let you take it back.
@@ -105,9 +106,8 @@ jobs:
           fi
       - name: Build the sdist and the wheel
         run: |
-          python -m pip install --upgrade pip build twine
-          python -m build
-          twine check --strict dist/*
+          uv build
+          uvx twine check --strict dist/*
       - run: ls -l dist/
       - uses: actions/upload-artifact@v4
         with:
@@ -125,7 +125,7 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 10
     steps:
-      - uses: actions/setup-python@v5
+      - uses: astral-sh/setup-uv@v5
         with:
           python-version: "3.12"
       - uses: actions/download-artifact@v4
@@ -136,9 +136,8 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          python -m venv /tmp/venv
-          /tmp/venv/bin/pip install --upgrade pip
-          /tmp/venv/bin/pip install "$(ls dist/*.whl)"
+          uv venv /tmp/venv
+          uv pip install --python /tmp/venv "$(ls dist/*.whl)"
           /tmp/venv/bin/python - <<'CHECK'
           import vsphere_triage
           from vsphere_triage.config import Settings
