@@ -81,7 +81,8 @@ async def run_in_guest(  # noqa: PLR0913 - one guest command, its target and its
         )
         raise ValueError(msg)
 
-    def work(session: VCenterSession) -> dict[str, Any]:
+    def check(session: VCenterSession) -> dict[str, Any]:
+        """Find the VM and whether it can take a command: reads only, so safe to retry."""
         located = locate(session, settings, env_id=env_id, vm_name=vm_name, moref=moref)
         if not located["found"]:
             return {"found": False, "reason": located["reason"]}
@@ -102,6 +103,14 @@ async def run_in_guest(  # noqa: PLR0913 - one guest command, its target and its
                     "are how a guest with no Tools is seen"
                 ),
             }
+        return {"found": True, "vm": vm}
+
+    checked = await pool.run(name, check)
+    if "vm" not in checked:
+        return checked
+    vm = checked["vm"]
+
+    def execute(session: VCenterSession) -> dict[str, Any]:
         result = session.run_in_guest(
             vm.moref,
             windows=vm.os_family == "windows",
@@ -114,10 +123,10 @@ async def run_in_guest(  # noqa: PLR0913 - one guest command, its target and its
         return {"found": True, "ran": True, "vm": vm.identity(), **result}
 
     # Never repeated on a dropped session: the command may already have run. The
-    # deadline covers the command's own timeout on top of the reads around it.
+    # deadline covers the command's own timeout on top of the transfer around it.
     return await pool.run(
         name,
-        work,
+        execute,
         retry=False,
         timeout_seconds=settings.timeout_seconds + settings.guest_exec_timeout_seconds,
     )

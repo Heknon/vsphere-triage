@@ -392,11 +392,15 @@ def read_serial(text: str, *, tail_lines: int) -> dict[str, Any]:
     # earlier boot's panic is not this boot's.
     linux_banners = [match.start() for match in LINUX_BOOT_BANNER.finditer(text)]
     linux_current = (text[linux_banners[-1] :] if linux_banners else text).splitlines()
-    linux = []
+    linux_earlier = (text[: linux_banners[-1]] if linux_banners else "").splitlines()
+    linux, earlier = [], []
     for name, hint, pattern in LINUX_MARKS:
         hits = [line for line in linux_current if pattern.search(line)]
         if hits:
             linux.append({"kind": name, "points_at": hint, "count": len(hits), "examples": hits[:3]})
+        before = [line for line in linux_earlier if pattern.search(line)]
+        if before:
+            earlier.append({"kind": name, "points_at": hint, "count": len(before), "examples": before[-3:]})
     # A serial file is appended across reboots, so a stop code earlier in it may
     # be from a previous boot. When EMS marked the boots, read stop codes only
     # from the current boot (after the last banner); otherwise read the whole
@@ -413,5 +417,8 @@ def read_serial(text: str, *, tail_lines: int) -> dict[str, Any]:
         "stop_codes_scoped_to_current_boot": bool(banners),
         "linux_findings": linux,
         "linux_findings_scoped_to_current_boot": bool(linux_banners),
+        # Kept apart, not dropped: a kdump/capture kernel prints a fresh banner after
+        # the very panic that matters.
+        "linux_findings_earlier_boots": earlier,
         "tail": lines[-tail_lines:],
     }

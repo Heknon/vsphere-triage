@@ -63,6 +63,10 @@ class VSphereError(RuntimeError):
     """A vSphere read failed in a way the caller should see, worded for a reader."""
 
 
+class DeadlineError(VSphereError):
+    """A read ran past its deadline; its worker thread may still be running it."""
+
+
 @dataclass
 class DatastoreFile:
     """A file read from a datastore: possibly only its end, and said so."""
@@ -186,12 +190,17 @@ class VCenterSession:
         # a caller can tell whether the session it used has since been replaced.
         self._lock = threading.Lock()
         self.generation = 0
+        # How long the last login took and when: the exhaustion signal, since a
+        # vCenter near its session limit is slow to log in long before it refuses.
+        self.last_login_seconds: float | None = None
+        self.last_login_at: datetime | None = None
 
     # -- the session ---------------------------------------------------------
 
     def _login(self) -> None:
         """Open a fresh session, disconnecting any old one first. Call under `_lock`."""
         username, password = self.settings.credentials_for(self.vcenter)
+        started = time.monotonic()
         try:
             raw = SmartConnect(
                 host=self.vcenter.host,
@@ -211,6 +220,8 @@ class VCenterSession:
         except (OSError, ssl.SSLError) as error:
             msg = f"vCenter {self.vcenter.name} ({self.vcenter.host}) unreachable: {error}"
             raise VSphereError(msg) from error
+        self.last_login_seconds = round(time.monotonic() - started, 2)
+        self.last_login_at = datetime.now(UTC)
         self._teardown()
         self._stub = ReadOnlyStub(raw._stub)  # noqa: SLF001 - wrapping is the point
         self._service = vim.ServiceInstance("ServiceInstance", self._stub)
@@ -578,7 +589,9 @@ class VCenterSession:
             "pid": pid,
             "exit_code": exit_code,
             "timed_out": exit_code is None,
-            "terminated_after_timeout": terminated,
+            # Only the shell Tools started is terminated: processes it spawned (a
+            # pipeline, a background job) can outlive it.
+            "shell_terminated_after_timeout": terminated,
             "output": output,
             "output_truncated": truncated,
         }
@@ -614,11 +627,15 @@ class VCenterSession:
         begin: datetime | None = None,
         end: datetime | None = None,
         types: Sequence[str] = (),
+        recursion: str = "self",
     ) -> list[Any]:
-        """The events on an entity (or everywhere), in a window, oldest first."""
+        """The events on an entity (or everywhere), in a window, oldest first.
+
+        `recursion="all"` takes an entity's children too (a folder's VMs).
+        """
         criteria = vim.event.EventFilterSpec()
         if entity is not None:
-            criteria.entity = vim.event.EventFilterSpec.ByEntity(entity=entity, recursion="self")
+            criteria.entity = vim.event.EventFilterSpec.ByEntity(entity=entity, recursion=recursion)
         if begin or end:
             criteria.time = vim.event.EventFilterSpec.ByTime(beginTime=begin, endTime=end)
         if types:
@@ -963,12 +980,30 @@ class VCenterPool:
         session = self.session(name)
         deadline = timeout_seconds or self.settings.timeout_seconds
         slot = _Slot(self._limits[name])
-        await slot.acquire()
+        try:
+            # Bounded too: slots held by reads stalled past their deadline must not
+            # make every later call on this vCenter wait forever without a word.
+            await asyncio.wait_for(slot.acquire(), timeout=deadline)
+        except TimeoutError:
+            msg = (
+                f"vCenter {name}: all {self.settings.max_concurrent_per_vcenter} read slots are still busy "
+                f"after {deadline:g}s (reads stalled past their deadline hold them until they end); "
+                "the vCenter is likely slow or unresponsive — check_vcenters, or retry later"
+            )
+            raise VSphereError(msg) from None
         try:
             await self._bounded(session.connect, slot=slot)
             generation = session.generation
             try:
                 return await self._bounded(lambda: work(session), deadline, slot=slot)
+            except DeadlineError as error:
+                if retry:
+                    raise
+                msg = (
+                    f"{error}; the guest command may still be running in the guest — check before "
+                    "running it again"
+                )
+                raise VSphereError(msg) from error
             except vim.fault.NotAuthenticated:
                 # The session expired. Reconnect (a no-op if a sibling call already
                 # did, so we never log its new session out), then retry once.
@@ -1019,7 +1054,7 @@ class VCenterPool:
             if slot is not None:
                 slot.hand_off(future)
             msg = f"vCenter read exceeded its deadline ({deadline:g}s)"
-            raise VSphereError(msg) from error
+            raise DeadlineError(msg) from error
         except asyncio.CancelledError:
             if slot is not None:
                 slot.hand_off(future)

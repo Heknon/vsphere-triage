@@ -37,7 +37,7 @@ from starlette.responses import JSONResponse
 from vsphere_triage import ages, guestexec, hardware, resources, snapshots, storagehealth, timecheck
 from vsphere_triage import scan as scanning
 from vsphere_triage.checks import classify, count_states
-from vsphere_triage.config import Settings
+from vsphere_triage.config import NotFoundError, Settings
 from vsphere_triage.contention import hosts_cpu, storage
 from vsphere_triage.diagnose import (
     Layout,
@@ -67,6 +67,8 @@ if TYPE_CHECKING:
 
 # Failures a caller can act on: a bad argument, an unreachable or slow vCenter,
 # a vROps refusal, a refused write. Their message reaches the model.
+logger = logging.getLogger(__name__)
+
 ANTICIPATED = (
     ValueError,
     re.error,
@@ -161,6 +163,25 @@ def _since(text: str | None, default: datetime) -> datetime:
     return _parse_time(text) if text else default
 
 
+# The longest look-back any tool takes: past it, vCenter keeps nothing finer anyway,
+# and an unbounded number of minutes or hours would overflow a timedelta.
+MAX_LOOKBACK = timedelta(days=366)
+
+
+def _ago(*, minutes: float = 0, hours: float = 0, least: timedelta = timedelta(minutes=1)) -> timedelta:
+    """A caller's look-back as a timedelta: at least `least`, at most `MAX_LOOKBACK`."""
+    seconds = minutes * 60 + hours * 3600
+    return min(max(timedelta(seconds=max(seconds, 0)), least), MAX_LOOKBACK)
+
+
+def _ordered(begin: datetime, end: datetime) -> tuple[datetime, datetime]:
+    """A window whose start is before its end, or an error that says so."""
+    if begin >= end:
+        msg = f"the window starts ({begin.isoformat()}) at or after it ends ({end.isoformat()})"
+        raise ValueError(msg)
+    return begin, end
+
+
 def build_server(
     settings: Settings | None = None, pool: VCenterPool | None = None, *, guest_exec: bool = True
 ) -> MCPServer:
@@ -231,11 +252,16 @@ def _registrar(server: MCPServer, resolved: Settings) -> Callable[[str | None], 
                 active["count"] += 1
                 try:
                     return bounded(await function(*args, **kwargs))
-                except LookupError as error:
+                except NotFoundError as error:
                     return bounded({"found": False, "reason": str(error).strip("'\"")})
                 except ANTICIPATED as error:
-                    # Said to the model in words; anything else is a crash the SDK hides.
+                    # Said to the model in words.
                     raise ToolError(str(error)) from error
+                except Exception as error:
+                    # A bug, not an answer: named as one, never as "not found".
+                    logger.exception("tool %s failed", name or getattr(function, "__name__", "?"))
+                    msg = f"internal error in this server ({type(error).__name__}: {error}); not a finding"
+                    raise ToolError(msg) from error
                 finally:
                     active["count"] -= 1
 
@@ -293,11 +319,15 @@ def _register_fleet_tools(  # noqa: C901, PLR0915 - one closure per tool
         def probe(session: VCenterSession) -> dict[str, Any]:
             started = time.monotonic()
             about = session.about()
-            login_seconds = round(time.monotonic() - started, 2)
+            round_trip = round(time.monotonic() - started, 2)
             return {
                 "reachable": True,
                 **about,
-                "login_seconds": login_seconds,
+                # The login is the one this server's session last made (on first use or
+                # re-login), not a fresh one: a probe does not open a session to time it.
+                "login_seconds": session.last_login_seconds,
+                "login_at": session.last_login_at,
+                "round_trip_seconds": round_trip,
                 "sessions": session.session_count(),
             }
 
@@ -312,7 +342,8 @@ def _register_fleet_tools(  # noqa: C901, PLR0915 - one closure per tool
             sessions = result.get("sessions", {})
             if sessions.get("total") is not None:
                 findings.append(
-                    f"{result['name']}: {sessions['total']} open sessions, login {result['login_seconds']}s"
+                    f"{result['name']}: {sessions['total']} open sessions, last login "
+                    f"{result['login_seconds']}s, round trip {result['round_trip_seconds']}s"
                 )
         return {"vcenters": rows, "findings": findings or ["all configured vCenters reachable"]}
 
@@ -645,7 +676,7 @@ def _register_fleet_tools(  # noqa: C901, PLR0915 - one closure per tool
         """
         names = _names(fleet, vcenters)
         end = _since(until, datetime.now(UTC))
-        begin = _since(since, end - timedelta(minutes=max(1, minutes)))
+        begin, end = _ordered(_since(since, end - _ago(minutes=minutes)), end)
         return await scanning.diagnose_window(fleet, resolved, names, begin, end)
 
 
@@ -904,6 +935,11 @@ def _register_piece_tools(  # noqa: C901 - one closure per tool
             datacenter = vm.datacenter_path or vm.datacenter
             if folder is None or datacenter is None:
                 return {"available": False, "reason": "the VM's folder or datacenter is not known"}
+            if which < 0:
+                return {
+                    "available": False,
+                    "reason": "which is 0 for vmware.log or N (1, 2, ...) for vmware-N.log",
+                }
             file = "vmware.log" if which == 0 else f"vmware-{which}.log"
             read = session.read_datastore_file(datacenter, f"{folder}/{file}", resolved.max_log_bytes)
             if read.status != 200:  # noqa: PLR2004
@@ -966,10 +1002,10 @@ def _register_piece_tools(  # noqa: C901 - one closure per tool
 
         def work(session: VCenterSession, vm: Any, _row: dict[str, Any]) -> dict[str, Any]:
             result = read_console(session, resolved, vm, captures=count, interval_seconds=interval)
-            if include_image and result.get("available"):
-                status, body, _ = session.screenshot(vm.moref)
-                if status == 200:  # noqa: PLR2004
-                    result["image_jpeg_base64"] = _thumbnail(body)
+            last = result.pop("_last_capture", None)
+            if include_image and last:
+                # The capture the words describe, not a newer one taken after them.
+                result["image_jpeg_base64"] = _thumbnail(last)
             return result
 
         return await _with_vm(vcenter, moref, work)
@@ -991,7 +1027,7 @@ def _register_piece_tools(  # noqa: C901 - one closure per tool
             try:
                 events = session.events(
                     entity=session.reference("VirtualMachine", moref),
-                    begin=now - timedelta(minutes=max(1, minutes)),
+                    begin=now - _ago(minutes=minutes),
                     end=now,
                 )
             except vmodl.fault.ManagedObjectNotFound:
@@ -1246,7 +1282,8 @@ def _register_vrops_tools(tool: Callable[..., Any], vrops: Vrops) -> None:
 
         """
         end = _since(until, datetime.now(UTC))
-        begin = _since(since, end - timedelta(hours=max(0.1, min(hours, 24 * 31))))
+        begin = _since(since, end - min(_ago(hours=hours, least=timedelta(minutes=6)), timedelta(days=31)))
+        begin, end = _ordered(begin, end)
         series = await vrops.stats(
             resource_id, stat_keys, begin, end, interval_minutes=max(1, interval_minutes)
         )
@@ -1289,8 +1326,7 @@ def _register_vrops_tools(tool: Callable[..., Any], vrops: Vrops) -> None:
             interval_minutes: rollup interval.
 
         """
-        begin = _since(since, datetime.now(UTC))
-        end = _since(until, datetime.now(UTC))
+        begin, end = _ordered(_since(since, datetime.now(UTC)), _since(until, datetime.now(UTC)))
         compared = await vrops.compare(
             resource_id,
             stat_keys,
@@ -1319,7 +1355,7 @@ def _register_vrops_tools(tool: Callable[..., Any], vrops: Vrops) -> None:
             hours: how far back.
 
         """
-        since = datetime.now(UTC) - timedelta(hours=max(0.1, hours))
+        since = datetime.now(UTC) - _ago(hours=hours, least=timedelta(minutes=6))
         alerts = await vrops.alerts(resource_id, since)
         return {"count": len(alerts), "alerts": alerts[:100]}
 
@@ -1334,9 +1370,9 @@ def _pick[T](items: Any, wanted: str, keys: Callable[[T], tuple[str, str]]) -> T
     if not exact:
         near = [keys(item)[0] for item in pool if text in (keys(item)[0] or "").lower()][:10]
         msg = f"{wanted!r} not found" + (f"; similar: {', '.join(near)}" if near else "")
-        raise LookupError(msg)
+        raise NotFoundError(msg)
     msg = f"{wanted!r} matches {len(exact)} objects; use the moref"
-    raise LookupError(msg)
+    raise NotFoundError(msg)
 
 
 def _console_interval(settings: Settings, captures: int, asked: float) -> float:

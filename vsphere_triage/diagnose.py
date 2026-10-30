@@ -63,7 +63,7 @@ from vsphere_triage.inventory import (
     snapshot_usage,
     vm_facts,
 )
-from vsphere_triage.vcenter import REALTIME_SPAN, VSphereError, parse_datastore_path
+from vsphere_triage.vcenter import QUERY_EVENTS_CAP, REALTIME_SPAN, VSphereError, parse_datastore_path
 from vsphere_triage.vmlog import boot_timeline, grep, parse_lines, read_serial
 
 if TYPE_CHECKING:
@@ -169,7 +169,7 @@ def read_vms(
     ]
 
 
-def locate(  # noqa: C901, PLR0911 - one lookup, each way it can fail beside it
+def locate(  # noqa: C901, PLR0911, PLR0912 - one lookup, each way it can fail beside it
     session: VCenterSession,
     settings: Settings,
     *,
@@ -205,11 +205,25 @@ def locate(  # noqa: C901, PLR0911 - one lookup, each way it can fail beside it
         }
     exact = [folder for folder in folders if folder.name.lower() == env_id.strip().lower()]
     candidates = exact or folders
+    if len(candidates) > MAX_CANDIDATE_FOLDERS:
+        # A short id contained in hundreds of folder names: each would be read with the
+        # heavy diagnosis paths. Ask for the exact id rather than read them all.
+        return {
+            "found": False,
+            "reason": f"{len(candidates)} folders contain {env_id!r} and none is named exactly that; "
+            "give the full environment id, or the VM's moref",
+            "candidates": [folder.path for folder in candidates[:MAX_CANDIDATE_FOLDERS]],
+        }
     matches = []
+    seen: set[str] = set()
     for folder in candidates:
         root = session.reference("Folder", folder.moref)
         for vm, row in read_vms(session, layout, root=root):
+            # Nested matching folders read one VM twice; it is still one VM.
+            if vm.moref in seen:
+                continue
             if vm.name == vm_name or vm.name.lower() == vm_name.lower():
+                seen.add(vm.moref)
                 matches.append((folder, vm, row))
     if len(matches) == 1:
         folder, vm, row = matches[0]
@@ -233,6 +247,10 @@ def locate(  # noqa: C901, PLR0911 - one lookup, each way it can fail beside it
         + ", ".join(folder.path for folder in candidates[:3]),
         "vms_in_environment": sorted(names)[:50],
     }
+
+
+# The most folders a non-exact environment id is looked for in.
+MAX_CANDIDATE_FOLDERS = 10
 
 
 def window(now: datetime, boot: datetime | None) -> tuple[datetime, datetime]:
@@ -404,7 +422,13 @@ def read_console(
             }
         images.append(body)
     thresholds = settings.thresholds
-    return {"available": True, "interval_seconds": interval_seconds} | read_captures(
+    # `_last_capture` is the image analysed last, for a caller that shows it; the
+    # leading underscore keeps it out of every JSON result.
+    return {
+        "available": True,
+        "interval_seconds": interval_seconds,
+        "_last_capture": images[-1],
+    } | read_captures(
         images,
         black_fraction=thresholds.console_black_fraction,
         frozen_difference=thresholds.console_frozen_difference,
@@ -651,6 +675,14 @@ def conclude(  # noqa: C901, PLR0912, PLR0913, PLR0915 - one ordered list of cau
                 evidence(STORAGE, weight=1, text=f"{label} usually means {hint}")
             if hint.startswith("CPU"):
                 evidence(CPU, weight=1, text=f"{label} usually means {hint}")
+        for finding in item.get("linux_findings_earlier_boots", []):
+            # A panic before the latest boot: often the very crash a kdump or capture
+            # kernel (which prints its own banner) then booted after. Weighed lightly.
+            evidence(
+                KERNEL_ERROR,
+                weight=1,
+                text=f"serial console, an earlier boot: {finding['kind']}: {finding['examples'][0]}",
+            )
         for finding in item.get("linux_findings", []):
             evidence(
                 KERNEL_ERROR, weight=3, text=f"serial console: {finding['kind']}: {finding['examples'][0]}"
@@ -681,9 +713,19 @@ def conclude(  # noqa: C901, PLR0912, PLR0913, PLR0915 - one ordered list of cau
         if console.get("frozen") and console.get("black"):
             evidence(EARLY_HANG, weight=2, text="console black and unchanged across captures")
         elif console.get("frozen"):
-            # A boot screen that does not move is not a boot that is progressing.
-            evidence(STILL_WORKING, weight=2, against=True, text="the console did not change across captures")
-            evidence(EARLY_HANG, weight=1, text="the console screen is unchanged across captures")
+            # A boot screen that does not move is not a boot that is progressing; but
+            # an update or disk-check screen can sit still for seconds while it works,
+            # so on those the stillness weighs less and is no evidence of a hang.
+            shown = {state["state"] for state in console.get("screen_states", [])}
+            slow_progress = bool(shown & {"windows_updating", "device_setup", "disk_check"})
+            evidence(
+                STILL_WORKING,
+                weight=1 if slow_progress else 2,
+                against=True,
+                text="the console did not change across captures",
+            )
+            if not slow_progress:
+                evidence(EARLY_HANG, weight=1, text="the console screen is unchanged across captures")
         if console.get("frozen") is False:
             evidence(EARLY_HANG, weight=2, against=True, text="the console changed between captures")
             evidence(STILL_WORKING, weight=1, text="the console changed between captures")
@@ -811,22 +853,41 @@ def next_checks(conclusion: dict[str, Any], vm: VmFacts) -> list[str]:
 def _env_reboots(
     session: VCenterSession,
     now: datetime,
+    folder_moref: str | None,
     peers: list[VmFacts],
     lookback_hours: float,
     window_minutes: float,
-) -> tuple[dict[str, datetime], dict[str, int]]:
-    """The latest reboot event per VM for a set of peers, and their resets in the boot-loop window.
+) -> tuple[dict[str, datetime], dict[str, int], str | None]:
+    """The latest reboot event per VM of an environment, its resets in the boot-loop window, and a note.
 
-    One query over the window, so a mass warm reboot does not make every peer
-    look long-stuck and a peer in a boot loop is not counted as healthy.
+    One query scoped to the environment's folder (not the whole vCenter, whose
+    events would crowd out the folder's past the QueryEvents cap), so a mass
+    warm reboot does not make every peer look long-stuck and a peer in a boot
+    loop is not counted as healthy. The note says when that could not be read
+    in full.
     """
     if not peers:
-        return {}, {}
+        return {}, {}, None
+    entity = session.reference("Folder", folder_moref) if folder_moref else None
     try:
-        events = session.events(begin=now - timedelta(hours=lookback_hours), end=now, types=RESET_EVENTS)
-    except (VSphereError, vmodl.MethodFault):
-        return {}, {}
-    return latest_reboot_by_vm(events), resets_by_vm(events, window_minutes, now)
+        events = session.events(
+            entity=entity,
+            recursion="all",
+            begin=now - timedelta(hours=lookback_hours),
+            end=now,
+            types=RESET_EVENTS,
+        )
+    except vim.fault.NotAuthenticated:
+        raise  # the session expired: let the pool re-login and retry
+    except (VSphereError, vmodl.MethodFault) as error:
+        return {}, {}, f"reboot events not read ({type(error).__name__}); uptime is from power-on"
+    note = None
+    if len(events) >= QUERY_EVENTS_CAP:
+        note = (
+            f"{len(events)} reset events in the environment's window: vCenter returns at most "
+            f"{QUERY_EVENTS_CAP}, so some reboots and boot-loop counts may be missed"
+        )
+    return latest_reboot_by_vm(events), resets_by_vm(events, window_minutes, now), note
 
 
 def diagnose_vm(
@@ -879,9 +940,16 @@ def diagnose_vm(
         siblings = read_vms(session, layout, root=session.reference("Folder", vm.folder_moref))
         # The peers were read without reboot events; a mass reboot would make
         # them all look long-stuck. Refine each from its own reset/reboot event.
-        peer_reboots, peer_resets = _env_reboots(
-            session, now, [peer for peer, _ in siblings], lookback, thresholds.boot_loop_window_minutes
+        peer_reboots, peer_resets, peer_note = _env_reboots(
+            session,
+            now,
+            vm.folder_moref,
+            [peer for peer, _ in siblings],
+            lookback,
+            thresholds.boot_loop_window_minutes,
         )
+        if peer_note:
+            vm.notes.append(f"environment: {peer_note}")
         peers = []
         for peer, _ in siblings:
             if peer.folder_moref != vm.folder_moref:
@@ -982,6 +1050,8 @@ def diagnose_environment(session: VCenterSession, settings: Settings, *, env_id:
             "reason": f"no folder on {session.vcenter.name} is named {env_id!r} or contains it",
         }
     exact = [folder for folder in folders if folder.name.lower() == env_id.strip().lower()]
+    if not exact and len(folders) == 1:
+        exact = folders  # one folder contains the id: unambiguous, as locate() accepts it
     if len(exact) != 1:
         return {
             "found": False,
@@ -995,7 +1065,9 @@ def diagnose_environment(session: VCenterSession, settings: Settings, *, env_id:
     # As in diagnose_vm: a warm reboot does not move bootTime, so measure each VM
     # from its latest reset or guest-reboot event, and count its boot-loop resets.
     lookback = min(max(max((vm.age_hours or 0.0) for vm in vms) if vms else 24.0, 1.0), 24.0)
-    reboots, resets = _env_reboots(session, now, vms, lookback, thresholds.boot_loop_window_minutes)
+    reboots, resets, reboot_note = _env_reboots(
+        session, now, folder.moref, vms, lookback, thresholds.boot_loop_window_minutes
+    )
     for vm in vms:
         set_effective_boot(vm, now, reboots=reboots)
     verdicts = [(vm, classify(vm, thresholds, resets_in_window=resets.get(vm.moref, 0))) for vm in vms]
@@ -1063,5 +1135,6 @@ def diagnose_environment(session: VCenterSession, settings: Settings, *, env_id:
         "hosts_cpu": cpu,
         "storage": disk,
         "pattern": pattern,
+        "notes": [reboot_note] if reboot_note else [],
         "next": "diagnose_vm on one abnormal VM for its console, vmware.log and serial console",
     }

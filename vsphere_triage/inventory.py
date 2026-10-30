@@ -379,8 +379,29 @@ def base_disk_of(devices: Iterable[Any]) -> str | None:
     template folder (e.g. `[DS] Windows-Cool/Windows-Cool.vmdk`). None when the
     VM has no parented disk (a full clone or the template itself).
     """
-    bases = sorted({chain[-1] for chain in disk_chains(devices) if len(chain) > 1})
+    bases = linked_bases(disk_chains(devices))
     return bases[0] if bases else None
+
+
+def _datastore_folder(path: str) -> str:
+    """`[DS] folder/file.vmdk` -> `[DS] folder`: where a disk file lives."""
+    return path.rsplit("/", 1)[0] if "/" in path else path
+
+
+def linked_bases(chains: Iterable[list[str]]) -> list[str]:
+    """The linked-clone base disks of a VM's disk chains, sorted.
+
+    A chain's last link is a base only when it lives outside the VM's own folder
+    (the template's): a full clone with a snapshot also has a parented chain,
+    but every link of it is the VM's own.
+    """
+    return sorted(
+        {
+            chain[-1]
+            for chain in chains
+            if len(chain) > 1 and _datastore_folder(chain[-1]) != _datastore_folder(chain[0])
+        }
+    )
 
 
 def base_disks_for(session: VCenterSession, refs: Iterable[Any]) -> dict[str, str | None]:
@@ -784,7 +805,8 @@ def read_datastore_mounts(session: VCenterSession) -> list[dict[str, Any]]:
                 "free_bytes": row.get("summary.freeSpace"),
                 "uncommitted_bytes": row.get("summary.uncommitted"),
                 "accessible": row.get("summary.accessible"),
-                "mounts": mounts,
+                # None, not [], when the host list was not read: unknown, not "no hosts".
+                "mounts": mounts if "host" in row else None,
             }
         )
     return result
@@ -899,7 +921,11 @@ def read_folders(session: VCenterSession) -> dict[str, FolderFacts]:
 
 def read_hosts(session: VCenterSession) -> dict[str, HostFacts]:
     """Every host, with its cluster's name."""
-    clusters = {row["moref"]: row["name"] for row in session.retrieve(vim.ComputeResource, CLUSTER_PATHS)}
+    # Clusters only: a standalone host's parent is a plain ComputeResource named
+    # after the host itself, which is not a cluster.
+    clusters = {
+        row["moref"]: row["name"] for row in session.retrieve(vim.ClusterComputeResource, CLUSTER_PATHS)
+    }
     hosts = {}
     for row in session.retrieve(vim.HostSystem, HOST_PATHS):
         parent = row.get("parent")
@@ -1102,7 +1128,7 @@ def vm_facts(  # noqa: C901, PLR0913, PLR0915 - one flattening of one row
         facts.devices, facts.device_findings, facts.device_blocks = describe_devices(
             devices, powered_on=facts.power_state == "poweredOn"
         )
-        bases = sorted({chain[-1] for chain in facts.disk_chain if len(chain) > 1})
+        bases = linked_bases(facts.disk_chain)
         if bases:
             facts.base_disk = bases[0]
             if len(bases) > 1:

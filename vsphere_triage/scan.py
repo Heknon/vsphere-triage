@@ -33,6 +33,7 @@ from vsphere_triage.checks import (
     latest_reboot_by_vm,
     resets_by_vm,
 )
+from vsphere_triage.config import NotFoundError
 from vsphere_triage.contention import hosts_cpu, storage
 from vsphere_triage.inventory import (
     HostFacts,
@@ -129,7 +130,7 @@ class ScanStore:
         except KeyError:
             kept = ", ".join(self._scans) or "none"
             msg = f"No scan {scan_id!r} is kept (kept: {kept}); run scan again"
-            raise LookupError(msg) from None
+            raise NotFoundError(msg) from None
 
 
 def scan_vcenter(session: VCenterSession, settings: Settings) -> VCenterScan:

@@ -352,6 +352,7 @@ def test_serial_output_without_ems_or_errors_is_plain() -> None:
         "stop_codes_scoped_to_current_boot": False,
         "linux_findings": [],
         "linux_findings_scoped_to_current_boot": False,
+        "linux_findings_earlier_boots": [],
         "tail": ["world"],
     }
 
@@ -1600,6 +1601,7 @@ def test_an_earlier_boots_kernel_panic_is_not_this_boots() -> None:
 
     assert result["linux_findings"] == []
     assert result["linux_findings_scoped_to_current_boot"] is True
+    assert [finding["kind"] for finding in result["linux_findings_earlier_boots"]] == ["kernel_panic"]
 
 
 def test_the_esxi_tools_running_status_lines_are_read() -> None:
@@ -2053,3 +2055,141 @@ def test_a_sibling_being_the_odd_one_out_is_not_said_of_the_diagnosed_vm() -> No
 
     assert result["signals"] == []
     assert result["findings"] == ["db-01 (vm-2) is the only abnormal VM of 2 here"]
+
+
+# -- round two: answers that must not be mistaken for others ----------------------------------
+
+
+class _ToolServer:
+    def __init__(self) -> None:
+        self.tools: dict[str, object] = {}
+
+    def tool(self, *, name: str, annotations: object) -> object:  # noqa: ARG002
+        def register(function: object) -> object:
+            self.tools[name] = function
+            return function
+
+        return register
+
+
+def test_a_bug_is_reported_as_an_internal_error_not_as_not_found() -> None:
+    from mcp.server.mcpserver.exceptions import ToolError  # noqa: PLC0415
+
+    from vsphere_triage.config import NotFoundError  # noqa: PLC0415
+    from vsphere_triage.server import _registrar  # noqa: PLC0415
+
+    fake = _ToolServer()
+    tool = _registrar(fake, Settings())  # type: ignore[arg-type]
+
+    @tool("buggy")
+    async def buggy() -> dict:
+        return {}["missing"]
+
+    @tool("absent")
+    async def absent() -> dict:
+        msg = "vm-9 not found"
+        raise NotFoundError(msg)
+
+    with pytest.raises(ToolError, match="internal error"):
+        asyncio.run(fake.tools["buggy"]())  # type: ignore[operator]
+    assert asyncio.run(fake.tools["absent"]()) == {"found": False, "reason": "vm-9 not found"}  # type: ignore[operator]
+
+
+def test_a_window_must_start_before_it_ends_and_a_huge_look_back_is_capped() -> None:
+    from vsphere_triage.server import MAX_LOOKBACK, _ago, _ordered  # noqa: PLC0415
+
+    with pytest.raises(ValueError, match="at or after it ends"):
+        _ordered(NOW, NOW - timedelta(hours=1))
+    assert _ago(minutes=10**12) == MAX_LOOKBACK
+    assert _ago(minutes=-5) == timedelta(minutes=1)
+
+
+def test_a_datastore_whose_capacity_was_not_read_is_unjudged_not_healthy() -> None:
+    verdict = storagehealth.classify_datastore(_store(capacity_bytes=None, free_bytes=None), LIMITS)
+
+    assert verdict["healthy"] is None
+    assert "capacity" in verdict["not_read"]
+
+
+def test_a_full_clone_with_a_snapshot_has_no_linked_clone_base() -> None:
+    from vsphere_triage.inventory import linked_bases  # noqa: PLC0415
+
+    full_clone = [["[DS] web-01/web-01-000001.vmdk", "[DS] web-01/web-01.vmdk"]]
+    linked = [["[DS] web-02/web-02.vmdk", "[DS] Cool/Cool.vmdk"]]
+
+    assert linked_bases(full_clone) == []
+    assert linked_bases(linked) == ["[DS] Cool/Cool.vmdk"]
+
+
+def test_waiting_for_a_slot_held_by_a_stalled_read_has_a_deadline(monkeypatch: pytest.MonkeyPatch) -> None:
+    import threading  # noqa: PLC0415
+
+    from vsphere_triage.vcenter import VCenterPool, VSphereError  # noqa: PLC0415
+
+    settings = Settings.from_environment(
+        {
+            "VSPHERE_VCENTERS": '[{"name": "vc-a", "host": "a"}]',
+            "VSPHERE_USERNAME": "u",
+            "VSPHERE_PASSWORD": "p",
+            "VSPHERE_MAX_CONCURRENT_PER_VCENTER": "1",
+            "VSPHERE_TIMEOUT_SECONDS": "0.1",
+        }
+    )
+    pool = VCenterPool(settings)
+    monkeypatch.setattr(pool.session("vc-a"), "connect", lambda: None)
+    stalled = threading.Event()
+
+    async def scenario() -> None:
+        with pytest.raises(VSphereError, match="deadline"):
+            await pool.run("vc-a", lambda _s: stalled.wait(5))
+        try:
+            with pytest.raises(VSphereError, match="read slots are still busy"):
+                await pool.run("vc-a", lambda _s: "never runs")
+        finally:
+            stalled.set()
+
+    asyncio.run(scenario())
+
+
+def test_a_guest_command_past_its_deadline_says_it_may_still_be_running(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import threading  # noqa: PLC0415
+
+    from vsphere_triage.vcenter import VCenterPool, VSphereError  # noqa: PLC0415
+
+    settings = Settings.from_environment(
+        {
+            "VSPHERE_VCENTERS": '[{"name": "vc-a", "host": "a"}]',
+            "VSPHERE_USERNAME": "u",
+            "VSPHERE_PASSWORD": "p",
+        }
+    )
+    pool = VCenterPool(settings)
+    monkeypatch.setattr(pool.session("vc-a"), "connect", lambda: None)
+    stalled = threading.Event()
+
+    async def scenario() -> None:
+        try:
+            with pytest.raises(VSphereError, match="may still be running"):
+                await pool.run("vc-a", lambda _s: stalled.wait(5), retry=False, timeout_seconds=0.05)
+        finally:
+            stalled.set()
+
+    asyncio.run(scenario())
+
+
+def test_a_still_update_screen_is_still_read_as_working() -> None:
+    busy = vm(cpu_mhz=3000.0, uptime_minutes=40.0)
+    console_read = {
+        "available": True,
+        "frozen": True,
+        "black": False,
+        "screen_states": [{"state": "windows_updating", "meaning": "Working on updates"}],
+        "stop_codes": [],
+    }
+
+    result = _conclude_on(busy, console=console_read)
+
+    assert result["causes"][0]["cause"] == diagnose.STILL_WORKING
+    assert diagnose.EARLY_HANG not in [entry["cause"] for entry in result["causes"]]

@@ -47,6 +47,14 @@ PositiveFloat = Annotated[float, BeforeValidator(_not_a_boolean), Field(gt=0, al
 Fraction = Annotated[float, BeforeValidator(_not_a_boolean), Field(gt=0, le=1, allow_inf_nan=False)]
 
 
+class NotFoundError(LookupError):
+    """Something asked for is not there (a vCenter, an object, a kept scan): an answer, not a crash.
+
+    Distinct from `KeyError` and `IndexError`, which are also `LookupError`s but
+    mean a bug: only this one is turned into a `found: false` result.
+    """
+
+
 class VCenter(BaseModel):
     """One vCenter: where it is, and the other names it goes by."""
 
@@ -342,7 +350,7 @@ class Settings(BaseSettings):
         else:
             names = ", ".join(vcenter.name for vcenter in matches)
             msg = f"{spelling!r} matches more than one vCenter ({names}); use its name"
-        raise LookupError(msg)
+        raise NotFoundError(msg)
 
     @classmethod
     def from_environment(cls, environment: Mapping[str, str] | None = None) -> Settings:
