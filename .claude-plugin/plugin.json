@@ -44,6 +44,7 @@
     "vrops_username": {
       "type": "string",
       "title": "vROps username (optional)",
+      "description": "VSPHERE_VROPS_USERNAME: required only if vROps URL is set",
       "default": ""
     },
     "vrops_password": {
