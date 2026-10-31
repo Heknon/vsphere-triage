@@ -36,6 +36,7 @@ from starlette.responses import JSONResponse
 
 from vsphere_triage import (
     ages,
+    appliance,
     capabilities,
     clusterevents,
     connhistory,
@@ -43,7 +44,9 @@ from vsphere_triage import (
     emscheck,
     guestexec,
     hardware,
+    hostlogs,
     hostsensors,
+    hosttls,
     linuxboot,
     power,
     powerflex,
@@ -109,6 +112,7 @@ ANTICIPATED = (
     VSphereError,
     VropsError,
     PowerFlexError,
+    appliance.ApplianceError,
     ReadOnlyViolationError,
     vmodl.MethodFault,
     httpx.HTTPError,
@@ -143,8 +147,12 @@ reads the serial port without Tools (only its Windows BCD check needs them).
 None of the seven is a first step.
 
 When the symptom is SSL EOF / reset / timeout against a vCenter that many
-clients hit (this server included), start with check_vcenters: a high session
-count or slow login points at the vCenter near its limit, not at any one VM.
+clients hit (this server included), start with check_vcenters: a session count
+at or near its configured cap, or a slow login, points at the vCenter near its
+limit, not at any one VM. A count well under the cap points elsewhere:
+vcenter_appliance_health and read_vcenter_log. When the failing calls are guest
+file transfers (guestFile), the download goes to the ESXi host, not vCenter:
+check_host_tls and search_host_logs.
 
 Concepts:
 - Environments are short-lived (minutes to a day) and each is a folder named by
@@ -307,6 +315,7 @@ def build_server(
     _register_machine_tools(tool, fleet, resolved, guest_exec=guest_exec)
     _register_piece_tools(tool, fleet, resolved)
     _register_infrastructure_tools(tool, fleet, resolved)
+    _register_connection_tools(tool, fleet, resolved)
     if vrops is not None:
         _register_vrops_tools(tool, vrops)
     if powerflex_client is not None:
@@ -425,9 +434,13 @@ def _register_fleet_tools(  # noqa: C901, PLR0915 - one closure per tool
                 continue
             rows.append(result)
             sessions = result.get("sessions", {})
+            if sessions.get("limit_finding"):
+                findings.append(f"{result['name']}: {sessions['limit_finding']}")
             if sessions.get("total") is not None:
+                cap = sessions.get("session_limit")
+                of_cap = f" of a configured cap of {cap}" if cap else " (cap: vpxd's default, not set)"
                 findings.append(
-                    f"{result['name']}: {sessions['total']} open sessions, this server's last login "
+                    f"{result['name']}: {sessions['total']} open sessions{of_cap}, this server's last login "
                     f"took {result['login_seconds']}s (at {_clock(result['login_at'])}), "
                     f"round trip now {result['round_trip_seconds']}s"
                 )
@@ -1762,6 +1775,147 @@ def _register_infrastructure_tools(tool: Callable[..., Any], fleet: VCenterPool,
             }
 
         return await fleet.run(name, run)
+
+
+def _register_connection_tools(tool: Callable[..., Any], fleet: VCenterPool, resolved: Settings) -> None:
+    """Connection failures past the session count: vCenter's own logs and appliance, and the host path."""
+
+    @tool()
+    async def read_vcenter_log(
+        *,
+        vcenter: str,
+        log: str = "vpxd",
+        pattern: str | None = None,
+        lines: int = 2000,
+        limit: int = 200,
+    ) -> dict[str, Any]:
+        """Lines from vCenter's own log (vpxd by default), filtered on the server.
+
+        For connection failures the session count does not explain: vpxd logs
+        refused logins, session-limit and connection errors, and its own
+        restarts. Asked without a host, the DiagnosticManager offers vCenter's
+        logs; a bare name (vpxd) is matched to the key vCenter offers, and the
+        result lists the keys when the one asked for is not there.
+
+        Args:
+            vcenter: the vCenter to read.
+            log: the log name or key (vpxd, vpxd-alert, ...); vpxd when empty.
+            pattern: a regular expression to keep lines by; all lines when empty.
+            lines: how many of the last lines to read.
+            limit: how many matching lines to return.
+
+        """
+        if pattern:
+            caller_pattern(pattern)
+        name = fleet.resolve(vcenter)
+
+        def run(session: VCenterSession) -> dict[str, Any]:
+            read = hostlogs.read_vcenter_log(session, log or "vpxd", max(10, min(lines, 20000)))
+            if not read.get("available"):
+                return read
+            parsed = parse_lines("\n".join(read["lines"]), first_number=read["line_start"])
+            kept, total = grep(parsed, pattern or ".*", limit=max(1, min(limit, resolved.max_log_lines)))
+            return {
+                "key": read["key"],
+                "lines_read": len(parsed),
+                "matched": total,
+                "lines": [line.as_dict() for line in kept],
+            }
+
+        return {"vcenter": name, **await fleet.run(name, run)}
+
+    @tool()
+    async def vcenter_appliance_health(*, vcenter: str) -> dict[str, Any]:
+        """The vCenter appliance's own health: memory, disk, database, uptime and its services.
+
+        For connection failures with sessions to spare: a vpxd that restarted,
+        an appliance short of memory, swap or disk, or a service up but
+        unhealthy (vpxd, envoy, the reverse proxy) drops or refuses connections
+        for every client, and none of it shows in the session count. Reads the
+        appliance REST API (vCenter 7.0 U2 or later) with the vCenter's
+        credentials, inside a session opened and closed for this call. Each
+        endpoint the account may not read is named in not_read.
+
+        Args:
+            vcenter: the vCenter to read.
+
+        """
+        name = fleet.resolve(vcenter)
+        client = appliance.Appliance(resolved.vcenter(name), resolved)
+        deadline = resolved.timeout_seconds * 2
+        try:
+            result = await asyncio.wait_for(asyncio.to_thread(client.health), timeout=deadline)
+        except TimeoutError:
+            msg = f"vCenter {name}: the appliance API did not answer within {deadline:g}s"
+            raise VSphereError(msg) from None
+        return {"vcenter": name, **result}
+
+    @tool()
+    async def check_host_tls(
+        *, vcenters: list[str] | None = None, hosts: list[str] | None = None
+    ) -> dict[str, Any]:
+        """Can this server reach each ESXi host on 443, and does its certificate hold up — worst first.
+
+        Guest file transfers (run_in_guest's output, or any client's guestFile
+        URL) go to the ESXi host, not to vCenter: that is how the API works —
+        InitiateFileTransferFromGuest returns a URL naming the host, and the
+        client downloads from it. So guestFile SSL EOFs, resets and timeouts
+        are about the host's TLS endpoint and the path to it, not the vCenter
+        session count. The URL carries the host's IP address, so each host is
+        probed at that address (its name if it is an IP, else what it resolves
+        to here, else its management IP): whether the connection is answered,
+        refused or reset, and whether the certificate is trusted, unexpired and
+        covers that address. Beyond reading the hosts it sends no vSphere call —
+        a handshake, then the socket is closed. Tested from where this server
+        runs; a client elsewhere has its own path.
+
+        Args:
+            vcenters: vCenter names; all when empty.
+            hosts: host names or morefs to probe; every connected host when empty.
+
+        """
+        names = _names(fleet, vcenters)
+        return await hosttls.check_host_tls(fleet, resolved, names, hosts=hosts or [])
+
+    @tool()
+    async def search_host_logs(
+        *,
+        vcenters: list[str] | None = None,
+        hosts: list[str] | None = None,
+        log: str = "hostd",
+        pattern: str | None = None,
+        lines: int = 3000,
+        per_host: int = 5,
+    ) -> dict[str, Any]:
+        """The same log on every connected ESXi host, counted per host, to see whether failures cluster.
+
+        Guest operations leave no task or event; a failed guest file transfer
+        shows only in the host's hostd log. Reads the end of that log on every
+        host and counts the matching lines, so it answers whether failures are
+        on a few hosts (their certificate, their hostd load) or spread over all
+        of them (the network, the client). The default pattern matches guest
+        file transfers, TLS/SSL errors and dropped connections. For one host's
+        log in full, read_host_log.
+
+        Args:
+            vcenters: vCenter names; all when empty.
+            hosts: host names or morefs to read; every connected host when empty.
+            log: the host log key (hostd, vpxa, vmkernel).
+            pattern: a regular expression to match; guest transfers, TLS and dropped connections when empty.
+            lines: how many of the last lines to read per host.
+            per_host: how many of the newest matching lines to return per host.
+
+        """
+        names = _names(fleet, vcenters)
+        return await hostlogs.search_host_logs(
+            fleet,
+            names,
+            log=log or "hostd",
+            pattern=pattern,
+            lines=max(10, min(lines, 20000)),
+            keep=max(1, min(per_host, 20)),
+            hosts=hosts or [],
+        )
 
 
 def _register_vrops_tools(tool: Callable[..., Any], vrops: Vrops) -> None:

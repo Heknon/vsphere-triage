@@ -44,6 +44,7 @@ climb and work the rest.
 | An incident that is over, VMs possibly destroyed | `diagnose_window` (rung 3) |
 | Many VMs rebooted or went unreachable at once | `cluster_events` and `recent_tasks` first (below) |
 | SSL EOF errors, resets or timeouts from vCenter itself | `check_vcenters` (below) |
+| Guest file transfers (`guestFile`) fail with SSL EOFs, resets or timeouts | `check_host_tls` (below) |
 | "Which environments have lived too long?" | `find_old_environments`; this is cleanup, not an incident |
 
 Climb the ladder from where you start; do not skip to the counters. A VM's
@@ -53,19 +54,53 @@ the rungs above.
 ## When the vCenter itself fails
 
 SSL EOF errors, connection resets or timeouts that hit every client of a
-vCenter (this server included) usually mean the vCenter is at its connection
-or session limit.
+vCenter (this server included) often mean the vCenter is at its session or
+connection limit, but not always. First ask **which calls fail**:
 
-1. `check_vcenters`: the open-session count, this server's last login time
-   and a round-trip time per vCenter.
+- **Guest file transfers** (`guestFile` in the error, or `run_in_guest`'s
+  `output_error` says the download failed): go to *When guest file transfers
+  fail* below. That download goes to the ESXi host, not to vCenter, so the
+  session count does not explain it.
+- **API calls to vCenter itself**: follow these steps.
+
+1. `check_vcenters`: the open-session count **against the configured cap**
+   (`session_limit`, read from `config.vmacore.soap.maxSessionCount`), this
+   server's last login time and a round-trip time per vCenter. A count at or
+   near the cap (`limit_finding`) is the answer. When no cap is set,
+   `session_limit` is null and vpxd's built-in default applies; the API cannot
+   read that default, so do not claim a number for it.
 2. `vcenter_sessions` on the failing vCenter: sessions grouped by user,
-   source IP and client, with idle counts. One client holding most sessions,
-   or many idle ones from one source, is the usual leak.
+   source IP and client, with idle counts, the cap, and every
+   session/connection setting an administrator set (`connection_settings`).
+   One client holding most sessions, or many idle ones from one source, is
+   the usual leak.
 3. If the failure has passed, `vcenter_history` over that window: login
    surges, failed logins and the busiest sources, in 10-minute buckets.
-4. If sessions look normal but SSL or handshake errors continue,
-   `check_host_time`: a host clock skewed from vCenter breaks TLS, and past
-   about 300 s it breaks Kerberos/AD authentication.
+4. If the count is well under the cap, the session limit is not the cause.
+   Look at what else drops connections:
+   - `vcenter_appliance_health`: memory, swap, disk and database health, the
+     appliance's uptime (a recent restart dropped every connection at that
+     time) and services that are up but unhealthy (vpxd, envoy, the reverse
+     proxy).
+   - `read_vcenter_log` (vpxd) with a `pattern` such as
+     `session|connection|SSL|refused`, at the time of the failures.
+   - `check_host_time`: a host clock skewed from vCenter breaks TLS, and past
+     about 300 s it breaks Kerberos/AD authentication.
+
+The reverse proxy's own connection limit and live connection count are not in
+the vSphere API. On 7.0 and later Envoy owns port 443 and caps remote HTTPS
+connections (2048 by default, `maxRemoteHttpsConnections` in
+`/etc/vmware-rhttpproxy/config.xml`); at the cap it closes connections, which
+clients see as SSL EOFs, and `/var/log/vmware/envoy/envoy.log` says "remote
+https connections exceed" (Broadcom KB 344920). That fits SSL EOFs better than
+the session cap, which shows as refused logins. If everything above is clean,
+say Envoy is the remaining suspect and that a person must read that log on the
+appliance (**stop and ask**).
+
+Two more limits sit beside vpxd's: on 8.0 vpxd shortens session timeouts as the
+count nears the cap (`config.vmacore.soap.enableSessionTimeoutPenalties`, KB
+336100), so an idle count can drop on its own; and the REST API (vAPI) keeps
+its own per-user session pool, separate from the SOAP count.
 
 If the account cannot see the global session list, `check_vcenters` says so;
 use the login time and the pattern of failures across callers instead. The
@@ -74,6 +109,34 @@ verdict names it.
 
 A `diagnose_vm` that keeps failing with dropped connections is the same
 problem seen from one VM: run `check_vcenters` before trusting its result.
+
+## When guest file transfers fail
+
+A guest file transfer is two steps: a call to vCenter that returns a URL, then
+an HTTPS download from that URL. The URL names the **ESXi host**, so the
+download never touches vCenter. This is how the API works, not a guess to
+confirm. Failures here are about the host and the path to it:
+
+1. `check_host_tls`: from where this server runs, at the address the transfer
+   URL carries (through vCenter that is the host's **IP address**, not its
+   name), whether 443 answers, is refused or resets, and whether the host's
+   certificate is trusted, unexpired and covers that address. Every host
+   failing the same way means no transfer can work from here; a few failing
+   points at those hosts. `no_address_to_probe` means this server could not
+   find the address at all: that host was not tested, which is not a failure.
+2. `search_host_logs` (hostd by default): the matching lines on every
+   connected host, counted per host. Concentrated on a few hosts points at
+   those hosts (certificate, hostd load, their network); spread over most
+   hosts points at what they all share (the network, the client).
+3. `read_host_log` on the worst host for its full context.
+
+`check_host_tls` tests from this server. The failing client may be somewhere
+else with its own path. If this server cannot reach the hosts (or cannot find
+their address) while the client gets as far as an SSL EOF, the two paths
+differ: say so, and give the person the same handshake to run from the client
+against the address in a failing URL (`openssl s_client -connect
+<address>:443`). Such a URL works once, for ten minutes. If the probe is
+clean but the client still fails, the client's path or the host side is left.
 
 ## When many VMs failed together
 

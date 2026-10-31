@@ -111,3 +111,45 @@ the four scenarios the last change touched: **4 of 4 pass**.
 | template-snapshots | pass, 1 call | |
 
 No run, in any round, called a tool that acts on a VM.
+
+### Round 9: connection failures past the session count (0.4.0)
+
+Three scenarios for the new tools: vc-b set to a session cap of 10 with a
+leaking client holding 9 (`session-cap`), vc-a with few sessions and no cap
+(`under-cap`), and guest file transfers failing on vc-a, whose hosts this
+server cannot resolve (`guest-file-transfer`). `fleet` re-ran as a regression.
+
+- `guest-file-transfer` first came back partial: Haiku called "the download goes
+  to the host" only probable, and set aside the all-hosts-unresolved probe
+  because the client reports SSL EOFs, not name errors. That objection is
+  right, so `check_host_tls` now says a client reaching an SSL EOF has its own
+  path and gives the handshake to run from it, and the skill states the host
+  download as how the API works. The re-run passed.
+- Neither cap scenario claimed a default cap number: the result says the
+  default is not readable, and both runs repeated that.
+
+| scenario | round 9 | after the fix |
+|---|---|---|
+| session-cap | pass | |
+| under-cap | pass | |
+| guest-file-transfer | partial | pass, 8 calls, 18k |
+| fleet | pass | |
+
+Round 9's call logs were lost when the world was restarted for the fix, so
+only the re-run has call counts.
+
+A check of the change against Broadcom's documentation then found that a
+guestFile URL through vCenter carries the host's IP, not its name (KB 310066).
+`check_host_tls` now probes that address, and a host it cannot find an address
+for is reported as untested, not as a broken path. On the simulator (hosts that
+do not resolve, vmk0 at 0.0.0.0) that is every host, so the
+`guest-file-transfer` grading was corrected to match: the right answer is "not
+tested from here, test from the client", not "unreachable". `under-cap` re-ran
+because its note now quotes the KBs' default caps.
+
+| scenario | round 10 (final code) |
+|---|---|
+| guest-file-transfer | pass, 10 calls, 40k |
+| under-cap | pass, 9 calls, 22k; did not take a KB default as vc-a's cap |
+
+No run called a tool that acts on a VM.

@@ -3,7 +3,10 @@
 The accounts this server may run with can change things. So every vSphere call
 goes through `ReadOnlyStub`, which refuses any method that is not on
 `ALLOWED_METHODS` before a byte is sent, and every HTTP request goes through
-`ensure_read_request`, which refuses anything but GET and HEAD.
+`ensure_read_request`, which refuses anything but GET and HEAD. The one HTTP
+exchange that is not a read is the appliance API's REST session (a POST to log
+in, a DELETE to log out), the counterpart of SOAP Login/Logout, allowed by
+`ensure_session_request` for that path only.
 
 The exceptions, enabled deliberately by the operator, are the tools that act on
 a VM for diagnostics and so cannot be read-only: `run_in_guest` (a command
@@ -73,6 +76,12 @@ ALLOWED_METHODS = frozenset(
 
 ALLOWED_HTTP_METHODS = frozenset({"GET", "HEAD"})
 
+# The REST counterpart of SOAP Login/Logout: the appliance API opens a session
+# with a POST to this path and closes it with a DELETE of it. Nothing else but
+# GET and HEAD is ever sent over HTTP (see `appliance`).
+REST_SESSION_PATH = "/api/session"
+REST_SESSION_METHODS = frozenset({"POST", "DELETE"})
+
 
 class ReadOnlyViolationError(PermissionError):
     """A call that could change vSphere was attempted and refused."""
@@ -118,4 +127,18 @@ def ensure_read_request(method: str) -> None:
     """Refuse an HTTP method that could write a datastore file or anything else."""
     if method.upper() not in ALLOWED_HTTP_METHODS:
         msg = f"Refused HTTP {method}: this server only reads from vSphere"
+        raise ReadOnlyViolationError(msg)
+
+
+def ensure_session_request(method: str, path: str) -> None:
+    """Allow a REST login (POST) or logout (DELETE) of `/api/session`, and nothing else.
+
+    The REST session is the one HTTP exchange that is not a GET, as SOAP's
+    Login and Logout are on `ALLOWED_METHODS`: it opens and closes a session
+    that lives only for this server's call and changes nothing anyone else sees.
+    """
+    if method.upper() in ALLOWED_HTTP_METHODS:
+        return
+    if method.upper() not in REST_SESSION_METHODS or path.rstrip("/") != REST_SESSION_PATH:
+        msg = f"Refused HTTP {method} {path}: only a session login/logout may be other than a read"
         raise ReadOnlyViolationError(msg)

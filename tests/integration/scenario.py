@@ -190,6 +190,8 @@ class World:
     machines: dict[str, Machine] = field(default_factory=dict)
     hosts: dict[str, str] = field(default_factory=dict)
     datastores: dict[str, str] = field(default_factory=dict)
+    # Sessions the fixture opened and left open, as a leaking client would.
+    held: list[Any] = field(default_factory=list)
 
     def moref(self, folder: str, name: str) -> str:
         """The moref of the VM `name` in folder `folder`."""
@@ -205,6 +207,35 @@ def connect(port: int) -> Any:
         pwd="pass",
         sslContext=ssl._create_unverified_context(),  # noqa: S323
     )
+
+
+# vc-b is set to a session cap of 10, and a leaking client holds 9: with the server's
+# own session the vCenter is at its configured limit.
+SESSION_CAP = 10
+LEAKED_SESSIONS = 9
+LEAKY_AGENT = "nightly-report/2.1"
+
+
+def crowd_sessions(world: World, *, cap: int, leaked: int) -> None:
+    """Set the vCenter's session cap and open `leaked` sessions that are never closed."""
+    service = connect(world.port)
+    try:
+        service.content.setting.UpdateOptions(
+            changedValue=[vim.option.OptionValue(key="config.vmacore.soap.maxSessionCount", value=str(cap))]
+        )
+    finally:
+        Disconnect(service)
+    for _ in range(leaked):
+        world.held.append(
+            SmartConnect(
+                host="127.0.0.1",
+                port=world.port,
+                user="report",
+                pwd="pass",
+                sslContext=ssl._create_unverified_context(),  # noqa: S323 - the simulator
+                customHeaders={"User-Agent": LEAKY_AGENT},
+            )
+        )
 
 
 def build(container: str, folders: list[str], machines: list[Machine], *, work: Path) -> World:  # noqa: PLR0912 - one fixture build
@@ -812,4 +843,5 @@ def fleet(work: Path) -> tuple[World, World]:
         b_machines,
         work=work,
     )
+    crowd_sessions(b, cap=SESSION_CAP, leaked=LEAKED_SESSIONS)
     return a, b

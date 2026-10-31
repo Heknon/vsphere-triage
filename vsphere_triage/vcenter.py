@@ -197,6 +197,49 @@ def _top(counts: dict[str, int], keep: int = 15) -> dict[str, int]:
     return dict(list(counts.items())[:keep])
 
 
+SESSION_LIMIT_KEY = "config.vmacore.soap.maxSessionCount"
+# Words in a `config.vmacore.*` key that make it worth showing beside a session count.
+CONNECTION_SETTING_WORDS = ("session", "connection", "timeout", "max")
+# At or past this share of the configured cap, logins are close to being refused.
+NEAR_LIMIT_SHARE = 0.8
+
+
+def against_limit(total: int, limit: int | None) -> dict[str, Any]:
+    """A session count read against the configured cap, or a note that the cap is the default.
+
+    Pure. With a cap: the share of it in use and, near or at it, a finding.
+    Without one: the cap is vpxd's built-in default, which the API cannot read,
+    so the count alone cannot say how close the vCenter is to refusing logins.
+    """
+    if limit is None:
+        return {
+            "session_limit": None,
+            "session_limit_note": (
+                f"{SESSION_LIMIT_KEY} is not set in this vCenter's advanced settings, so vpxd's built-in "
+                "default applies; the API cannot read it, and Broadcom's KBs give 2000 (KB 322837) and, "
+                "for 8.0, 500 (KB 336100). A count well under that points away from a session cap and at "
+                "connections (Envoy's limit), the appliance or the network instead"
+            ),
+        }
+    share = total / limit
+    result: dict[str, Any] = {
+        "session_limit": limit,
+        "percent_of_limit": round(share * 100, 1),
+        "session_limit_source": SESSION_LIMIT_KEY,
+    }
+    if share >= 1:
+        result["limit_finding"] = (
+            f"{total} sessions open against a configured cap of {limit} ({SESSION_LIMIT_KEY}): "
+            "the vCenter is at its session limit and refuses new logins"
+        )
+    elif share >= NEAR_LIMIT_SHARE:
+        result["limit_finding"] = (
+            f"{total} sessions open against a configured cap of {limit} ({share:.0%}): "
+            "close to the point where new logins are refused"
+        )
+    return result
+
+
 class VCenterSession:
     """A logged-in, read-only session on one vCenter. Not thread-safe to create."""
 
@@ -364,6 +407,8 @@ class VCenterSession:
                 "total": len(sessions),
                 "note": _OWN_ONLY_NOTE,
                 "current_user": current,
+                # The cap is readable even when the sessions are not.
+                "session_limit": self.session_limit(),
             }
         by_user: dict[str, int] = {}
         for entry in sessions:
@@ -371,6 +416,7 @@ class VCenterSession:
         return {
             "visible": "all",
             "total": len(sessions),
+            **against_limit(len(sessions), self.session_limit()),
             "by_user": dict(sorted(by_user.items(), key=lambda kv: kv[1], reverse=True)[:15]),
             "current_user": current,
         }
@@ -431,9 +477,15 @@ class VCenterSession:
                     f"{len(idle)} sessions idle past the {idle_cut or 30:g}-min timeout; most from {worst} — "
                     "idle sessions that never close are the classic leak"
                 )
+        limit = self.session_limit()
+        measured = against_limit(len(rows), limit)
+        if measured.get("limit_finding"):
+            findings.insert(0, measured["limit_finding"])
         return {
             "visible": "all",
             "total": len(rows),
+            **measured,
+            "connection_settings": self.connection_settings(),
             "idle_timeout_minutes": idle_cut,
             "idle_sessions": len(idle),
             "by_user": _top(by_user),
@@ -446,6 +498,54 @@ class VCenterSession:
                 reverse=True,
             )[:10],
         }
+
+    def session_limit(self) -> int | None:
+        """The configured API session cap (`config.vmacore.soap.maxSessionCount`), if it is set.
+
+        vpxd refuses new logins once this many sessions are open. The setting is
+        present only when someone set it; otherwise vpxd's built-in default
+        applies, which the API does not expose, and this returns None.
+        """
+        value = self._option(SESSION_LIMIT_KEY)
+        if value is None or isinstance(value, bool):
+            return None
+        with contextlib.suppress(TypeError, ValueError):
+            number = int(str(value).strip())
+            return number if number > 0 else None
+        return None
+
+    def connection_settings(self) -> dict[str, Any]:
+        """Every advanced setting under `config.vmacore.` that names a session, connection or timeout.
+
+        Read as found rather than by guessed names: whatever an administrator
+        set in vpxd's SOAP/HTTP layer (a session cap, a connection limit, a
+        timeout) shows here, and nothing shows when nothing was set.
+        """
+        found: dict[str, Any] = {}
+        options: list[Any] = []
+        with contextlib.suppress(Exception):
+            options = list(self.content.setting.QueryOptions("config.vmacore."))
+        if not options:
+            # A prefix with nothing under it raises InvalidName (and the simulator refuses
+            # prefixes): read every option, by naming none, and filter.
+            with contextlib.suppress(Exception):
+                options = [
+                    option
+                    for option in self.content.setting.QueryOptions() or []
+                    if str(getattr(option, "key", "")).startswith("config.vmacore.")
+                ]
+        for option in options:
+            key = str(getattr(option, "key", ""))
+            if any(word in key.lower() for word in CONNECTION_SETTING_WORDS):
+                found[key] = getattr(option, "value", None)
+        return dict(sorted(found.items()))
+
+    def _option(self, key: str) -> Any:
+        """One advanced setting's value, or None when it is not set or not readable."""
+        with contextlib.suppress(Exception):
+            values = self.content.setting.QueryOptions(key)
+            return values[0].value if values else None
+        return None
 
     def _session_timeout_minutes(self) -> float | None:
         """The configured API idle-session timeout, if the setting is readable."""
@@ -677,7 +777,8 @@ class VCenterSession:
                 output_error = (
                     f"the command ran, but its output could not be downloaded from the ESXi host "
                     f"({type(error).__name__}: {error}); the host must be reachable from this server "
-                    "and its certificate trusted (VSPHERE_CA_BUNDLE)"
+                    "and its certificate trusted (VSPHERE_CA_BUNDLE). The download goes to the host, not "
+                    "vCenter: check_host_tls probes that path, search_host_logs finds the host's side"
                 )
         finally:
             with contextlib.suppress(Exception):
