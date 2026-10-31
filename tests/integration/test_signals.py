@@ -362,3 +362,75 @@ def test_resource_limits_carry_the_template_base_disk(server: MCPServer) -> None
     assert "coolwin" in (capped["base_disk"] or "")
     # the rollup names the template the capped clone came from
     assert any("coolwin" in (t["base_disk"] or "") for t in result["by_template"])
+
+
+# -- connection failures past the session count ---------------------------------------------
+
+
+def test_a_vcenter_at_its_configured_session_cap_says_so(server: MCPServer) -> None:
+    import scenario  # noqa: PLC0415 - the fixture's own module
+
+    result = call(server, "check_vcenters")
+
+    rows = {row["name"]: row for row in result["vcenters"]}
+    capped = rows["vc-b"]["sessions"]
+    assert capped["session_limit"] == scenario.SESSION_CAP
+    assert capped["total"] >= scenario.SESSION_CAP
+    assert "at its session limit" in capped["limit_finding"]
+    assert any(finding.startswith("vc-b: ") and "session limit" in finding for finding in result["findings"])
+    # vc-a has no cap set: the default applies, and the result says it cannot read it.
+    assert rows["vc-a"]["sessions"]["session_limit"] is None
+    assert "not readable" in rows["vc-a"]["sessions"]["session_limit_note"]
+
+
+def test_the_session_breakdown_names_the_leaking_client_against_the_cap(server: MCPServer) -> None:
+    import scenario  # noqa: PLC0415 - the fixture's own module
+
+    result = call(server, "vcenter_sessions", {"vcenter": "vc-b"})
+
+    assert result["visible"] == "all"
+    assert result["session_limit"] == scenario.SESSION_CAP
+    assert result["by_user"]["report"] == scenario.LEAKED_SESSIONS
+    assert "configured cap of 10" in result["findings"][0]
+    assert result["connection_settings"]["config.vmacore.soap.maxSessionCount"] == "10"
+
+
+def test_hosts_whose_names_do_not_resolve_are_named_as_the_transfer_path(server: MCPServer) -> None:
+    result = call(server, "check_host_tls", {"vcenters": ["vc-a"]})
+
+    # vcsim's hosts are named DC0_C0_H0 and the like: no DNS has them.
+    assert result["hosts_probed"] >= 4
+    assert result["by_outcome"] == {"name_does_not_resolve": result["hosts_probed"]}
+    assert "no guest file transfer can complete" in result["findings"][0]
+
+
+def test_a_handshake_with_the_simulator_is_judged_by_trust(worlds: tuple[Any, Any]) -> None:
+    from vsphere_triage import hosttls  # noqa: PLC0415
+
+    # The simulator's own TLS endpoint stands in for a host: self-signed, so not trusted.
+    port = worlds[0].port
+    verified = asyncio.run(hosttls.probe("127.0.0.1", Settings(), port=port))
+    unverified = asyncio.run(hosttls.probe("127.0.0.1", Settings(tls_verify=False), port=port))
+
+    assert verified["outcome"] in (hosttls.UNTRUSTED, hosttls.NAME_MISMATCH)
+    assert unverified["outcome"] == hosttls.OK
+
+
+def test_a_host_log_sweep_the_simulator_cannot_answer_is_not_called_clean(server: MCPServer) -> None:
+    result = call(server, "search_host_logs", {"vcenters": ["vc-a"]})
+
+    assert result["hosts_read"] == 0
+    assert result["unread"]
+    assert "not evidence there are none" in result["findings"][0]
+
+
+def test_vcenters_own_log_the_simulator_lacks_is_reported(server: MCPServer) -> None:
+    result = call(server, "read_vcenter_log", {"vcenter": "vc-a"})
+
+    assert result["available"] is False
+    assert "QueryDescriptions" in result["reason"]
+
+
+def test_an_appliance_without_the_rest_api_is_said_in_words(server: MCPServer) -> None:
+    with pytest.raises(ToolError, match="appliance REST API"):
+        asyncio.run(server.call_tool("vcenter_appliance_health", {"vcenter": "vc-a"}))

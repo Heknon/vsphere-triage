@@ -62,11 +62,15 @@ session's raw (unguarded) stub: `run_in_guest`, the two power operations
 `reboot_guest` / `hard_reset`, and the guest-reading `check_ems` /
 `investigate_windows_boot` / `investigate_linux_boot` / `read_crash_dump` (which
 reach the raw stub only when they run a command in the guest). The optional vROps and PowerFlex
-clients are separate GET-only HTTP clients, not vSphere stubs. A test sweeps every read-only tool and asserts the
+clients are separate GET-only HTTP clients, not vSphere stubs, and so is the
+appliance client (`vcenter_appliance_health`), apart from opening and closing
+its REST session (`readonly.ensure_session_request`: POST and DELETE of
+`/api/session`, nothing else). `check_host_tls` sends no request at all, only a
+TLS handshake. A test sweeps every read-only tool and asserts the
 vSphere methods sent are a subset of `readonly.ALLOWED_METHODS`; others assert
 that guest exec and the power operations never dirty that guarded surface, and
-that the PowerFlex client issues only GET requests (its own read-only proof,
-via a mock transport). If
+that the PowerFlex and appliance clients issue only GET requests beyond their
+login (their own read-only proof, via a mock transport). If
 you add a tool or a vSphere call, keep those tests passing — do not add a method
 to the allowlist to silence the sweep without understanding why it is being
 sent, and route any new non-read-only operation through the raw stub, never by
