@@ -111,3 +111,31 @@ the four scenarios the last change touched: **4 of 4 pass**.
 | template-snapshots | pass, 1 call | |
 
 No run, in any round, called a tool that acts on a VM.
+
+### Round 9: connection failures past the session count (0.4.0)
+
+Three scenarios for the new tools: vc-b set to a session cap of 10 with a
+leaking client holding 9 (`session-cap`), vc-a with few sessions and no cap
+(`under-cap`), and guest file transfers failing on vc-a, whose hosts this
+server cannot resolve (`guest-file-transfer`). `fleet` re-ran as a regression.
+
+- `guest-file-transfer` first came back partial: Haiku called "the download goes
+  to the host" only probable, and set aside the all-hosts-unresolved probe
+  because the client reports SSL EOFs, not name errors. That objection is
+  right, so `check_host_tls` now says a client reaching an SSL EOF has its own
+  path and gives the handshake to run from it, and the skill states the host
+  download as how the API works. The re-run passed.
+- Neither cap scenario claimed a default cap number: the result says the
+  default is not readable, and both runs repeated that.
+
+| scenario | round 9 | after the fix |
+|---|---|---|
+| session-cap | pass | |
+| under-cap | pass | |
+| guest-file-transfer | partial | pass, 8 calls, 18k |
+| fleet | pass | |
+
+Round 9's call logs were lost when the world was restarted for the fix, so
+only the re-run has call counts.
+
+No run called a tool that acts on a VM.
