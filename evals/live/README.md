@@ -138,4 +138,18 @@ server cannot resolve (`guest-file-transfer`). `fleet` re-ran as a regression.
 Round 9's call logs were lost when the world was restarted for the fix, so
 only the re-run has call counts.
 
+A check of the change against Broadcom's documentation then found that a
+guestFile URL through vCenter carries the host's IP, not its name (KB 310066).
+`check_host_tls` now probes that address, and a host it cannot find an address
+for is reported as untested, not as a broken path. On the simulator (hosts that
+do not resolve, vmk0 at 0.0.0.0) that is every host, so the
+`guest-file-transfer` grading was corrected to match: the right answer is "not
+tested from here, test from the client", not "unreachable". `under-cap` re-ran
+because its note now quotes the KBs' default caps.
+
+| scenario | round 10 (final code) |
+|---|---|
+| guest-file-transfer | pass, 10 calls, 40k |
+| under-cap | pass, 9 calls, 22k; did not take a KB default as vc-a's cap |
+
 No run called a tool that acts on a VM.
