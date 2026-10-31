@@ -7,11 +7,19 @@ ESXi host, not vCenter. So "guestFile" SSL EOFs, resets and timeouts are about
 the path from the client to the host and the host's own TLS endpoint, and a
 vCenter with sessions to spare can still see every transfer fail.
 
-This opens a TCP connection to each host, then a TLS handshake, and reports
-which step failed and why: the name does not resolve, nothing answers (a
-firewall dropping it), the connection is refused or reset, or the certificate
-is not trusted, expired, or does not cover the name in the URL. No vSphere
-method and no HTTP request is sent: only a handshake, then the socket is closed.
+Through vCenter the URL carries the host's IP address, not its name: the IP it
+was registered with, or for a host registered by name the first address DNS
+returns for it (Broadcom KB 310066). The URL is good for ten minutes and one
+successful GET. So the probe goes to that address: the host's name if it is an
+IP, else the first address it resolves to here, else the IP of its management
+interface; and the certificate is checked against that address, as a client
+following the URL would check it.
+
+Per host it reports which step failed and why: no address to probe, nothing
+answers (a firewall dropping it), the connection is refused or reset, or the
+certificate is not trusted, expired, or does not cover the address. No vSphere
+method beyond reading the hosts, and no HTTP request: a handshake, then the
+socket is closed.
 
 It tests from where this server runs. A client somewhere else has its own path,
 so a host this server reaches can still be out of that client's reach.
@@ -21,19 +29,21 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import ipaddress
 import ssl
 import time
 from datetime import UTC, datetime
 from typing import TYPE_CHECKING, Any
 
-from vsphere_triage.inventory import read_hosts
+from pyVmomi import vim
+
 from vsphere_triage.vcenter import ssl_context
 
 if TYPE_CHECKING:
     from collections.abc import Sequence
 
     from vsphere_triage.config import Settings
-    from vsphere_triage.vcenter import VCenterPool
+    from vsphere_triage.vcenter import VCenterPool, VCenterSession
 
 PORT = 443
 CONCURRENT_PROBES = 16
@@ -44,7 +54,7 @@ EXPIRES_SOON_DAYS = 30
 SHOWN = 8
 
 # The outcomes a probe can have, worst first in a summary.
-UNRESOLVED = "name_does_not_resolve"
+UNRESOLVED = "no_address_to_probe"
 NO_ANSWER = "no_answer"
 REFUSED = "refused"
 RESET = "reset_during_handshake"
@@ -55,12 +65,19 @@ TLS_FAILED = "tls_failed"
 OK = "ok"
 
 MEANING = {
-    UNRESOLVED: "the host's name does not resolve from this server, so a transfer URL naming it cannot work",
+    UNRESOLVED: (
+        "not probed: the host's name does not resolve from this server and the host reports no usable "
+        "management IP, so the address vCenter puts in its transfer URLs is unknown here — not evidence "
+        "the path is broken"
+    ),
     NO_ANSWER: "nothing answered on the port in time: a firewall dropping the traffic, or the host is down",
     REFUSED: "the host refused the connection: nothing listening, or a firewall rejecting it",
     RESET: "the connection was reset or closed during the TLS handshake — the same SSL EOF clients see",
     UNTRUSTED: "the host's certificate is not signed by a CA this server trusts (VSPHERE_CA_BUNDLE)",
-    NAME_MISMATCH: "the host's certificate does not cover the name vCenter puts in the transfer URL",
+    NAME_MISMATCH: (
+        "the host's certificate does not cover the IP address vCenter puts in the transfer URL, so a "
+        "client that checks the name refuses it"
+    ),
     EXPIRED: "the host's certificate has expired",
     TLS_FAILED: "the TLS handshake failed for another reason; see `error`",
     OK: "reachable, and the handshake completed",
@@ -132,24 +149,60 @@ def certificate_facts(der: bytes | None, *, now: datetime | None = None) -> dict
     }
 
 
-async def probe(host: str, settings: Settings, *, port: int = PORT) -> dict[str, Any]:
-    """One host: resolve, connect, handshake. Every failure is a result, never raised."""
-    deadline = min(MAX_PROBE_SECONDS, settings.timeout_seconds)
-    result: dict[str, Any] = {"host": host, "port": port}
+def _usable_ip(text: str | None) -> str | None:
+    """`text` if it is a routable-looking IP address (not 0.0.0.0 or ::), else None."""
+    if not text:
+        return None
+    try:
+        address = ipaddress.ip_address(text.strip())
+    except ValueError:
+        return None
+    return None if address.is_unspecified else str(address)
+
+
+async def url_address(
+    host: str, management_ip: str | None, deadline: float
+) -> tuple[str | None, str, str | None]:
+    """The address a transfer URL for this host would carry, how it was found, and why not.
+
+    The host's name when it is an IP; else the first address it resolves to
+    (what vCenter uses for a host registered by name); else its management IP.
+    """
+    if _usable_ip(host):
+        return _usable_ip(host), "the host's name is its IP", None
     loop = asyncio.get_running_loop()
     try:
-        addresses = await asyncio.wait_for(loop.getaddrinfo(host, port), timeout=deadline)
+        found = await asyncio.wait_for(loop.getaddrinfo(host, PORT), timeout=deadline)
     except (OSError, TimeoutError) as error:
-        return result | {"outcome": UNRESOLVED, "error": f"{type(error).__name__}: {error}"}
-    result["address"] = addresses[0][4][0] if addresses else None
+        why = f"{type(error).__name__}: {error}"
+        fallback = _usable_ip(management_ip)
+        if fallback:
+            return fallback, "the host's management IP (its name does not resolve here)", why
+        return None, "", why
+    return str(found[0][4][0]), "the first address the host's name resolves to here", None
+
+
+async def probe(
+    host: str, settings: Settings, *, port: int = PORT, management_ip: str | None = None
+) -> dict[str, Any]:
+    """One host: find the address its transfer URLs carry, connect, handshake. Never raises."""
+    deadline = min(MAX_PROBE_SECONDS, settings.timeout_seconds)
+    result: dict[str, Any] = {"host": host, "port": port}
+    address, how, why = await url_address(host, management_ip, deadline)
+    if address is None:
+        return result | {"outcome": UNRESOLVED, "error": why}
+    result |= {"url_address": address, "address_from": how}
+    if why:
+        result["name_error"] = why
     started = time.monotonic()
     writer: asyncio.StreamWriter | None = None
     try:
-        _, writer = await asyncio.wait_for(asyncio.open_connection(host, port), timeout=deadline)
+        _, writer = await asyncio.wait_for(asyncio.open_connection(address, port), timeout=deadline)
         result["connect_seconds"] = round(time.monotonic() - started, 3)
         handshake = time.monotonic()
+        # Checked against the address, as a client following the URL checks it.
         await asyncio.wait_for(
-            writer.start_tls(ssl_context(settings), server_hostname=host), timeout=deadline
+            writer.start_tls(ssl_context(settings), server_hostname=address), timeout=deadline
         )
         result["handshake_seconds"] = round(time.monotonic() - handshake, 3)
         tls = writer.get_extra_info("ssl_object")
@@ -161,7 +214,7 @@ async def probe(host: str, settings: Settings, *, port: int = PORT) -> dict[str,
         result["outcome"] = outcome_of(error)
         result["error"] = f"{type(error).__name__}: {getattr(error, 'verify_message', None) or error}"
         if result["outcome"] in (UNTRUSTED, NAME_MISMATCH, EXPIRED):
-            result["certificate"] = await _unverified_certificate(host, port, deadline)
+            result["certificate"] = await _unverified_certificate(address, port, deadline)
     finally:
         if writer is not None:
             writer.close()
@@ -207,15 +260,22 @@ def _outcome_findings(
         )
     elif len(failing) == len(rows) and len(by_outcome) == 1:
         outcome = failing[0]["outcome"]
+        if outcome == UNRESOLVED:
+            findings.append(
+                f"no host ({len(rows)}) could be probed — {MEANING[outcome]}. Take the address from a "
+                "failing transfer URL and run the handshake from the client (openssl s_client -connect "
+                "<address>:443)"
+            )
+            return findings
         findings.append(
             f"every host ({len(rows)}) fails the same way — {outcome}: {MEANING[outcome]}. From this server "
             "no guest file transfer can complete, however healthy vCenter is"
         )
-        if outcome in (UNRESOLVED, NO_ANSWER, REFUSED):
+        if outcome in (NO_ANSWER, REFUSED):
             findings.append(
                 "a client that gets as far as an SSL EOF or reset did reach the host, so its path differs "
                 "from this server's: run the same handshake from the client (openssl s_client -connect "
-                "<host>:443) to see its own failure"
+                "<address>:443) to see its own failure"
             )
     else:
         findings.append(f"{len(failing)} of {len(rows)} hosts fail on {PORT} from this server")
@@ -272,12 +332,36 @@ def summarize(rows: list[dict[str, Any]], *, verify: bool) -> dict[str, Any]:
     }
 
 
+def management_ip(vnics: Any) -> str | None:
+    """The IP of a host's management VMkernel interface: vmk0, else the first with an address."""
+    candidates = sorted(vnics or [], key=lambda vnic: getattr(vnic, "device", "") != "vmk0")
+    for vnic in candidates:
+        address = _usable_ip(getattr(getattr(getattr(vnic, "spec", None), "ip", None), "ipAddress", None))
+        if address:
+            return address
+    return None
+
+
+def _read_targets(session: VCenterSession) -> list[dict[str, Any]]:
+    """Every host's name, connection state and management IP. Blocking."""
+    rows = session.retrieve(vim.HostSystem, ("name", "runtime.connectionState", "config.network.vnic"))
+    return [
+        {
+            "name": row.get("name", row["moref"]),
+            "moref": row["moref"],
+            "connection_state": row.get("runtime.connectionState"),
+            "management_ip": management_ip(row.get("config.network.vnic")),
+        }
+        for row in rows
+    ]
+
+
 async def check_host_tls(
     pool: VCenterPool, settings: Settings, names: Sequence[str], *, hosts: Sequence[str] = ()
 ) -> dict[str, Any]:
     """Probe every connected host (or the named ones) across the vCenters on 443."""
     wanted = {name.strip().lower() for name in hosts if name.strip()}
-    results = await asyncio.gather(*(pool.run(name, read_hosts) for name in names), return_exceptions=True)
+    results = await asyncio.gather(*(pool.run(name, _read_targets) for name in names), return_exceptions=True)
     targets: list[dict[str, Any]] = []
     errors: dict[str, str] = {}
     not_connected: list[str] = []
@@ -285,18 +369,20 @@ async def check_host_tls(
         if isinstance(result, BaseException):
             errors[name] = str(result)
             continue
-        for facts in result.values():
-            if wanted and facts.name.lower() not in wanted and facts.moref.lower() not in wanted:
+        for facts in result:
+            if wanted and facts["name"].lower() not in wanted and facts["moref"].lower() not in wanted:
                 continue
-            if facts.connection_state not in (None, "connected"):
-                not_connected.append(f"{name}:{facts.name}")
+            if facts["connection_state"] not in (None, "connected"):
+                not_connected.append(f"{name}:{facts['name']}")
                 continue
-            targets.append({"vcenter": name, "name": facts.name, "moref": facts.moref})
+            targets.append(
+                {"vcenter": name} | {key: facts[key] for key in ("name", "moref", "management_ip")}
+            )
     gate = asyncio.Semaphore(CONCURRENT_PROBES)
 
     async def one(target: dict[str, Any]) -> dict[str, Any]:
         async with gate:
-            return target | await probe(target["name"], settings)
+            return target | await probe(target["name"], settings, management_ip=target["management_ip"])
 
     rows = list(await asyncio.gather(*(one(target) for target in targets)))
     summary = summarize(rows, verify=settings.tls_verify)
@@ -310,7 +396,9 @@ async def check_host_tls(
         "not_connected": not_connected[:25],
         "errors": errors,
         "note": (
-            "probed from where this server runs, by the host's name in vCenter (normally the name a "
-            "guest file-transfer URL carries); a client elsewhere has its own network path"
+            "probed from where this server runs, at the address a guest file-transfer URL carries (the "
+            "host's IP: the name if it is one, else what the name resolves to here, else its management "
+            "IP; vCenter resolves names with its own DNS, which can differ); a client elsewhere has its "
+            "own network path"
         ),
     }

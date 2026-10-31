@@ -34,15 +34,17 @@ if TYPE_CHECKING:
 
 SESSION_PATH = "/api/session"
 SESSION_HEADER = "vmware-api-session-id"
-# The health areas the appliance reports, each a colour: green, orange, red or gray.
+# The health areas the appliance reports, each a colour: green, yellow (healthy but with
+# some problems), orange, red, or gray (unknown).
 HEALTH_AREAS = ("system", "load", "mem", "swap", "storage", "database-storage", "applmgmt")
 UPTIME_PATH = "/api/appliance/system/uptime"
-# vMon's services; the first path is the current one, the second its older spelling.
-SERVICES_PATHS = ("/api/vcenter/services", "/api/appliance/vmon/service")
+# vMon's services: a map of service name to its state, health and startup type.
+SERVICES_PATH = "/api/vcenter/services"
 # Services whose trouble drops or refuses API connections, named first when unhealthy.
 CONNECTION_SERVICES = ("vpxd", "envoy", "rhttpproxy", "vapi-endpoint", "sts", "vmware-vpostgres")
 RECENT_RESTART_SECONDS = 24 * 3600
 BAD_COLOURS = ("orange", "red")
+WARNING_COLOURS = ("yellow",)
 
 
 class ApplianceError(RuntimeError):
@@ -50,21 +52,18 @@ class ApplianceError(RuntimeError):
 
 
 def _service_rows(raw: Any) -> list[dict[str, Any]]:
-    """The vMon service list as rows, from either response shape: a map, or a list of {key, value}."""
-    if isinstance(raw, dict):
-        items = list(raw.items())
-    elif isinstance(raw, list):
-        items = [(item.get("key"), item.get("value")) for item in raw if isinstance(item, dict)]
-    else:
+    """The service map vCenter returns (`/api/vcenter/services`), as rows."""
+    if not isinstance(raw, dict):
         return []
     rows = []
-    for name, info in items:
+    for name, info in raw.items():
         if not isinstance(info, dict):
             continue
         rows.append(
             {
                 "service": name,
                 "state": info.get("state"),
+                # Set only while the service is STARTED.
                 "health": info.get("health"),
                 "startup_type": info.get("startup_type"),
                 "health_messages": [
@@ -74,6 +73,19 @@ def _service_rows(raw: Any) -> list[dict[str, Any]]:
             }
         )
     return rows
+
+
+def service_trouble(row: dict[str, Any]) -> str | None:
+    """`unhealthy`, `warning`, `stopped` (an automatic service that is down), or None. Pure."""
+    state = str(row.get("state") or "").upper()
+    health = str(row.get("health") or "").upper()
+    if state == "STARTED" and health == "DEGRADED":
+        return "unhealthy"
+    if state == "STARTED" and health == "HEALTHY_WITH_WARNINGS":
+        return "warning"
+    if state == "STOPPED" and str(row.get("startup_type") or "").upper() == "AUTOMATIC":
+        return "stopped"
+    return None
 
 
 def judge(health: dict[str, Any], uptime_seconds: float | None, services: list[dict[str, Any]]) -> list[str]:
@@ -87,33 +99,31 @@ def judge(health: dict[str, Any], uptime_seconds: float | None, services: list[d
             + " — a short appliance (memory, swap, disk, database) slows or drops API connections for "
             "every client"
         )
+    warned = {area: colour for area, colour in health.items() if str(colour).lower() in WARNING_COLOURS}
+    if warned:
+        findings.append(
+            "appliance health yellow (healthy, with some problems): "
+            + ", ".join(warned)
+            + " — worth a look; not by itself a cause of dropped connections"
+        )
     if uptime_seconds is not None and uptime_seconds < RECENT_RESTART_SECONDS:
         findings.append(
             f"the appliance came up {uptime_seconds / 3600:.1f} h ago: every session and connection was "
             "dropped then — errors at that time are the restart, not a limit"
         )
-    unhealthy = [
-        row
-        for row in services
-        if (
-            str(row.get("state")).upper() == "STARTED"
-            and str(row.get("health")).upper() not in ("HEALTHY", "NONE")
-        )
-        or (
-            str(row.get("state")).upper() == "STOPPED" and str(row.get("startup_type")).upper() == "AUTOMATIC"
-        )
-    ]
-    unhealthy.sort(key=lambda row: row["service"] not in CONNECTION_SERVICES)
-    for row in unhealthy[:8]:
+    troubled = [row for row in services if service_trouble(row)]
+    # Unhealthy and stopped before warnings; the services that carry API connections first.
+    troubled.sort(
+        key=lambda row: (service_trouble(row) == "warning", row["service"] not in CONNECTION_SERVICES)
+    )
+    for row in troubled[:8]:
         why = "; ".join(message for message in row["health_messages"] if message)
+        carries = row["service"] in CONNECTION_SERVICES and service_trouble(row) != "warning"
         findings.append(
-            f"service {row['service']} is {row['state']} / {row['health']}"
+            f"service {row['service']} is {row['state']}"
+            + (f" / {row['health']}" if row.get("health") else "")
             + (f" ({why})" if why else "")
-            + (
-                " — it carries the API connections, so its trouble is every client's"
-                if row["service"] in CONNECTION_SERVICES
-                else ""
-            )
+            + (" — it carries the API connections, so its trouble is every client's" if carries else "")
         )
     return findings
 
@@ -201,23 +211,14 @@ class Appliance:
         uptime_seconds = float(uptime) if isinstance(uptime, (int, float)) else None
         if why is not None:
             not_read["system/uptime"] = why
-        services: list[dict[str, Any]] = []
-        reasons = []
-        for path in SERVICES_PATHS:
-            raw, why = self._get(client, token, path)
-            if why is None:
-                services = _service_rows(raw)
-                break
-            reasons.append(f"{path}: {why}")
-        if not services and reasons:
-            not_read["services"] = "; ".join(reasons)
+        raw, why = self._get(client, token, SERVICES_PATH)
+        services = _service_rows(raw) if why is None else []
+        if why is not None:
+            not_read["services"] = why
         findings = judge(health, uptime_seconds, services)
-        if not findings:
-            findings = (
-                ["appliance healthy: every health area read is green, no recent restart, services healthy"]
-                if health and not not_read
-                else []
-            )
+        all_green = bool(health) and all(str(colour).lower() == "green" for colour in health.values())
+        if not findings and all_green and not not_read:
+            findings = ["appliance healthy: every health area is green, no recent restart, services healthy"]
         if not_read:
             findings.append(
                 f"{len(not_read)} appliance endpoint(s) not read ({', '.join(not_read)}): "
@@ -227,14 +228,8 @@ class Appliance:
             "findings": findings,
             "health": health,
             "uptime_hours": None if uptime_seconds is None else round(uptime_seconds / 3600, 1),
-            "services_unhealthy": [
-                row
-                for row in services
-                if str(row.get("health")).upper() not in ("HEALTHY", "NONE")
-                or (
-                    str(row.get("state")).upper() == "STOPPED"
-                    and str(row.get("startup_type")).upper() == "AUTOMATIC"
-                )
+            "services_troubled": [
+                row | {"trouble": service_trouble(row)} for row in services if service_trouble(row)
             ][:20],
             "services_read": len(services),
             "not_read": not_read,

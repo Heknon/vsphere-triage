@@ -1859,12 +1859,14 @@ def _register_connection_tools(tool: Callable[..., Any], fleet: VCenterPool, res
         Guest file transfers (run_in_guest's output, or any client's guestFile
         URL) go to the ESXi host, not to vCenter: that is how the API works —
         InitiateFileTransferFromGuest returns a URL naming the host, and the
-        client downloads from it. So guestFile SSL EOFs, resets
-        and timeouts are about the host's TLS endpoint and the path to it, not
-        the vCenter session count. Per host: whether the name resolves, the
-        connection is answered, refused or reset, and the certificate is trusted,
-        unexpired and covers the host's name. Sends no vSphere call — a
-        handshake, then the socket is closed. Tested from where this server
+        client downloads from it. So guestFile SSL EOFs, resets and timeouts
+        are about the host's TLS endpoint and the path to it, not the vCenter
+        session count. The URL carries the host's IP address, so each host is
+        probed at that address (its name if it is an IP, else what it resolves
+        to here, else its management IP): whether the connection is answered,
+        refused or reset, and whether the certificate is trusted, unexpired and
+        covers that address. Beyond reading the hosts it sends no vSphere call —
+        a handshake, then the socket is closed. Tested from where this server
         runs; a client elsewhere has its own path.
 
         Args:

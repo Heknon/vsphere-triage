@@ -88,9 +88,19 @@ connection limit, but not always. First ask **which calls fail**:
      about 300 s it breaks Kerberos/AD authentication.
 
 The reverse proxy's own connection limit and live connection count are not in
-the vSphere API; they live in the appliance's configuration and logs. If
-everything above is clean, say that is the remaining suspect and that a person
-must read it on the appliance (**stop and ask**).
+the vSphere API. On 7.0 and later Envoy owns port 443 and caps remote HTTPS
+connections (2048 by default, `maxRemoteHttpsConnections` in
+`/etc/vmware-rhttpproxy/config.xml`); at the cap it closes connections, which
+clients see as SSL EOFs, and `/var/log/vmware/envoy/envoy.log` says "remote
+https connections exceed" (Broadcom KB 344920). That fits SSL EOFs better than
+the session cap, which shows as refused logins. If everything above is clean,
+say Envoy is the remaining suspect and that a person must read that log on the
+appliance (**stop and ask**).
+
+Two more limits sit beside vpxd's: on 8.0 vpxd shortens session timeouts as the
+count nears the cap (`config.vmacore.soap.enableSessionTimeoutPenalties`, KB
+336100), so an idle count can drop on its own; and the REST API (vAPI) keeps
+its own per-user session pool, separate from the SOAP count.
 
 If the account cannot see the global session list, `check_vcenters` says so;
 use the login time and the pattern of failures across callers instead. The
@@ -107,11 +117,13 @@ an HTTPS download from that URL. The URL names the **ESXi host**, so the
 download never touches vCenter. This is how the API works, not a guess to
 confirm. Failures here are about the host and the path to it:
 
-1. `check_host_tls`: from where this server runs, whether each host's name
-   resolves, whether 443 answers, is refused or resets, and whether the host's
-   certificate is trusted, unexpired and covers the host's name. Every host
+1. `check_host_tls`: from where this server runs, at the address the transfer
+   URL carries (through vCenter that is the host's **IP address**, not its
+   name), whether 443 answers, is refused or resets, and whether the host's
+   certificate is trusted, unexpired and covers that address. Every host
    failing the same way means no transfer can work from here; a few failing
-   points at those hosts.
+   points at those hosts. `no_address_to_probe` means this server could not
+   find the address at all: that host was not tested, which is not a failure.
 2. `search_host_logs` (hostd by default): the matching lines on every
    connected host, counted per host. Concentrated on a few hosts points at
    those hosts (certificate, hostd load, their network); spread over most
@@ -119,9 +131,11 @@ confirm. Failures here are about the host and the path to it:
 3. `read_host_log` on the worst host for its full context.
 
 `check_host_tls` tests from this server. The failing client may be somewhere
-else with its own path. If this server cannot even resolve or reach the hosts
-while the client gets as far as an SSL EOF, the two paths differ: say so, and
-give the person the same handshake to run from the client. If the probe is
+else with its own path. If this server cannot reach the hosts (or cannot find
+their address) while the client gets as far as an SSL EOF, the two paths
+differ: say so, and give the person the same handshake to run from the client
+against the address in a failing URL (`openssl s_client -connect
+<address>:443`). Such a URL works once, for ten minutes. If the probe is
 clean but the client still fails, the client's path or the host side is left.
 
 ## When many VMs failed together

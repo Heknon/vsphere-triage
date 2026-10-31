@@ -169,12 +169,13 @@
       "id": "guest-file-transfer",
       "prompt": "On vc-a our automation's guest file transfers (the guestFile URLs from InitiateFileTransferFromGuest) keep failing with SSL EOF and connection errors, while normal vCenter API calls mostly work. What is going on?",
       "must": [
-        "says the guest file download goes to the ESXi host, not to vCenter",
-        "reports that the ESXi hosts' names (DC0_C0_H0 and the like) do not resolve from this server, so no transfer URL can work from here",
-        "says the probe was from this server and the automation's own DNS / network path to the hosts needs checking, or that the host logs could not be read here"
+        "says the guest file download goes to the ESXi host (at the IP address in the URL), not to vCenter",
+        "says this server could not test the host path (no address to probe for the hosts), and that this is not evidence the path is broken",
+        "gives the person the handshake to run from the automation's side against the address in a failing URL, or says the host logs must be read on the hosts"
       ],
       "must_not": [
         "blames vc-a's session count or recommends raising the session limit as the fix",
+        "says the hosts are unreachable or that no transfer can work, as if it had been tested",
         "runs a command in a guest or reboots a VM"
       ]
     }

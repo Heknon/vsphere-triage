@@ -216,9 +216,9 @@ def against_limit(total: int, limit: int | None) -> dict[str, Any]:
             "session_limit": None,
             "session_limit_note": (
                 f"{SESSION_LIMIT_KEY} is not set in this vCenter's advanced settings, so vpxd's built-in "
-                "default applies (not readable through the API; see VMware's documentation for your "
-                "version). A count well under that default points away from a session cap and at "
-                "connections, the appliance or the network instead"
+                "default applies; the API cannot read it, and Broadcom's KBs give 2000 (KB 322837) and, "
+                "for 8.0, 500 (KB 336100). A count well under that points away from a session cap and at "
+                "connections (Envoy's limit), the appliance or the network instead"
             ),
         }
     share = total / limit
@@ -526,11 +526,12 @@ class VCenterSession:
         with contextlib.suppress(Exception):
             options = list(self.content.setting.QueryOptions("config.vmacore."))
         if not options:
-            # Some vCenters (and the simulator) refuse a prefix: read all and filter.
+            # A prefix with nothing under it raises InvalidName (and the simulator refuses
+            # prefixes): read every option, by naming none, and filter.
             with contextlib.suppress(Exception):
                 options = [
                     option
-                    for option in self.content.setting.QueryOptions("") or []
+                    for option in self.content.setting.QueryOptions() or []
                     if str(getattr(option, "key", "")).startswith("config.vmacore.")
                 ]
         for option in options:

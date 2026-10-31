@@ -244,11 +244,11 @@ server always matches the skill. Invoke the skill as
 | `get_datastore_health` | a datastore's latency and IOPS from every host that mounts it, which of those hosts see it slow (`slow_from_hosts`: a path or an array), and its VMs |
 | `read_host_log` | `vmkernel`, `hostd` or `vpxa` lines, regex-filtered |
 | `search_host_logs` | the same host log (`hostd` by default) on every connected host, matched and counted per host, so it shows whether failures cluster on a few hosts or spread over all. The default pattern matches guest file transfers, TLS errors and dropped connections |
-| `check_host_tls` | per ESXi host, from where the server runs: whether its name resolves and port 443 answers, is refused or resets, and whether its certificate is trusted, unexpired and covers its name. Guest file transfers download from the host, not vCenter, so this is their path. Sends no vSphere call, only a TLS handshake |
-| `check_vcenters` | per vCenter: reachable, the server's last login time, a round-trip time and the open-session count against the configured cap (`config.vmacore.soap.maxSessionCount`, when set), for SSL EOFs and resets caused by session exhaustion |
+| `check_host_tls` | per ESXi host, from where the server runs, at the address a guest file-transfer URL carries (the host's IP: its name if it is one, else what the name resolves to, else its management IP): whether port 443 answers, is refused or resets, and whether its certificate is trusted, unexpired and covers that address. Guest file transfers download from the host, not vCenter, so this is their path. Beyond reading the hosts it sends no vSphere call, only a TLS handshake |
+| `check_vcenters` | per vCenter: reachable, the server's last login time, a round-trip time and the open-session count against the configured cap (`config.vmacore.soap.maxSessionCount`, when set), for refused logins and dropped connections caused by session exhaustion |
 | `vcenter_sessions` | a vCenter's open API sessions grouped by user, source IP and client, with idle counts, the oldest, the session cap and the session/connection settings an administrator set under `config.vmacore.` |
 | `read_vcenter_log` | vCenter's own log (`vpxd` by default, or any key vCenter offers), regex-filtered |
-| `vcenter_appliance_health` | the appliance's health (overall, load, memory, swap, storage, database), its uptime and its services' state and health, through the appliance REST API (vCenter 7.0 U2 or later), inside a REST session opened and closed for the call |
+| `vcenter_appliance_health` | the appliance's health (overall, load, memory, swap, storage, database; green, yellow, orange, red or gray), its uptime and its services' state and health, through the appliance REST API (vCenter 7.0 U2 or later), inside a REST session opened and closed for the call |
 | `vcenter_history` | login, logout and failed-login events over a past window, in 10-minute buckets, with the busiest sources |
 
 ### Tools that act on a VM
@@ -395,7 +395,7 @@ Read-only role is not enough for every read:
 | Read-only (System.View, System.Read) | inventory, events, performance counters |
 | `Datastore.Browse` | `vmware.log`, serial-console files and datastore listings (`read_vm_log`, `get_boot_timeline`, `read_serial_console`); without it these return HTTP 403 |
 | `Global.Diagnostics` | host and vCenter logs (`read_host_log`, `search_host_logs`, `read_vcenter_log`) |
-| the appliance API's own authorization (confirm on your version) | `vcenter_appliance_health`; each endpoint the account may not read is named in `not_read` |
+| the appliance API's own authorization (confirm on your version; Broadcom names the SSO group `SystemConfiguration.Administrators` for health monitoring) | `vcenter_appliance_health`; each endpoint the account may not read is named in `not_read` |
 | the console privilege `/screen` needs (confirm on your version) | `get_vm_console` |
 | `Sessions.TerminateSession` | the full session list in `check_vcenters` / `vcenter_sessions`; vSphere has no separate view privilege for it, and without it only this server's own session is visible |
 | `VirtualMachine.GuestOperations.Query`, `.Modify`, `.Execute` | the guest-command tools |

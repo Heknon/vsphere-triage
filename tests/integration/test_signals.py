@@ -380,7 +380,7 @@ def test_a_vcenter_at_its_configured_session_cap_says_so(server: MCPServer) -> N
     assert any(finding.startswith("vc-b: ") and "session limit" in finding for finding in result["findings"])
     # vc-a has no cap set: the default applies, and the result says it cannot read it.
     assert rows["vc-a"]["sessions"]["session_limit"] is None
-    assert "not readable" in rows["vc-a"]["sessions"]["session_limit_note"]
+    assert "the API cannot read it" in rows["vc-a"]["sessions"]["session_limit_note"]
 
 
 def test_the_session_breakdown_names_the_leaking_client_against_the_cap(server: MCPServer) -> None:
@@ -395,13 +395,14 @@ def test_the_session_breakdown_names_the_leaking_client_against_the_cap(server: 
     assert result["connection_settings"]["config.vmacore.soap.maxSessionCount"] == "10"
 
 
-def test_hosts_whose_names_do_not_resolve_are_named_as_the_transfer_path(server: MCPServer) -> None:
+def test_hosts_with_no_address_to_probe_are_said_not_tested(server: MCPServer) -> None:
     result = call(server, "check_host_tls", {"vcenters": ["vc-a"]})
 
-    # vcsim's hosts are named DC0_C0_H0 and the like: no DNS has them.
+    # vcsim's hosts are named DC0_C0_H0 and the like (no DNS has them), with vmk0 at 0.0.0.0.
     assert result["hosts_probed"] >= 4
-    assert result["by_outcome"] == {"name_does_not_resolve": result["hosts_probed"]}
-    assert "no guest file transfer can complete" in result["findings"][0]
+    assert result["by_outcome"] == {"no_address_to_probe": result["hosts_probed"]}
+    assert result["findings"][0].startswith(f"no host ({result['hosts_probed']}) could be probed")
+    assert "not evidence the path is broken" in result["findings"][0]
 
 
 def test_a_handshake_with_the_simulator_is_judged_by_trust(worlds: tuple[Any, Any]) -> None:

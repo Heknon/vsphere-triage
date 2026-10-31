@@ -49,7 +49,7 @@ def test_an_unset_cap_says_the_default_applies_and_is_not_readable() -> None:
 
     assert result["session_limit"] is None
     assert SESSION_LIMIT_KEY in result["session_limit_note"]
-    assert "not readable" in result["session_limit_note"]
+    assert "the API cannot read it" in result["session_limit_note"]
 
 
 class _Option:
@@ -252,11 +252,24 @@ def test_an_older_vcenter_without_the_rest_api_is_said_in_words() -> None:
     assert sent == [("POST", "/api/session")]
 
 
-def test_the_older_vmon_service_list_shape_is_read_too() -> None:
-    rows = appliance._service_rows([{"key": "vpxd", "value": {"state": "STARTED", "health": "HEALTHY"}}])
+def test_a_yellow_area_and_a_service_with_warnings_are_warnings_not_healthy() -> None:
+    answers = GREEN | {
+        "/api/appliance/health/storage": "yellow",
+        appliance.UPTIME_PATH: 9 * 86400.0,
+        "/api/vcenter/services": {
+            "vpxd": {"state": "STARTED", "health": "HEALTHY_WITH_WARNINGS", "startup_type": "AUTOMATIC"},
+        },
+    }
+    client, _ = _appliance(answers)
 
-    assert rows[0]["service"] == "vpxd"
-    assert rows[0]["health"] == "HEALTHY"
+    result = client.health()
+    findings = " | ".join(result["findings"])
+
+    assert "yellow (healthy, with some problems): storage" in findings
+    assert "service vpxd is STARTED / HEALTHY_WITH_WARNINGS" in findings
+    assert "every client's" not in findings  # a warning is not called everyone's trouble
+    assert "appliance healthy" not in findings
+    assert result["services_troubled"][0]["trouble"] == "warning"
 
 
 # -- vCenter's own log, and the host-log sweep --------------------------------------------------
@@ -409,7 +422,7 @@ def test_each_connection_failure_is_named_for_what_it_means() -> None:
 
 
 def test_every_host_failing_the_same_way_says_no_transfer_can_complete() -> None:
-    rows = [{"vcenter": "vc-a", "name": f"esx-{n}", "outcome": hosttls.UNRESOLVED} for n in range(3)]
+    rows = [{"vcenter": "vc-a", "name": f"esx-{n}", "outcome": hosttls.REFUSED} for n in range(3)]
 
     summary = hosttls.summarize(rows, verify=True)
 
@@ -419,6 +432,28 @@ def test_every_host_failing_the_same_way_says_no_transfer_can_complete() -> None
     # A client that sees SSL EOF got further than this server: the two paths differ.
     assert "its path differs from this server's" in summary["findings"][1]
     assert summary["hosts_by_vcenter"] == {"vc-a": 3}
+
+
+def test_hosts_with_no_address_to_probe_are_not_called_broken() -> None:
+    rows = [{"vcenter": "vc-a", "name": f"esx-{n}", "outcome": hosttls.UNRESOLVED} for n in range(3)]
+
+    findings = hosttls.summarize(rows, verify=True)["findings"]
+
+    assert findings[0].startswith("no host (3) could be probed")
+    assert "not evidence the path is broken" in findings[0]
+    assert not any("no guest file transfer can complete" in finding for finding in findings)
+
+
+def test_the_management_ip_is_vmk0s_and_an_unspecified_address_is_none() -> None:
+    def vnic(device: str, address: str) -> Any:
+        ip = type("Ip", (), {"ipAddress": address})()
+        return type("Vnic", (), {"device": device, "spec": type("Spec", (), {"ip": ip})()})()
+
+    assert hosttls.management_ip([vnic("vmk1", "10.0.1.5"), vnic("vmk0", "10.0.0.5")]) == "10.0.0.5"
+    unset = "0.0.0.0"  # noqa: S104 - an unset vmknic address, not a bind
+    assert hosttls.management_ip([vnic("vmk0", unset), vnic("vmk1", "10.0.1.5")]) == "10.0.1.5"
+    assert hosttls.management_ip([vnic("vmk0", unset)]) is None
+    assert hosttls.management_ip(None) is None
 
 
 def test_mixed_outcomes_are_listed_worst_first() -> None:
@@ -504,7 +539,32 @@ def test_a_real_handshake_is_judged_by_the_servers_trust(tmp_path: Path) -> None
     assert closed["outcome"] == hosttls.REFUSED
 
 
-def test_a_name_that_does_not_resolve_is_its_own_outcome() -> None:
+def test_a_name_that_does_not_resolve_and_no_management_ip_is_not_probed() -> None:
     result = asyncio.run(hosttls.probe("esx-01.does-not-exist.invalid", Settings(timeout_seconds=5)))
 
     assert result["outcome"] == hosttls.UNRESOLVED
+
+
+def test_a_name_that_does_not_resolve_is_probed_at_its_management_ip(tmp_path: Path) -> None:
+    cert, private = _self_signed(tmp_path, "esx-test")
+
+    async def run() -> dict[str, Any]:
+        context = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
+        context.load_cert_chain(cert, private)
+        server = await asyncio.start_server(lambda _r, w: w.close(), "127.0.0.1", 0, ssl=context)
+        port = server.sockets[0].getsockname()[1]
+        async with server:
+            return await hosttls.probe(
+                "esx-01.does-not-exist.invalid",
+                Settings(ca_bundle=str(cert), timeout_seconds=5),
+                port=port,
+                management_ip="127.0.0.1",
+            )
+
+    result = asyncio.run(run())
+
+    # Checked against the IP, as the transfer URL carries it: the certificate covers 127.0.0.1.
+    assert result["outcome"] == hosttls.OK
+    assert result["url_address"] == "127.0.0.1"
+    assert "management IP" in result["address_from"]
+    assert result["name_error"]
