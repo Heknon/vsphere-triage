@@ -416,6 +416,9 @@ def test_every_host_failing_the_same_way_says_no_transfer_can_complete() -> None
     assert summary["failing"] == 3
     assert "every host (3) fails the same way" in summary["findings"][0]
     assert "no guest file transfer can complete" in summary["findings"][0]
+    # A client that sees SSL EOF got further than this server: the two paths differ.
+    assert "its path differs from this server's" in summary["findings"][1]
+    assert summary["hosts_by_vcenter"] == {"vc-a": 3}
 
 
 def test_mixed_outcomes_are_listed_worst_first() -> None:

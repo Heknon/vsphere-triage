@@ -104,8 +104,8 @@ problem seen from one VM: run `check_vcenters` before trusting its result.
 
 A guest file transfer is two steps: a call to vCenter that returns a URL, then
 an HTTPS download from that URL. The URL names the **ESXi host**, so the
-download never touches vCenter. Failures here are about the host and the path
-to it:
+download never touches vCenter. This is how the API works, not a guess to
+confirm. Failures here are about the host and the path to it:
 
 1. `check_host_tls`: from where this server runs, whether each host's name
    resolves, whether 443 answers, is refused or resets, and whether the host's
@@ -119,8 +119,10 @@ to it:
 3. `read_host_log` on the worst host for its full context.
 
 `check_host_tls` tests from this server. The failing client may be somewhere
-else with its own path; say so if the probe is clean but the client still
-fails.
+else with its own path. If this server cannot even resolve or reach the hosts
+while the client gets as far as an SSL EOF, the two paths differ: say so, and
+give the person the same handshake to run from the client. If the probe is
+clean but the client still fails, the client's path or the host side is left.
 
 ## When many VMs failed together
 

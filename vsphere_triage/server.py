@@ -1857,8 +1857,9 @@ def _register_connection_tools(tool: Callable[..., Any], fleet: VCenterPool, res
         """Can this server reach each ESXi host on 443, and does its certificate hold up — worst first.
 
         Guest file transfers (run_in_guest's output, or any client's guestFile
-        URL) go to the ESXi host, not to vCenter: vCenter hands out a URL naming
-        the host and the client downloads from it. So guestFile SSL EOFs, resets
+        URL) go to the ESXi host, not to vCenter: that is how the API works —
+        InitiateFileTransferFromGuest returns a URL naming the host, and the
+        client downloads from it. So guestFile SSL EOFs, resets
         and timeouts are about the host's TLS endpoint and the path to it, not
         the vCenter session count. Per host: whether the name resolves, the
         connection is answered, refused or reset, and the certificate is trusted,

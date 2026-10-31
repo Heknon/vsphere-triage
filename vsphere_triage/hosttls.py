@@ -193,12 +193,10 @@ async def _unverified_certificate(host: str, port: int, deadline: float) -> dict
                 await asyncio.wait_for(writer.wait_closed(), timeout=2)
 
 
-def summarize(rows: list[dict[str, Any]], *, verify: bool) -> dict[str, Any]:
-    """Hosts grouped by outcome, worst first, with what each outcome means for a transfer. Pure."""
-    by_outcome: dict[str, list[str]] = {}
-    for row in rows:
-        by_outcome.setdefault(row["outcome"], []).append(f"{row['vcenter']}:{row['name']}")
-    failing = [row for row in rows if row["outcome"] != OK]
+def _outcome_findings(
+    rows: list[dict[str, Any]], failing: list[dict[str, Any]], by_outcome: dict[str, list[str]]
+) -> list[str]:
+    """What the outcomes say, worst first: all fine, all failing alike, or which fail how."""
     findings: list[str] = []
     if not rows:
         findings.append("no connected host to probe")
@@ -213,6 +211,12 @@ def summarize(rows: list[dict[str, Any]], *, verify: bool) -> dict[str, Any]:
             f"every host ({len(rows)}) fails the same way — {outcome}: {MEANING[outcome]}. From this server "
             "no guest file transfer can complete, however healthy vCenter is"
         )
+        if outcome in (UNRESOLVED, NO_ANSWER, REFUSED):
+            findings.append(
+                "a client that gets as far as an SSL EOF or reset did reach the host, so its path differs "
+                "from this server's: run the same handshake from the client (openssl s_client -connect "
+                "<host>:443) to see its own failure"
+            )
     else:
         findings.append(f"{len(failing)} of {len(rows)} hosts fail on {PORT} from this server")
         for outcome in ORDER:
@@ -222,6 +226,16 @@ def summarize(rows: list[dict[str, Any]], *, verify: bool) -> dict[str, Any]:
                     f" (+{len(hosts) - SHOWN} more)" if len(hosts) > SHOWN else ""
                 )
                 findings.append(f"{outcome} ({len(hosts)}): {shown} — {MEANING[outcome]}")
+    return findings
+
+
+def summarize(rows: list[dict[str, Any]], *, verify: bool) -> dict[str, Any]:
+    """Hosts grouped by outcome, worst first, with what each outcome means for a transfer. Pure."""
+    by_outcome: dict[str, list[str]] = {}
+    for row in rows:
+        by_outcome.setdefault(row["outcome"], []).append(f"{row['vcenter']}:{row['name']}")
+    failing = [row for row in rows if row["outcome"] != OK]
+    findings = _outcome_findings(rows, failing, by_outcome)
     slow = [row for row in rows if (row.get("handshake_seconds") or 0) >= SLOW_HANDSHAKE_SECONDS]
     if slow:
         findings.append(
@@ -244,9 +258,13 @@ def summarize(rows: list[dict[str, Any]], *, verify: bool) -> dict[str, Any]:
         findings.append("VSPHERE_TLS_VERIFY is off, so certificates were not judged — only reachability")
     rank = {outcome: index for index, outcome in enumerate(ORDER)}
     ordered = sorted(rows, key=lambda row: (rank[row["outcome"]], -(row.get("handshake_seconds") or 0)))
+    per_vcenter: dict[str, int] = {}
+    for row in rows:
+        per_vcenter[row["vcenter"]] = per_vcenter.get(row["vcenter"], 0) + 1
     return {
         "findings": findings,
         "hosts_probed": len(rows),
+        "hosts_by_vcenter": per_vcenter,
         "failing": len(failing),
         "by_outcome": {outcome: len(hosts) for outcome, hosts in by_outcome.items()},
         "hosts": ordered[:50],
