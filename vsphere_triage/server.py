@@ -613,6 +613,9 @@ def _register_fleet_tools(  # noqa: C901, PLR0915 - one closure per tool
         how many are idle past the timeout and the oldest ones. A single client
         holding most of the sessions, or many idle sessions from one source, is
         the usual cause: a client that opens sessions and never closes them.
+        calls_by_client sums each client's API calls over its open sessions:
+        a running total, so two reads a known interval apart give its calls
+        per minute (a request swarm shows as one client's count racing ahead).
         Needs the account to be allowed the global session list; otherwise only
         this server's own session is visible and the result says so (then read
         the vCenter's session count from vROps instead).

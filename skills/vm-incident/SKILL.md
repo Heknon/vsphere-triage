@@ -74,7 +74,16 @@ connection limit, but not always. First ask **which calls fail**:
    source IP and client, with idle counts, the cap, and every
    session/connection setting an administrator set (`connection_settings`).
    One client holding most sessions, or many idle ones from one source, is
-   the usual leak.
+   the usual leak. `calls_by_client` is each client's API call total over its
+   open sessions. It only grows, so to see a **request rate** call
+   `vcenter_sessions` twice, a minute or two apart, and divide the difference
+   by the time between them (use the times of the two reads). A client
+   whose rate is far above the rest, at the time of the errors, is a request
+   swarm: many guest operations (each transfer is several vCenter calls) or
+   tight polling. Two cautions: a session that closed between the reads takes
+   its calls with it, so a client that logs in per request shows a drop or
+   noise, not a rate (its login surge shows in `vcenter_history` instead); and
+   the rate covers vCenter calls only, not the downloads that go to the hosts.
 3. If the failure has passed, `vcenter_history` over that window: login
    surges, failed logins and the busiest sources, in 10-minute buckets.
 4. If the count is well under the cap, the session limit is not the cause.
@@ -130,6 +139,13 @@ confirm. Failures here are about the host and the path to it:
    those hosts (certificate, hostd load, their network); spread over most
    hosts points at what they all share (the network, the client).
 3. `read_host_log` on the worst host for its full context.
+4. If you suspect a swarm of transfers, measure the automation's request rate
+   on vCenter: `vcenter_sessions` twice, a minute or two apart, and compare
+   `calls_by_client` (see *When the vCenter itself fails*, step 2). Each
+   transfer is several vCenter calls before its download, so a swarm shows as
+   one client's calls racing ahead. Whether the errors scale with that rate is
+   the test; throttling the automation and watching the errors fall confirms
+   it.
 
 `check_host_tls` tests from this server. The failing client may be somewhere
 else with its own path. If this server cannot reach the hosts (or cannot find

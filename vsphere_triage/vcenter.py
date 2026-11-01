@@ -193,6 +193,20 @@ def _tally(rows: list[dict[str, Any]], key: Callable[[dict[str, Any]], str]) -> 
     return dict(sorted(counts.items(), key=lambda kv: kv[1], reverse=True))
 
 
+def calls_by_client(rows: list[dict[str, Any]]) -> dict[str, int]:
+    """The API calls each client's open sessions have made, summed, most first. Pure.
+
+    A session's callCount only grows, so this is a total since each session
+    logged in, not a rate; a closed session's calls are gone from it.
+    """
+    totals: dict[str, int] = {}
+    for row in rows:
+        if isinstance(row.get("call_count"), int):
+            key = f"{row['user']} @ {row['ip']} ({row['user_agent']})"
+            totals[key] = totals.get(key, 0) + row["call_count"]
+    return dict(sorted(totals.items(), key=lambda kv: kv[1], reverse=True))
+
+
 def _top(counts: dict[str, int], keep: int = 15) -> dict[str, int]:
     return dict(list(counts.items())[:keep])
 
@@ -491,6 +505,9 @@ class VCenterSession:
             "by_user": _top(by_user),
             "by_source_ip": _top(by_ip),
             "by_client": _top(by_client),
+            # Calls each client has made over its open sessions' lifetimes. Cumulative:
+            # read twice a known interval apart, the difference is its calls per minute.
+            "calls_by_client": _top(calls_by_client(rows)),
             "findings": findings or ["no single client dominates the open sessions"],
             "oldest": sorted(
                 (row for row in rows if row["age_minutes"] is not None),
