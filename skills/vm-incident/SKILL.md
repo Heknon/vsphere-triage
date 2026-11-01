@@ -28,6 +28,7 @@ Carry the vCenter and moref from the first tool call to the last.
 | Your orchestrator or monitoring | the failing tests, the environment id, the machine names, the reboot time, the Tools error | its own tools or logs |
 | The VM creator/runner logs | what it asked vCenter to do and when, its errors, how long it waited for the VM | your log store |
 | vCenter | live VM state, console, `vmware.log`, serial console, events, host and datastore counters | the `vsphere-triage` server |
+| The runner (the machine calling vCenter) | its own connections, connection table, ports, CPU, proxy and path to vCenter and the hosts | your own shell over SSH, only with a person's OK (`core/runner.md`); the `vsphere-triage` server cannot reach it |
 | vROps (optional) | days of host, cluster and datastore history; alerts | the `vrops_*` tools |
 | PowerFlex (optional) | the storage backend: SDS and device health, rebuild and rebalance, per-protection-domain traffic | the `powerflex_*` tools |
 
@@ -46,6 +47,7 @@ climb and work the rest.
 | Many VMs raise Tools errors at once (a creation burst, busy hosts) | `correlate_hosts` (below) |
 | SSL EOF errors, resets or timeouts from vCenter itself | `check_vcenters` (below) |
 | Guest file transfers (`guestFile`) fail with SSL EOFs, resets or timeouts | `check_host_tls` (below) |
+| SSL EOFs or "Tools errors" from one runner while the server side looks clean | `core/runner.md` (below) |
 | "Which environments have lived too long?" | `find_old_environments`; this is cleanup, not an incident |
 
 Climb the ladder from where you start; do not skip to the counters. A VM's
@@ -63,6 +65,10 @@ connection limit, but not always. First ask **which calls fail**:
   fail* below. That download goes to the ESXi host, not to vCenter, so the
   session count does not explain it.
 - **API calls to vCenter itself**: follow these steps.
+- **Only one client fails** (one runner or automation host), while others of
+  the same vCenter work: the runner or its path may be the cause. Clear the
+  server side with the steps below, then go to *When the client may be the
+  problem*.
 
 1. `check_vcenters`: the open-session count **against the configured cap**
    (`session_limit`, read from `config.vmacore.soap.maxSessionCount`), this
@@ -154,6 +160,24 @@ differ: say so, and give the person the same handshake to run from the client
 against the address in a failing URL (`openssl s_client -connect
 <address>:443`). Such a URL works once, for ten minutes. If the probe is
 clean but the client still fails, the client's path or the host side is left.
+
+## When the client may be the problem
+
+The machine calling vCenter (a runner, an automation host) can cause the same
+`SSLEOFError`, resets and timeouts as the server: an idle connection dropped
+by a firewall or NAT and then reused (the **first call after a pause** fails,
+a retry works), a full connection table, ports or file descriptors run out, a
+starved container, a proxy or an MTU problem in the path, or one pyVmomi
+connection shared across threads. A runner whose own status call fails can
+also report a "Tools error" on a VM whose Tools is fine: check that VM in
+vCenter (`diagnose_vm` or `scan`).
+
+The tools only clear the server side. If it is clean at the error time,
+load `core/runner.md`: the signs, the read-only commands to run on the runner
+over SSH (from your own shell or a paramiko script, only after a person names
+the runner and its access), and the packet capture that shows who closed the
+connection. Without runner-side evidence, name the runner as the remaining
+suspect, not as the cause.
 
 ## When many VMs failed together
 
@@ -290,6 +314,7 @@ that test, which is evidence too.
 | Each state and cause, and what rules it out | `core/causes.md` |
 | Checking that a correlation is a cause | `core/correlation.md` |
 | The Windows boot investigation | `core/windows-boot.md` |
+| Checking the runner (the client) over SSH | `core/runner.md` |
 | The verdict format | `core/verdict.md` |
 | Terms | `glossary.md` |
 | Worked examples | `examples/cpu-overcommit.md`, `examples/storage-boot-storm.md` |

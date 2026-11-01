@@ -71,7 +71,7 @@ The minimum configuration is the vCenter list and a login:
 
 The server speaks MCP over stdio by default. With `uvx`, use
 `"command": "uvx", "args": ["vsphere-triage"]` (pin a version with
-`"vsphere-triage==0.5.1"`); with a `uv tool` or `pipx` install, use
+`"vsphere-triage==0.5.2"`); with a `uv tool` or `pipx` install, use
 `"command": "vsphere-triage"` as above.
 
 ## Two ways to start
