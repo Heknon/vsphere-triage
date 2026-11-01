@@ -80,6 +80,7 @@ LONG_RUNNING = "long_running"
 TOOLS_OUTDATED = "tools_outdated"
 CPU_LIMITED = "cpu_limited"
 MEMORY_LIMITED = "memory_limited"
+GUEST_OPS_NOT_READY = "guest_ops_not_ready"
 
 # Flags worth a look on their own. The rest only add detail to a verdict.
 ATTENTION_FLAGS = (
@@ -98,7 +99,7 @@ ATTENTION_FLAGS = (
 # the pressure ended), so they are reported but never make a VM count as
 # abnormal in a scan's rates and groups.
 CONTEXT_FLAGS = (MEMORY_RECLAIMED, HOST_MEMORY_PRESSURE, VCENTER_ALARM, LONG_RUNNING, CONSOLIDATION_NEEDED)
-DETAIL_FLAGS = (HOST_IN_MAINTENANCE, TOOLS_OUTDATED, CPU_LIMITED, MEMORY_LIMITED)
+DETAIL_FLAGS = (HOST_IN_MAINTENANCE, TOOLS_OUTDATED, CPU_LIMITED, MEMORY_LIMITED, GUEST_OPS_NOT_READY)
 FLAGS = (*ATTENTION_FLAGS, *DETAIL_FLAGS)
 FLAG_MEANING = {
     BOOT_LOOP: "reset or rebooted several times in a short window",
@@ -114,6 +115,10 @@ FLAG_MEANING = {
     TOOLS_OUTDATED: "its Tools version is too old, too new or blocklisted for this host",
     CPU_LIMITED: "a CPU limit caps it below full speed: apparent starvation that is configured, not the host",
     MEMORY_LIMITED: "a memory limit is set below its configured RAM, forcing the host to balloon or swap it",
+    GUEST_OPS_NOT_READY: (
+        "Tools runs but the guest is not ready for guest operations: a guest command or file transfer "
+        "started now fails, so wait for guestOperationsReady before starting one"
+    ),
 }
 OUTDATED_TOOLS = ("guestToolsTooOld", "guestToolsBlacklisted", "guestToolsTooNew")
 
@@ -174,6 +179,7 @@ def classify(  # noqa: C901, PLR0911, PLR0912 - one decision list, kept in one p
         "age_hours": _round(vm.age_hours, 2),
         "tools_status": vm.tools_status,
         "tools_running": vm.tools_running,
+        "guest_operations_ready": vm.guest_ops_ready,
         "tools_version_status": vm.tools_version_status,
         "heartbeat": vm.heartbeat,
         "guest_state": vm.guest_state,
@@ -292,6 +298,8 @@ def _flags(vm: VmFacts, thresholds: Thresholds, resets_in_window: int) -> list[s
             flags.append(CPU_LIMITED)
     if vm.memory_limit_mb is not None and (vm.memory_mb is None or vm.memory_limit_mb < vm.memory_mb):
         flags.append(MEMORY_LIMITED)
+    if vm.powered_on and vm.tools_up and vm.guest_ops_ready is False:
+        flags.append(GUEST_OPS_NOT_READY)
     return flags
 
 

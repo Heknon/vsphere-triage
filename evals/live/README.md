@@ -153,3 +153,25 @@ because its note now quotes the KBs' default caps.
 | under-cap | pass, 9 calls, 22k; did not take a KB default as vc-a's cap |
 
 No run called a tool that acts on a VM.
+
+### Round 11: mass Tools errors (0.5.0)
+
+`tools-wave` asks the question behind `correlate_hosts`: many Tools errors at
+once, is it CPU or the creation swarm, and are the guest-transfer SSL errors
+from request peaks? Ground truth: two separate causes (CPU overcommit on
+DC0_C1_H0, storage latency on LocalDS_0), and no host logs on the simulator, so
+the SSL link cannot be confirmed.
+
+Before any model ran, a smoke call showed `correlate_hosts` saying "Tools
+trouble follows the creation burst: 6 of 9" in a world where every host took
+new VMs. A host group now counts as the pattern only when the trouble sits
+there well beyond its share of the VMs; a burst on nearly every host is said
+not to single hosts out.
+
+| scenario | round 11 |
+|---|---|
+| tools-wave | pass, 19 calls, 136k |
+| fleet | pass, 11 calls, 200k |
+| cpu-starvation | pass, 4 calls, 71k |
+
+No run called a tool that acts on a VM.

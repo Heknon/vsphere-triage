@@ -43,6 +43,7 @@ climb and work the rest.
 | A question about the fleet ("anything stuck on vc-04?") | `scan`, then `explain_group` (rung 3) |
 | An incident that is over, VMs possibly destroyed | `diagnose_window` (rung 3) |
 | Many VMs rebooted or went unreachable at once | `cluster_events` and `recent_tasks` first (below) |
+| Many VMs raise Tools errors at once (a creation burst, busy hosts) | `correlate_hosts` (below) |
 | SSL EOF errors, resets or timeouts from vCenter itself | `check_vcenters` (below) |
 | Guest file transfers (`guestFile`) fail with SSL EOFs, resets or timeouts | `check_host_tls` (below) |
 | "Which environments have lived too long?" | `find_old_environments`; this is cleanup, not an incident |
@@ -149,10 +150,40 @@ Check what happened above the VMs before diagnosing them one by one:
   rebooted on purpose: judge them from that restart, not as separate hangs.
 - `recent_tasks`: what someone or an automation did in the window, e.g. a
   storage vMotion wave onto one datastore, a mass reconfigure, a snapshot
-  consolidation.
+  consolidation, or a clone/power-on wave (mass VM creation), with the
+  busiest 10 minutes of clones and of power-ons.
 - `get_host_health` on a shared host: its CPU, storage and hardware sensors.
   A failed power supply, fan or DIMM stalls every VM on the host and shows in
   none of their guest evidence.
+
+## When many VMs raise Tools errors at once
+
+A wave of Tools errors, often with SSL errors on guest file transfers at the
+same time, usually has one of three shapes. `correlate_hosts` over the window
+tells them apart: per host, the VMs in Tools trouble now, the VMs created and
+powered on in the window, the host's CPU demand peak, VMs not ready for guest
+operations, and the hostd guest-transfer/TLS lines.
+
+- **Tools trouble follows host load** (most of it on overcommitted hosts):
+  starved guests bring Tools up late and drop its heartbeat. Confirm with
+  `explain_group` on the host group, or `get_host_health` on the worst host.
+- **Tools trouble follows the creation burst** (on the hosts that took the
+  power-ons), with a clone/power-on wave in the task stream: mass creation is
+  the load. The fix is pacing the creation, for a person to decide.
+- **Transfer failures land on the same hosts** as the Tools trouble: one load
+  explains both. **Transfer failures on otherwise quiet hosts**: a different
+  cause for them; go to *When guest file transfers fail*.
+
+VMs flagged `guest_ops_not_ready` run Tools but cannot take a guest command or
+file transfer yet; an automation that starts one then gets a failure that
+looks like a connection error. It should wait for the guest to report ready.
+The Tools trouble counted is the VMs' state now: for a wave that has passed,
+use `diagnose_window` over its window.
+
+A monitoring "Tools error" can also be the monitoring's own call to vCenter
+failing (an SSL EOF on the status check). If vCenter shows Tools running on a
+VM the monitoring flagged, check the vCenter side (*When the vCenter itself
+fails*).
 
 ## Tools that act on a VM
 

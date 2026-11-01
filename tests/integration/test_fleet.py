@@ -542,6 +542,7 @@ def test_every_call_the_tools_made_is_on_the_read_list(
     call(server, "cluster_events", {"vcenters": ["vc-a"], "minutes": 60})
     call(server, "recent_tasks", {"vcenter": "vc-a", "minutes": 60})
     call(server, "vcenter_sessions", {"vcenter": "vc-a"})
+    call(server, "correlate_hosts", {"vcenters": ["vc-a"]})
     call(server, "read_vcenter_log", {"vcenter": "vc-a"})
     call(server, "search_host_logs", {"vcenters": ["vc-a"]})
     call(server, "check_host_tls", {"vcenters": ["vc-a"]})
