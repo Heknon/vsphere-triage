@@ -56,6 +56,10 @@ TOOLS_TROUBLE_FLAGS = (HEARTBEAT_INTERMITTENT, TOOLS_FLAPPING)
 BURST_POWER_ONS = 3
 # The share of the Tools trouble that must sit on one kind of host to call it the pattern.
 FOLLOWS_SHARE = 0.6
+# ... and beyond the share of the VMs those hosts hold by at least this much.
+BEYOND_POPULATION = 0.15
+# A group holding this share of the VMs is nearly everything: it cannot single hosts out.
+EVERYWHERE_SHARE = 0.8
 SHOWN = 8
 
 
@@ -68,64 +72,116 @@ def _share(part: int, whole: int) -> float:
     return part / whole if whole else 0.0
 
 
+def _concentration(group: list[dict[str, Any]], rows: list[dict[str, Any]]) -> tuple[int, int, float, float]:
+    """Of the Tools trouble and of the VMs, how much sits on `group`: (trouble, all trouble, shares)."""
+    troubled = sum(row["tools_trouble"] for row in rows)
+    vms = sum(row.get("vms", 0) for row in rows)
+    on_group = sum(row["tools_trouble"] for row in group)
+    vms_on_group = sum(row.get("vms", 0) for row in group)
+    return on_group, troubled, _share(on_group, troubled), _share(vms_on_group, vms)
+
+
+def _follows(group: list[dict[str, Any]], rows: list[dict[str, Any]]) -> str | None:
+    """`follows`, `everywhere` (the group holds nearly every VM) or `not`; None for an empty group.
+
+    The trouble follows a group only when it sits there well beyond the group's
+    share of the VMs: if every host took new VMs, most of the trouble is on such
+    a host whatever caused it.
+    """
+    if not group:
+        return None
+    _, _, trouble_share, vm_share = _concentration(group, rows)
+    if vm_share >= EVERYWHERE_SHARE:
+        return "everywhere"
+    if trouble_share >= FOLLOWS_SHARE and trouble_share >= vm_share + BEYOND_POPULATION:
+        return "follows"
+    return "not"
+
+
+def _load_finding(rows: list[dict[str, Any]], troubled: int) -> str:
+    hot = [row for row in rows if row.get("overcommitted")]
+    names = ", ".join(row["host"] for row in hot[:SHOWN])
+    on_hot, _, trouble_share, vm_share = _concentration(hot, rows)
+    load = _follows(hot, rows)
+    if load == "follows":
+        return (
+            f"Tools trouble follows host load: {on_hot} of {troubled} ({trouble_share:.0%}) on "
+            f"overcommitted host(s) ({names}), which hold {vm_share:.0%} of the VMs — starved guests "
+            "bring Tools up late and drop its heartbeat"
+        )
+    if load is not None:
+        return (
+            f"only {on_hot} of {troubled} Tools-trouble VMs are on overcommitted hosts ({names}): "
+            "host CPU is not the common factor, though it can explain those"
+        )
+    if not any(row.get("overcommitted") is not None for row in rows):
+        return "host CPU demand could not be read for the window, so load could not be judged"
+    return "no host was overcommitted in the window"
+
+
+def _burst_finding(rows: list[dict[str, Any]], troubled: int) -> str | None:
+    burst = [row for row in rows if row.get("powered_on_in_window", 0) >= BURST_POWER_ONS]
+    on_burst, _, trouble_share, vm_share = _concentration(burst, rows)
+    creation = _follows(burst, rows)
+    took = f"hosts that took {BURST_POWER_ONS} or more power-ons in the window"
+    if creation == "follows":
+        return (
+            f"Tools trouble follows the creation burst: {on_burst} of {troubled} "
+            f"({trouble_share:.0%}) on {took}, which hold {vm_share:.0%} of the VMs"
+        )
+    if creation == "not":
+        return (
+            f"the Tools trouble does not concentrate on the {took} ({on_burst} of {troubled} there, "
+            f"which hold {vm_share:.0%} of the VMs): new VMs alone do not explain it"
+        )
+    if creation == "everywhere":
+        return (
+            f"the creation burst reached nearly every host ({vm_share:.0%} of the VMs are on {took}), "
+            "so per host it cannot single out a cause — look at what the troubled VMs share instead "
+            "(scan, explain_group), and at whether the burst's timing matches the errors (recent_tasks)"
+        )
+    return None
+
+
+def _log_finding(rows: list[dict[str, Any]]) -> str:
+    hit = [row for row in rows if row.get("log_hits")]
+    if not hit:
+        return "no guest-transfer/TLS lines in the hostd logs read"
+    hits = sum(row["log_hits"] for row in hit)
+    on_troubled = sum(row["log_hits"] for row in hit if row["tools_trouble"] or row.get("overcommitted"))
+    if _share(on_troubled, hits) >= FOLLOWS_SHARE:
+        return (
+            f"guest-transfer failures land on the same hosts: {on_troubled} of {hits} hostd lines on "
+            "hosts with Tools trouble or overcommit — one load explains both"
+        )
+    return (
+        f"guest-transfer failures are not where the Tools trouble is: {hits - on_troubled} of {hits} "
+        "hostd lines on otherwise quiet hosts — look at the network or the client for those"
+    )
+
+
 def correlate(rows: list[dict[str, Any]], *, logs_read: bool) -> list[str]:
     """What the per-host rows say: does Tools trouble follow load, the burst, the transfer failures. Pure.
 
-    Each row: {vcenter, host, tools_trouble, overcommitted, powered_on_in_window,
-    log_hits (None when not read)}.
+    Each row: {vcenter, host, vms, tools_trouble, overcommitted,
+    powered_on_in_window, log_hits (None when not read)}.
     """
     troubled = sum(row["tools_trouble"] for row in rows)
     findings: list[str] = []
     if not troubled:
         findings.append("no VM is in Tools trouble now (hung, not up after boot, or a heartbeat that drops)")
     else:
-        hot = [row for row in rows if row.get("overcommitted")]
-        on_hot = sum(row["tools_trouble"] for row in hot)
-        burst = [row for row in rows if row.get("powered_on_in_window", 0) >= BURST_POWER_ONS]
-        on_burst = sum(row["tools_trouble"] for row in burst)
         hosts_with = [row for row in rows if row["tools_trouble"]]
         findings.append(
             f"{troubled} VM(s) in Tools trouble on {len(hosts_with)} of {len(rows)} hosts; most on "
             + ", ".join(f"{row['host']} ({row['tools_trouble']})" for row in hosts_with[:3])
         )
-        if hot and _share(on_hot, troubled) >= FOLLOWS_SHARE:
-            findings.append(
-                f"Tools trouble follows host load: {on_hot} of {troubled} on overcommitted host(s) "
-                f"({', '.join(row['host'] for row in hot[:SHOWN])}) — starved guests bring Tools up late "
-                "and drop its heartbeat"
-            )
-        elif hot:
-            findings.append(
-                f"only {on_hot} of {troubled} Tools-trouble VMs are on overcommitted hosts: host CPU is not "
-                "the common factor"
-            )
-        if burst and _share(on_burst, troubled) >= FOLLOWS_SHARE:
-            findings.append(
-                f"Tools trouble follows the creation burst: {on_burst} of {troubled} on hosts that took "
-                f"{BURST_POWER_ONS} or more power-ons in the window"
-            )
-        if not any(row.get("overcommitted") is not None for row in rows):
-            findings.append("host CPU demand could not be read for the window, so load could not be judged")
+        findings.append(_load_finding(rows, troubled))
+        burst = _burst_finding(rows, troubled)
+        if burst:
+            findings.append(burst)
     if logs_read:
-        hit = [row for row in rows if row.get("log_hits")]
-        if not hit:
-            findings.append("no guest-transfer/TLS lines in the hostd logs read")
-        else:
-            hits = sum(row["log_hits"] for row in hit)
-            on_troubled = sum(
-                row["log_hits"] for row in hit if row["tools_trouble"] or row.get("overcommitted")
-            )
-            if _share(on_troubled, hits) >= FOLLOWS_SHARE:
-                findings.append(
-                    f"guest-transfer failures land on the same hosts: {on_troubled} of {hits} hostd lines on "
-                    "hosts with Tools trouble or overcommit — one load explains both"
-                )
-            else:
-                findings.append(
-                    f"guest-transfer failures are not where the Tools trouble is: {hits - on_troubled} of "
-                    f"{hits} hostd lines on otherwise quiet hosts — look at the network or the client "
-                    "for those"
-                )
+        findings.append(_log_finding(rows))
     return findings
 
 

@@ -89,10 +89,13 @@ def test_readiness_unknown_or_true_is_not_flagged() -> None:
 # -- the per-host line-up ---------------------------------------------------------------------
 
 
-def _row(host: str, *, trouble: int, hot: bool | None, power_ons: int = 0, hits: int | None = None) -> dict:
+def _row(
+    host: str, *, trouble: int, hot: bool | None, power_ons: int = 0, hits: int | None = None, vms: int = 10
+) -> dict:
     return {
         "vcenter": "vc-a",
         "host": host,
+        "vms": vms,
         "tools_trouble": trouble,
         "overcommitted": hot,
         "powered_on_in_window": power_ons,
@@ -111,9 +114,8 @@ def test_tools_trouble_on_overcommitted_hosts_with_the_transfer_failures_there_i
     findings = loadmap.correlate(rows, logs_read=True)
 
     assert findings[0].startswith("10 VM(s) in Tools trouble on 3 of 4 hosts; most on esx-1 (6)")
-    assert findings[1].startswith(
-        "Tools trouble follows host load: 9 of 10 on overcommitted host(s) (esx-1, esx-2)"
-    )
+    assert findings[1].startswith("Tools trouble follows host load: 9 of 10 (90%) on overcommitted host(s)")
+    assert "which hold 50% of the VMs" in findings[1]
     assert findings[2].startswith("Tools trouble follows the creation burst: 9 of 10")
     assert findings[3].startswith("guest-transfer failures land on the same hosts: 54 of 54")
 
@@ -128,6 +130,7 @@ def test_transfer_failures_on_quiet_hosts_point_away_from_the_load() -> None:
     findings = loadmap.correlate(rows, logs_read=True)
 
     assert any(finding.startswith("Tools trouble follows host load: 5 of 5") for finding in findings)
+
     assert any(
         finding.startswith("guest-transfer failures are not where the Tools trouble is: 39 of 40")
         for finding in findings
@@ -141,6 +144,8 @@ def test_trouble_spread_over_quiet_hosts_says_cpu_is_not_the_common_factor() -> 
 
     assert any("host CPU is not the common factor" in finding for finding in findings)
     assert not any("guest-transfer" in finding for finding in findings)
+    # No host took a burst of power-ons, so the burst is not judged at all.
+    assert not any("creation burst" in finding for finding in findings)
 
 
 def test_unread_counters_are_said_not_called_quiet() -> None:
@@ -148,3 +153,45 @@ def test_unread_counters_are_said_not_called_quiet() -> None:
 
     assert any("could not be judged" in finding for finding in findings)
     assert not any("follows host load" in finding for finding in findings)
+
+
+def test_a_burst_that_reached_every_host_is_not_called_the_pattern() -> None:
+    # Every host took new VMs: most of the trouble is on a burst host whatever caused it.
+    rows = [
+        _row("esx-1", trouble=2, hot=True, power_ons=4),
+        _row("esx-2", trouble=3, hot=False, power_ons=6),
+        _row("esx-3", trouble=2, hot=False, power_ons=5),
+    ]
+
+    findings = loadmap.correlate(rows, logs_read=False)
+
+    assert not any("follows the creation burst" in finding for finding in findings)
+    assert any(finding.startswith("the creation burst reached nearly every host") for finding in findings)
+
+
+def test_trouble_on_a_host_group_no_more_than_its_share_of_vms_does_not_follow_it() -> None:
+    # The overcommitted hosts hold 70% of the VMs and 70% of the trouble: no concentration.
+    rows = [
+        _row("esx-1", trouble=7, hot=True, vms=70),
+        _row("esx-2", trouble=3, hot=False, vms=30),
+    ]
+
+    findings = loadmap.correlate(rows, logs_read=False)
+
+    assert not any("follows host load" in finding for finding in findings)
+    assert any("host CPU is not the common factor" in finding for finding in findings)
+
+
+def test_a_burst_the_trouble_does_not_follow_is_said() -> None:
+    rows = [
+        _row("esx-1", trouble=1, hot=False, power_ons=6),
+        _row("esx-2", trouble=4, hot=False),
+        _row("esx-3", trouble=0, hot=False),
+    ]
+
+    findings = loadmap.correlate(rows, logs_read=False)
+
+    assert any(
+        finding.startswith("the Tools trouble does not concentrate on the hosts that took")
+        for finding in findings
+    )
