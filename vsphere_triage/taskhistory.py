@@ -41,6 +41,63 @@ def categorize(operation: str) -> str:
     return "other"
 
 
+# A burst worth naming: this many tasks of one family inside one bucket.
+BUCKET_MINUTES = 10
+CLONE_WAVE = 10
+POWER_ON_WAVE = 20
+
+
+def is_power_on(operation: str) -> bool:
+    """Whether a task operation powers a VM on (including DRS's initial placement of one)."""
+    lowered = operation.lower()
+    return "poweron" in lowered
+
+
+def busiest_bucket(times: list[datetime], *, minutes: int = BUCKET_MINUTES) -> dict[str, Any] | None:
+    """The `minutes`-long bucket holding the most of `times`: its start and count. Pure."""
+    if not times:
+        return None
+    width = timedelta(minutes=minutes)
+    first = min(times)
+    counts: dict[int, int] = {}
+    for moment in times:
+        index = int((moment - first) / width)
+        counts[index] = counts.get(index, 0) + 1
+    index, count = max(counts.items(), key=lambda item: (item[1], -item[0]))
+    return {"start": first + index * width, "minutes": minutes, "count": count}
+
+
+def creation_waves(rows: list[dict[str, Any]]) -> tuple[dict[str, Any], list[str]]:
+    """Clone and power-on bursts: the busiest bucket of each, and a finding for a wave. Pure.
+
+    Mass VM creation is clones (or deploys) followed by power-ons; at once, they
+    load the hosts and vCenter together, which is when Tools comes up late and
+    guest operations fail.
+    """
+    clone_times = [
+        row["time"]
+        for row in rows
+        if categorize(str(row.get("operation", ""))) == "clone" and row.get("time")
+    ]
+    power_times = [
+        row["time"] for row in rows if is_power_on(str(row.get("operation", ""))) and row.get("time")
+    ]
+    peaks = {"clone": busiest_bucket(clone_times), "power_on": busiest_bucket(power_times)}
+    findings = []
+    for family, threshold, words in (
+        ("clone", CLONE_WAVE, "clone/deploy"),
+        ("power_on", POWER_ON_WAVE, "power-on"),
+    ):
+        peak = peaks[family]
+        if peak and peak["count"] >= threshold:
+            findings.append(
+                f"{words} wave: {peak['count']} {words} tasks in the {BUCKET_MINUTES} minutes from "
+                f"{peak['start']:%H:%M}Z — mass creation loads the hosts and vCenter at once, which is when "
+                "Tools comes up late and guest operations fail"
+            )
+    return peaks, findings
+
+
 def summarize_tasks(rows: list[dict[str, Any]], *, now: datetime, window_minutes: float) -> dict[str, Any]:
     """Group tasks by family over the window, flag waves and failures.
 
@@ -80,6 +137,8 @@ def summarize_tasks(rows: list[dict[str, Any]], *, now: datetime, window_minutes
             f"{families['snapshot']} snapshot tasks — a snapshot or consolidation sweep, which hits "
             "datastore I/O hard"
         )
+    peaks, wave_findings = creation_waves(rows)
+    findings.extend(wave_findings)
     if failures:
         findings.append(f"{len(failures)} task(s) failed in the window — see failures")
     return {
@@ -88,6 +147,7 @@ def summarize_tasks(rows: list[dict[str, Any]], *, now: datetime, window_minutes
         "total_tasks": len(rows),
         "by_family": dict(sorted(families.items(), key=lambda item: -item[1])),
         "by_user": dict(sorted(by_user.items(), key=lambda item: -item[1])[:5]),
+        "busiest": {family: peak for family, peak in peaks.items() if peak},
         "failures": failures[:20],
         "findings": findings or ["no notable tasks in the window"],
     }

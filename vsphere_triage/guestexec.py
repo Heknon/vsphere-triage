@@ -180,6 +180,16 @@ async def run_in_guest(  # noqa: PLR0913 - one guest command, its target and its
                     "are how a guest with no Tools is seen"
                 ),
             }
+        if vm.guest_ops_ready is False:
+            return {
+                "found": True,
+                "ran": False,
+                "reason": (
+                    "Tools runs, but the guest reports it is not ready for guest operations "
+                    "(guest.guestOperationsReady is false), so a command or its output transfer would fail "
+                    "now; this is common while a guest is still booting. Retry once it is ready"
+                ),
+            }
         return {"found": True, "vm": vm}
 
     checked = await pool.run(name, check)

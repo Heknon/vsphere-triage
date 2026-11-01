@@ -60,6 +60,7 @@ VM_PATHS = (
     "summary.quickStats.uptimeSeconds",
     "summary.quickStats.guestHeartbeatStatus",
     "guest.toolsRunningStatus",
+    "guest.guestOperationsReady",
     "guest.toolsVersionStatus2",
     "guest.guestState",
     "guest.guestFamily",
@@ -187,6 +188,7 @@ class VmFacts:
     read_at: datetime | None = None
     tools_status: str | None = None
     tools_running: str | None = None
+    guest_ops_ready: bool | None = None
     tools_version_status: str | None = None
     heartbeat: str | None = None
     guest_state: str | None = None
@@ -1290,6 +1292,8 @@ def vm_facts(  # noqa: C901, PLR0912, PLR0913, PLR0915 - one flattening of one r
     ]
     facts.tools_status = row.get("guest.toolsStatus")
     facts.tools_running = row.get("guest.toolsRunningStatus")
+    ready = row.get("guest.guestOperationsReady")
+    facts.guest_ops_ready = ready if isinstance(ready, bool) else None
     facts.tools_version_status = row.get("guest.toolsVersionStatus2")
     facts.heartbeat = row.get("summary.quickStats.guestHeartbeatStatus")
     facts.guest_state = row.get("guest.guestState") or None

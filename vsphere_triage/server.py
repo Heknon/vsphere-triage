@@ -48,6 +48,7 @@ from vsphere_triage import (
     hostsensors,
     hosttls,
     linuxboot,
+    loadmap,
     power,
     powerflex,
     resources,
@@ -171,6 +172,9 @@ Two ways in:
 2. From a question about the fleet ("anything stuck on vc-04?"): scan, then
    explain_group on its strongest group, then diagnose_vm on that group's
    representatives. A past window, when VMs are gone: diagnose_window.
+3. From a wave of Tools errors at once (mass creation, busy hosts):
+   correlate_hosts lines them up per host with creation, CPU and transfer
+   failures.
 
 Reading the answers:
 - Shared causes first. CPU starvation on an overcommitted ESXi host (ready time,
@@ -556,12 +560,14 @@ def _register_fleet_tools(  # noqa: C901, PLR0915 - one closure per tool
 
     @tool()
     async def recent_tasks(*, vcenter: str, minutes: int = 120) -> dict[str, Any]:
-        """What was *done* on a vCenter in a window: migrations, reconfigures, snapshots, failures.
+        """What was *done* on a vCenter in a window: migrations, reconfigures, snapshots, clones, failures.
 
         Events say what happened; tasks say what someone or an automation did. A
         storage-vMotion sweep onto one datastore, a mass reconfigure, a snapshot
-        consolidation — each can stall the VMs caught in it and shows in no single
-        VM's counters. This groups the task stream and flags waves and failures.
+        consolidation, a wave of clones and power-ons (mass VM creation) — each
+        can stall the VMs caught in it and shows in no single VM's counters. This
+        groups the task stream and flags waves and failures, with the busiest
+        10 minutes of clones and of power-ons.
 
         Args:
             vcenter: the vCenter to read.
@@ -1876,6 +1882,31 @@ def _register_connection_tools(tool: Callable[..., Any], fleet: VCenterPool, res
         """
         names = _names(fleet, vcenters)
         return await hosttls.check_host_tls(fleet, resolved, names, hosts=hosts or [])
+
+    @tool()
+    async def correlate_hosts(
+        *, vcenters: list[str] | None = None, minutes: int = 60, read_host_logs: bool = True
+    ) -> dict[str, Any]:
+        """Many Tools errors at once: per host, Tools trouble, VM creation, CPU and transfer failures.
+
+        For a wave of VMware Tools errors, with or without SSL errors on guest
+        file transfers. Per host over the window: the VMs in Tools trouble now
+        (hung, not up after boot, a heartbeat that drops), the VMs created and
+        powered on in it, the host's CPU demand peak, VMs not ready for guest
+        operations, and the hostd lines for guest transfers and TLS. Says
+        whether the Tools trouble follows host load or the creation burst, and
+        whether the transfer failures land on the same hosts; plus the
+        vCenter's clone and power-on waves from the task stream.
+
+        Args:
+            vcenters: vCenter names; all when empty.
+            minutes: the window, ending now (default 60).
+            read_host_logs: also read each host's hostd log (two calls per host).
+
+        """
+        names = _names(fleet, vcenters)
+        window = int(_ago(minutes=minutes).total_seconds() // 60)
+        return await loadmap.correlate_hosts(fleet, resolved, names, minutes=window, read_logs=read_host_logs)
 
     @tool()
     async def search_host_logs(

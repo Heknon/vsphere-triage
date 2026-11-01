@@ -435,3 +435,23 @@ def test_vcenters_own_log_the_simulator_lacks_is_reported(server: MCPServer) -> 
 def test_an_appliance_without_the_rest_api_is_said_in_words(server: MCPServer) -> None:
     with pytest.raises(ToolError, match="appliance REST API"):
         asyncio.run(server.call_tool("vcenter_appliance_health", {"vcenter": "vc-a"}))
+
+
+# -- mass Tools errors ---------------------------------------------------------------------
+
+
+def test_tools_trouble_is_lined_up_per_host_with_cpu_and_creation(server: MCPServer) -> None:
+    result = call(server, "correlate_hosts", {"vcenters": ["vc-a"], "minutes": 60})
+
+    hosts = {row["host"]: row for row in result["hosts"]}
+    # The overcommitted host from the CPU scenario, with its two busy env-1002 VMs.
+    assert hosts["DC0_C1_H0"]["overcommitted"] is True
+    assert hosts["DC0_C1_H0"]["tools_trouble"] >= 2
+    # env-1001's three clones hung on slow storage sit on hosts that are not overcommitted.
+    assert hosts["DC0_C0_H0"]["overcommitted"] is False
+    assert hosts["DC0_C0_H0"]["tools_trouble"] >= 2
+    assert any("host CPU is not the common factor" in finding for finding in result["findings"])
+    # Every VM was created and powered on inside the hour: the burst is visible.
+    assert sum(row["powered_on_in_window"] for row in result["hosts"]) >= 10
+    # vcsim has no host logs: said, not read as "no failures".
+    assert any("no hostd log could be read" in note for note in result["notes"])

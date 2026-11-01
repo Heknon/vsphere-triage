@@ -71,7 +71,7 @@ The minimum configuration is the vCenter list and a login:
 
 The server speaks MCP over stdio by default. With `uvx`, use
 `"command": "uvx", "args": ["vsphere-triage"]` (pin a version with
-`"vsphere-triage==0.4.0"`); with a `uv tool` or `pipx` install, use
+`"vsphere-triage==0.5.0"`); with a `uv tool` or `pipx` install, use
 `"command": "vsphere-triage"` as above.
 
 ## Two ways to start
@@ -213,7 +213,7 @@ server always matches the skill. Invoke the skill as
 | `explain_group` | for one group from a scan: what its abnormal VMs share that the healthy ones do not, and host CPU and storage over their boot window |
 | `diagnose_window` | resets, failed power-ons, host CPU and storage over a past window |
 | `cluster_events` | vSphere HA restarts and VM-monitoring resets, host failures, isolations and lost connections, failed failovers, maintenance mode and migration waves over a window; names the failed host and the hosts VMs restarted onto |
-| `recent_tasks` | tasks over a window grouped by kind (migration, reconfigure, snapshot, clone, power, destroy), flagging 10 or more migrations, reconfigures or snapshot operations as a wave, and the tasks that failed, with their error. Read through a task history collector created and destroyed for the call |
+| `recent_tasks` | tasks over a window grouped by kind (migration, reconfigure, snapshot, clone, power, destroy), flagging 10 or more migrations, reconfigures or snapshot operations as a wave, a clone/power-on wave (10 clones or 20 power-ons inside 10 minutes) with its busiest 10 minutes, and the tasks that failed, with their error. Read through a task history collector created and destroyed for the call |
 | `find_old_environments` | environment folders older than N hours (age of their oldest VM), optionally under given path segments, oldest first |
 | `hardware_profile` | device counts per category and kind across the fleet, NIC types, and VMs whose devices differ from the rest of their environment |
 | `find_vms_by_device` | VMs that have, or lack, a device category (`sound`, `usb`, `ethernet`, ...) or kind (`Vmxnet3`, `HdAudioCard`) |
@@ -221,6 +221,7 @@ server always matches the skill. Invoke the skill as
 | `find_resource_limits` | VMs with a CPU or memory limit or reservation, tightest limit first, templates marked (linked clones inherit a template's limit), and VMs in a resource pool or vApp running at 85% or more of a limit set on it, with the pool named |
 | `check_datastores` | each datastore's free space, thin over-provisioning ratio and per-host reachability (APD/PDL); datastores holding a template's base disk are marked |
 | `check_host_time` | each host's NTP configuration and clock skew from vCenter |
+| `correlate_hosts` | for a wave of Tools errors: per host over a window, the VMs in Tools trouble now, the VMs created and powered on in it, the host's CPU demand peak, VMs not ready for guest operations and the hostd guest-transfer/TLS lines; says whether the Tools trouble follows host load or the creation burst, and whether transfer failures land on the same hosts |
 
 ### One environment or VM
 
@@ -320,8 +321,9 @@ swapped or compressed), `host_memory_pressure` (host at 95% memory or more),
 `vcenter_alarm` (a red alarm on the VM), `host_not_connected`, `long_running`
 (older than 24 hours) and `consolidation_needed`. These add detail only:
 `host_in_maintenance`, `tools_outdated`, `cpu_limited` (a CPU limit at or
-below 90% of the VM's full speed) and `memory_limited` (a memory limit below
-its RAM).
+below 90% of the VM's full speed), `memory_limited` (a memory limit below
+its RAM) and `guest_ops_not_ready` (Tools runs, but the guest reports it is not
+ready for guest operations, so a guest command or file transfer would fail).
 
 `scan(states=[...])` selects any state or flag, e.g. `["no_tools"]` or
 `["long_running"]`.
