@@ -393,6 +393,7 @@ def test_the_session_breakdown_names_the_leaking_client_against_the_cap(server: 
     assert result["by_user"]["report"] == scenario.LEAKED_SESSIONS
     assert "configured cap of 10" in result["findings"][0]
     assert result["connection_settings"]["config.vmacore.soap.maxSessionCount"] == "10"
+    assert any(client.startswith("report @") for client in result["calls_by_client"])
 
 
 def test_hosts_with_no_address_to_probe_are_said_not_tested(server: MCPServer) -> None:

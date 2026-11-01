@@ -71,7 +71,7 @@ The minimum configuration is the vCenter list and a login:
 
 The server speaks MCP over stdio by default. With `uvx`, use
 `"command": "uvx", "args": ["vsphere-triage"]` (pin a version with
-`"vsphere-triage==0.5.0"`); with a `uv tool` or `pipx` install, use
+`"vsphere-triage==0.5.1"`); with a `uv tool` or `pipx` install, use
 `"command": "vsphere-triage"` as above.
 
 ## Two ways to start
@@ -247,7 +247,7 @@ server always matches the skill. Invoke the skill as
 | `search_host_logs` | the same host log (`hostd` by default) on every connected host, matched and counted per host, so it shows whether failures cluster on a few hosts or spread over all. The default pattern matches guest file transfers, TLS errors and dropped connections |
 | `check_host_tls` | per ESXi host, from where the server runs, at the address a guest file-transfer URL carries (the host's IP: its name if it is one, else what the name resolves to, else its management IP): whether port 443 answers, is refused or resets, and whether its certificate is trusted, unexpired and covers that address. Guest file transfers download from the host, not vCenter, so this is their path. Beyond reading the hosts it sends no vSphere call, only a TLS handshake |
 | `check_vcenters` | per vCenter: reachable, the server's last login time, a round-trip time and the open-session count against the configured cap (`config.vmacore.soap.maxSessionCount`, when set), for refused logins and dropped connections caused by session exhaustion |
-| `vcenter_sessions` | a vCenter's open API sessions grouped by user, source IP and client, with idle counts, the oldest, the session cap and the session/connection settings an administrator set under `config.vmacore.` |
+| `vcenter_sessions` | a vCenter's open API sessions grouped by user, source IP and client, with idle counts, each client's API call total (`calls_by_client`; read twice for a rate), the oldest, the session cap and the session/connection settings an administrator set under `config.vmacore.` |
 | `read_vcenter_log` | vCenter's own log (`vpxd` by default, or any key vCenter offers), regex-filtered |
 | `vcenter_appliance_health` | the appliance's health (overall, load, memory, swap, storage, database; green, yellow, orange, red or gray), its uptime and its services' state and health, through the appliance REST API (vCenter 7.0 U2 or later), inside a REST session opened and closed for the call |
 | `vcenter_history` | login, logout and failed-login events over a past window, in 10-minute buckets, with the busiest sources |

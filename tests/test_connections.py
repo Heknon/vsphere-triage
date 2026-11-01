@@ -568,3 +568,16 @@ def test_a_name_that_does_not_resolve_is_probed_at_its_management_ip(tmp_path: P
     assert result["url_address"] == "127.0.0.1"
     assert "management IP" in result["address_from"]
     assert result["name_error"]
+
+
+def test_calls_are_summed_per_client_most_first() -> None:
+    from vsphere_triage.vcenter import calls_by_client  # noqa: PLC0415
+
+    rows = [
+        {"user": "svc", "ip": "10.0.0.9", "user_agent": "automation/1", "call_count": 900},
+        {"user": "svc", "ip": "10.0.0.9", "user_agent": "automation/1", "call_count": 400},
+        {"user": "ops", "ip": "10.0.0.5", "user_agent": "pyvmomi", "call_count": 12},
+        {"user": "ops", "ip": "10.0.0.5", "user_agent": "pyvmomi", "call_count": None},
+    ]
+
+    assert calls_by_client(rows) == {"svc @ 10.0.0.9 (automation/1)": 1300, "ops @ 10.0.0.5 (pyvmomi)": 12}
